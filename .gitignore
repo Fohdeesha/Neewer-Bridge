@@ -1,0 +1,17 @@
+# Rust build output
+/target
+
+# Reference projects (kept on disk for research, not part of this repo)
+/NeewerLite
+/NeewerLite-Python
+
+# Large reference artifact
+/artnet_protocol_specs.txt
+
+# Local config holding real MACs (use config.example.toml as the template)
+/config.toml
+/neewer-bridge.toml
+
+# OS / editor
+.DS_Store
+*.swp

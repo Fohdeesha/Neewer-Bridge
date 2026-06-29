@@ -1,0 +1,22 @@
+[package]
+name = "neewer-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "ArtNet (DMX-over-UDP) to Neewer Bluetooth light control bridge"
+license = "MIT"
+
+[[bin]]
+name = "neewer-bridge"
+path = "src/main.rs"
+
+[lib]
+name = "neewer_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+# Deps are added per-milestone to keep build times fast while iterating.
+# Protocol + ArtNet parsing need nothing external. BLE/CLI/config deps come next.
+
+[profile.release]
+lto = true
+strip = true
