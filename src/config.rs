@@ -138,14 +138,22 @@ impl Config {
             if !KNOWN_DRIVERS.contains(&l.driver.as_str()) {
                 bail!("{who}: unknown driver {:?}; expected one of {KNOWN_DRIVERS:?}", l.driver);
             }
-            if !KNOWN_PROFILES.contains(&l.profile.as_str()) {
-                bail!("{who}: unknown profile {:?}; expected one of {KNOWN_PROFILES:?}", l.profile);
-            }
+            let profile = crate::profile::Profile::parse(&l.profile).ok_or_else(|| {
+                anyhow::anyhow!("{who}: unknown profile {:?}; expected one of {KNOWN_PROFILES:?}", l.profile)
+            })?;
             if l.universe > 32767 {
                 bail!("{who}: universe {} out of range (0..=32767)", l.universe);
             }
             if l.address < 1 || l.address > 512 {
                 bail!("{who}: address {} out of range (1..=512)", l.address);
+            }
+            // The whole profile must fit within the 512-channel universe.
+            let last = l.address as u32 + profile.channel_count() as u32 - 1;
+            if last > 512 {
+                bail!(
+                    "{who}: profile {:?} ({} ch) at address {} runs to channel {} (>512)",
+                    l.profile, profile.channel_count(), l.address, last
+                );
             }
         }
         // Detect duplicate MAC bindings — a config mistake that would make the

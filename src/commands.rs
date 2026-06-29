@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::time::Duration;
 use tracing::info;
 
+use crate::artnet;
 use crate::ble;
 use crate::config::parse_mac;
 use crate::protocol::{classic, home, infinity};
@@ -34,6 +35,30 @@ pub async fn scan(adapter_selector: &str, seconds: u64, all: bool) -> Result<()>
     );
     println!("To bind it for the bridge, add a [[lights]] entry with its MAC to your config.");
     Ok(())
+}
+
+/// `monitor` — bind the ArtNet listener and print a summary of every ArtDmx
+/// packet received. Hardware-free; point a console / QLC+ at this host to verify
+/// ArtNet reception, universe addressing, and channel data without any lights.
+pub async fn monitor(bind_ip: &str) -> Result<()> {
+    info!(bind_ip, port = artnet::ARTNET_PORT, "ArtNet monitor — press Ctrl-C to stop");
+    artnet::listen(bind_ip, |src, pkt| {
+        let (net, sub_net, universe) = artnet::split_port_address(pkt.port_address);
+        let preview: Vec<String> = pkt.data.iter().take(12).map(|b| format!("{b:3}")).collect();
+        info!(
+            %src,
+            port = pkt.port_address,
+            net,
+            sub_net,
+            universe,
+            seq = pkt.sequence,
+            channels = pkt.data.len(),
+            "ArtDmx ch1.. = [{}{}]",
+            preview.join(" "),
+            if pkt.data.len() > 12 { " …" } else { "" },
+        );
+    })
+    .await
 }
 
 /// `test` — connect to one light and prove the BLE path end to end:

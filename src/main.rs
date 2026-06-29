@@ -51,6 +51,8 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         seconds: u64,
     },
+    /// Listen for ArtNet and print received ArtDmx packets (no BLE needed).
+    Monitor,
     /// Run the ArtNet→BLE bridge (not yet implemented).
     Run,
 }
@@ -68,19 +70,20 @@ async fn main() {
 }
 
 async fn dispatch(cli: &Cli) -> Result<()> {
-    // BLE adapter selection comes from config when present, else "default".
-    // scan/test don't require a config file to exist.
-    let adapter_selector = Config::load(&cli.config)
-        .map(|c| c.ble.adapter)
-        .unwrap_or_else(|_| "default".to_string());
+    // scan/test/monitor don't require a config file to exist — fall back to
+    // defaults so the tools work out of the box. `run` will require a valid one.
+    let cfg = Config::load(&cli.config).unwrap_or_default();
 
     match &cli.command {
-        Command::Scan { seconds, all } => commands::scan(&adapter_selector, *seconds, *all).await,
-        Command::Test { mac, driver, seconds } => {
-            commands::test(&adapter_selector, mac, driver, *seconds).await
+        Command::Scan { seconds, all } => {
+            commands::scan(&cfg.ble.adapter, *seconds, *all).await
         }
+        Command::Test { mac, driver, seconds } => {
+            commands::test(&cfg.ble.adapter, mac, driver, *seconds).await
+        }
+        Command::Monitor => commands::monitor(&cfg.artnet.bind_ip).await,
         Command::Run => {
-            anyhow::bail!("`run` is not implemented yet (ArtNet listener + mapper come next)")
+            anyhow::bail!("`run` is not implemented yet (per-light BLE actors come next)")
         }
     }
 }
