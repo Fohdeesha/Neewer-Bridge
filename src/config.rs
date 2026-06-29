@@ -125,6 +125,8 @@ fn default_true() -> bool {
 pub const KNOWN_PROFILES: &[&str] = &["cct", "cct_gm", "hsi", "full"];
 /// Known driver selectors.
 pub const KNOWN_DRIVERS: &[&str] = &["auto", "classic", "infinity", "home"];
+/// Known failsafe modes (only `hold` is fully implemented in v1).
+pub const KNOWN_FAILSAFE_MODES: &[&str] = &["hold", "blackout", "poweroff"];
 
 impl Config {
     /// Load and validate a config from a TOML file.
@@ -139,6 +141,12 @@ impl Config {
 
     /// Structural validation independent of any hardware being present.
     pub fn validate(&self) -> Result<()> {
+        if !KNOWN_FAILSAFE_MODES.contains(&self.failsafe.mode.as_str()) {
+            bail!(
+                "failsafe.mode {:?} unknown; expected one of {KNOWN_FAILSAFE_MODES:?}",
+                self.failsafe.mode
+            );
+        }
         for (i, l) in self.lights.iter().enumerate() {
             let who = format!("lights[{i}] (mac={:?})", l.mac);
             parse_mac(&l.mac).with_context(|| format!("{who}: invalid mac"))?;
@@ -174,6 +182,32 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Append a `[[lights]]` block to a config file (creating it if absent),
+/// preserving any existing content/comments. The result is validated before it
+/// is written, so a bad addition can't corrupt the file.
+pub fn append_light(path: &Path, light: &LightCfg) -> Result<()> {
+    let mut text = std::fs::read_to_string(path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "\n[[lights]]\nmac = \"{}\"\nname = \"{}\"\ndriver = \"{}\"\nprofile = \"{}\"\nuniverse = {}\naddress = {}\npower_on_connect = {}\n",
+        normalize_mac(&light.mac),
+        light.name.clone().unwrap_or_default(),
+        light.driver,
+        light.profile,
+        light.universe,
+        light.address,
+        light.power_on_connect,
+    ));
+
+    // Parse + validate the whole file before committing it to disk.
+    let cfg: Config = toml::from_str(&text).context("the resulting config would not parse")?;
+    cfg.validate().context("the resulting config would be invalid")?;
+    std::fs::write(path, &text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// Parse a MAC string (`"AA:BB:CC:DD:EE:FF"`, `-` or `:` separators, any case)
@@ -229,6 +263,42 @@ mod tests {
         assert_eq!(normalize_mac("aa-bb-cc-dd-ee-ff"), "AA:BB:CC:DD:EE:FF");
         assert!(mac_eq("AABBCCDDEEFF", "aa:bb:cc:dd:ee:ff"));
         assert!(!mac_eq("AABBCCDDEEFF", "aa:bb:cc:dd:ee:00"));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_failsafe_mode() {
+        let mut c = Config::default();
+        assert!(c.validate().is_ok()); // default "hold"
+        c.failsafe.mode = "explode".into();
+        assert!(c.validate().is_err());
+        c.failsafe.mode = "blackout".into();
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn append_light_round_trips() {
+        let path = std::env::temp_dir().join(format!("nb_append_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let light = LightCfg {
+            mac: "aa-bb-cc-dd-ee-ff".into(),
+            name: Some("Key".into()),
+            driver: "auto".into(),
+            profile: "full".into(),
+            universe: 2,
+            address: 5,
+            power_on_connect: true,
+        };
+        append_light(&path, &light).unwrap();
+        // Append a second one to confirm multiple [[lights]] blocks accumulate.
+        let light2 = LightCfg { mac: "11:22:33:44:55:66".into(), ..light.clone() };
+        append_light(&path, &light2).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.lights.len(), 2);
+        assert_eq!(normalize_mac(&loaded.lights[0].mac), "AA:BB:CC:DD:EE:FF");
+        assert_eq!(loaded.lights[0].universe, 2);
+        assert_eq!(loaded.lights[1].address, 5);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -40,6 +40,8 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Interactively scan, blink-to-identify, and add a light to the config.
+    Add,
     /// Connect to one light by MAC and prove BLE control (blink + set CCT).
     Test {
         /// Target light MAC, e.g. AA:BB:CC:DD:EE:FF.
@@ -53,7 +55,7 @@ enum Command {
     },
     /// Listen for ArtNet and print received ArtDmx packets (no BLE needed).
     Monitor,
-    /// Run the ArtNet→BLE bridge (not yet implemented).
+    /// Run the full ArtNet→BLE bridge.
     Run,
 }
 
@@ -76,6 +78,10 @@ async fn dispatch(cli: &Cli) -> Result<()> {
         Command::Scan { seconds, all } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
             commands::scan(&cfg.ble.adapter, *seconds, *all).await
+        }
+        Command::Add => {
+            let cfg = Config::load(&cli.config).unwrap_or_default();
+            commands::add(&cli.config, &cfg.ble.adapter).await
         }
         Command::Test { mac, driver, seconds } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();

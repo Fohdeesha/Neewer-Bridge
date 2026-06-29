@@ -73,14 +73,9 @@ impl LightActor {
 
             match ble::connect_and_verify(&peripheral).await {
                 Ok(chars) => {
-                    if self.cfg.power_on_connect {
-                        debug!(light = %label, "powering on");
-                        if let Err(e) =
-                            ble::write_command(&peripheral, &chars.write, &driver.power(true)).await
-                        {
-                            warn!(light = %label, error = %e, "power-on write failed");
-                        }
-                    }
+                    // Power is driven entirely by the flushed LightState (the
+                    // bridge seeds the initial state's power from
+                    // `power_on_connect`), so there's no separate power-on here.
                     if let Err(e) = self.session(&label, &peripheral, &chars, &driver).await {
                         warn!(light = %label, error = %e, "session ended; will reconnect");
                     }
@@ -140,10 +135,23 @@ impl LightActor {
                 _ = flush.tick() => {
                     let desired = *self.rx.borrow();
                     if Some(desired) != last_sent {
-                        let cmd = driver.apply(&desired);
-                        ble::write_command(p, &chars.write, &cmd)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("flush write failed: {e}"))?;
+                        let prev_power = last_sent.map(|l| l.power);
+                        if desired.power {
+                            // Power-on only on transition (or the first send).
+                            if prev_power != Some(true) {
+                                ble::write_command(p, &chars.write, &driver.power(true))
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!("power-on write failed: {e}"))?;
+                            }
+                            ble::write_command(p, &chars.write, &driver.apply(&desired))
+                                .await
+                                .map_err(|e| anyhow::anyhow!("flush write failed: {e}"))?;
+                        } else if prev_power != Some(false) {
+                            // Power-off only on transition (failsafe poweroff).
+                            ble::write_command(p, &chars.write, &driver.power(false))
+                                .await
+                                .map_err(|e| anyhow::anyhow!("power-off write failed: {e}"))?;
+                        }
                         last_sent = Some(desired);
                     }
                 }

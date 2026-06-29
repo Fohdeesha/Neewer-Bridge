@@ -1,18 +1,23 @@
 //! `run` orchestration: spawn one BLE actor per configured light, start the
-//! shared scan, and feed mapped ArtDmx into each light's `watch` channel.
+//! shared scan, feed mapped ArtDmx into each light's `watch` channel, and run
+//! the ArtNet-loss failsafe.
 //!
 //! Data flow (NOTES.md §8):
 //!   ArtNet UDP → parse → per-universe lookup → map_dmx → watch::Sender
 //!                                                          ↓ (coalesced)
 //!                                            per-light actor → BLE write
 //!
-//! The `watch` channel does the coalescing for free: a fast ArtNet stream only
-//! ever leaves the *latest* `LightState` for the actor to read at its flush rate.
+//! The `watch` channel coalesces for free: a fast ArtNet stream only ever leaves
+//! the *latest* `LightState` for the actor to read at its flush rate.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::watch;
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
 use crate::artnet::{self, ArtDmx};
@@ -39,41 +44,47 @@ pub async fn run(cfg: Config) -> Result<()> {
     ble::start_scan(&adapter).await?;
     info!("BLE scan started (shared)");
 
-    // Build the universe → sinks map and spawn one actor per light.
-    let mut universe_map: HashMap<u16, Vec<Sink>> = HashMap::new();
+    // Build the universe → sinks map (+ a flat list for the failsafe task) and
+    // spawn one actor per light. Sinks are shared via Arc between the ArtNet
+    // listener (lookup) and the failsafe task (push to all).
+    let mut universe_map: HashMap<u16, Vec<Arc<Sink>>> = HashMap::new();
+    let mut all_sinks: Vec<Arc<Sink>> = Vec::new();
     for light in &cfg.lights {
         let profile = Profile::parse(&light.profile).expect("validated profile");
-        let (tx, rx) = watch::channel(LightState::default());
-        universe_map.entry(light.universe).or_default().push(Sink {
-            address: light.address,
-            profile,
-            cct: CctRange::default(),
-            tx,
-        });
+        // Seed initial power from power_on_connect: the actor sends this as soon
+        // as it connects, before any ArtNet arrives.
+        let initial = LightState { power: light.power_on_connect, ..LightState::default() };
+        let (tx, rx) = watch::channel(initial);
+        let sink = Arc::new(Sink { address: light.address, profile, cct: CctRange::default(), tx });
+        universe_map.entry(light.universe).or_default().push(sink.clone());
+        all_sinks.push(sink);
 
-        let actor = LightActor::new(
-            light.clone(),
-            adapter.clone(),
-            rx,
-            cfg.ble.flush_hz,
-            cfg.ble.probe_secs,
-        );
+        let actor =
+            LightActor::new(light.clone(), adapter.clone(), rx, cfg.ble.flush_hz, cfg.ble.probe_secs);
         tokio::spawn(actor.run());
     }
+
+    // Shared "last ArtNet packet" timestamp, as millis since `base`.
+    let base = Instant::now();
+    let last_artnet = Arc::new(AtomicU64::new(0));
+
+    spawn_failsafe(&cfg, base, last_artnet.clone(), all_sinks);
 
     // ArtNet listener — owns the senders; updates them as packets arrive.
     let bind_ip = cfg.artnet.bind_ip.clone();
     let port = cfg.artnet.port;
+    let last_for_listener = last_artnet.clone();
     let listener = tokio::spawn(async move {
         let res = artnet::listen(&bind_ip, port, move |_src, pkt: ArtDmx| {
+            last_for_listener.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
             if let Some(sinks) = universe_map.get(&pkt.port_address) {
                 for s in sinks {
                     if let Some(slice) =
                         extract_slice(&pkt.data, s.address, s.profile.channel_count())
                     {
                         let state = map_dmx(s.profile, slice, s.cct);
-                        // Ignore send errors: a downed actor has no receiver, and
-                        // it will read the latest value when it reconnects.
+                        // Ignore send errors: a downed actor has no receiver; it
+                        // reads the latest value when it reconnects.
                         let _ = s.tx.send(state);
                     }
                 }
@@ -89,23 +100,72 @@ pub async fn run(cfg: Config) -> Result<()> {
         lights = cfg.lights.len(),
         bind = %cfg.artnet.bind_ip,
         port = cfg.artnet.port,
+        failsafe = %cfg.failsafe.mode,
         "bridge running — press Ctrl-C to stop"
     );
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Ctrl-C received — shutting down");
+        _ = tokio::signal::ctrl_c() => info!("Ctrl-C received — shutting down"),
+        _ = listener => warn!("ArtNet listener task ended unexpectedly"),
+    }
+    info!("shutdown: failsafe = {} (lights keep their last commanded state)", cfg.failsafe.mode);
+    Ok(())
+}
+
+/// Spawn the ArtNet-loss failsafe task, unless the mode is `hold` or no timeout
+/// is set. While idle past the timeout, it forces blackout (brightness 0) or
+/// power-off on every light; normal ArtNet resumes immediately overwrite it.
+fn spawn_failsafe(cfg: &Config, base: Instant, last_artnet: Arc<AtomicU64>, sinks: Vec<Arc<Sink>>) {
+    let mode = cfg.failsafe.mode.clone();
+    let timeout_ms = cfg.failsafe.timeout_secs.saturating_mul(1000);
+    if mode == "hold" || timeout_ms == 0 {
+        if mode != "hold" {
+            warn!(mode, "failsafe.timeout_secs = 0 → behaves like 'hold'");
         }
-        _ = listener => {
-            warn!("ArtNet listener task ended unexpectedly");
-        }
+        return;
     }
 
-    // Failsafe on shutdown. v1 only implements "hold": Neewer lights keep their
-    // last commanded state when BLE drops, so there's nothing to send.
-    if cfg.failsafe.mode != "hold" {
-        warn!(mode = %cfg.failsafe.mode, "failsafe mode not implemented yet; treating as 'hold'");
-    }
-    info!("failsafe = hold: lights keep their last state");
-    Ok(())
+    tokio::spawn(async move {
+        let mut tick = interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut announced = false;
+        loop {
+            tick.tick().await;
+            let idle_ms = (base.elapsed().as_millis() as u64)
+                .saturating_sub(last_artnet.load(Ordering::Relaxed));
+            if idle_ms < timeout_ms {
+                announced = false;
+                continue;
+            }
+            if !announced {
+                warn!(mode, idle_secs = idle_ms / 1000, "ArtNet lost — applying failsafe");
+                announced = true;
+            }
+            for s in &sinks {
+                match mode.as_str() {
+                    "blackout" => {
+                        s.tx.send_if_modified(|st| {
+                            if st.brightness != 0 {
+                                st.brightness = 0;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                    "poweroff" => {
+                        s.tx.send_if_modified(|st| {
+                            if st.power {
+                                st.power = false;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
 }

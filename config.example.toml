@@ -15,9 +15,12 @@ flush_hz   = 15          # max BLE updates per light per second (coalescing cap)
 probe_secs = 20          # liveness RSSI-probe interval (stale-session detection)
 
 [failsafe]
-# What lights do when ArtNet data stops. v1 implements "hold" only.
-mode         = "hold"    # hold | blackout | poweroff  (latter two: future)
-timeout_secs = 0         # 0 = hold forever; >0 = act after N seconds of silence
+# What lights do when ArtNet data stops arriving.
+#   hold     = keep last state forever (Neewer lights hold their setting)
+#   blackout = after timeout, set brightness to 0 (light stays powered/connected)
+#   poweroff = after timeout, send BLE power-off
+mode         = "hold"
+timeout_secs = 0         # 0 = never act (hold); >0 = act after N seconds of silence
 
 # --- Lights -----------------------------------------------------------------
 # Add one [[lights]] block per fixture. Use `neewer-bridge scan` to find MACs.
