@@ -7,12 +7,12 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use tracing::error;
 
 use neewer_bridge::config::Config;
-use neewer_bridge::{commands, logging};
+use neewer_bridge::{bridge, commands, logging};
 
 #[derive(Parser)]
 #[command(name = "neewer-bridge", version, about = "ArtNet → Neewer Bluetooth light bridge")]
@@ -70,20 +70,26 @@ async fn main() {
 }
 
 async fn dispatch(cli: &Cli) -> Result<()> {
-    // scan/test/monitor don't require a config file to exist — fall back to
-    // defaults so the tools work out of the box. `run` will require a valid one.
-    let cfg = Config::load(&cli.config).unwrap_or_default();
-
     match &cli.command {
+        // scan/test/monitor don't require a config file — fall back to defaults
+        // so the tools work out of the box.
         Command::Scan { seconds, all } => {
+            let cfg = Config::load(&cli.config).unwrap_or_default();
             commands::scan(&cfg.ble.adapter, *seconds, *all).await
         }
         Command::Test { mac, driver, seconds } => {
+            let cfg = Config::load(&cli.config).unwrap_or_default();
             commands::test(&cfg.ble.adapter, mac, driver, *seconds).await
         }
-        Command::Monitor => commands::monitor(&cfg.artnet.bind_ip).await,
+        Command::Monitor => {
+            let cfg = Config::load(&cli.config).unwrap_or_default();
+            commands::monitor(&cfg.artnet.bind_ip, cfg.artnet.port).await
+        }
+        // `run` requires a valid config (it defines the light bindings).
         Command::Run => {
-            anyhow::bail!("`run` is not implemented yet (per-light BLE actors come next)")
+            let cfg = Config::load(&cli.config)
+                .with_context(|| format!("loading config {} (required for `run`)", cli.config.display()))?;
+            bridge::run(cfg).await
         }
     }
 }

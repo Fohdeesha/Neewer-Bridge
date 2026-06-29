@@ -4,8 +4,10 @@
 # power-on or discovery order.
 
 [artnet]
-# Local IP to receive ArtNet on (UDP 6454). 0.0.0.0 = listen on all interfaces.
+# Local IP to receive ArtNet on. 0.0.0.0 = listen on all interfaces.
 bind_ip = "0.0.0.0"
+# UDP port to listen on. 6454 is the ArtNet standard; change only if needed.
+port = 6454
 
 [ble]
 adapter    = "default"   # "default" = first Bluetooth adapter

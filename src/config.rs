@@ -23,9 +23,13 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ArtNet {
-    /// Local IP to bind the ArtNet UDP listener to (port 6454). `0.0.0.0` = all.
+    /// Local IP to bind the ArtNet UDP listener to. `0.0.0.0` = all interfaces.
     #[serde(default = "default_bind_ip")]
     pub bind_ip: String,
+    /// UDP port to listen on. Defaults to the standard ArtNet port (6454) but is
+    /// configurable so the bridge isn't locked to it.
+    #[serde(default = "default_artnet_port")]
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -74,7 +78,7 @@ pub struct LightCfg {
 
 impl Default for ArtNet {
     fn default() -> Self {
-        Self { bind_ip: default_bind_ip() }
+        Self { bind_ip: default_bind_ip(), port: default_artnet_port() }
     }
 }
 impl Default for Ble {
@@ -94,6 +98,9 @@ impl Default for Failsafe {
 
 fn default_bind_ip() -> String {
     "0.0.0.0".into()
+}
+fn default_artnet_port() -> u16 {
+    crate::artnet::ARTNET_PORT
 }
 fn default_adapter() -> String {
     "default".into()

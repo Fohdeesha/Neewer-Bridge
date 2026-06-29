@@ -75,11 +75,11 @@ pub fn split_port_address(port_address: u16) -> (u8, u8, u8) {
 
 /// Bind the ArtNet UDP listener and call `on_packet` for every valid ArtDmx
 /// datagram received. Runs until the socket errors or the task is cancelled.
-pub async fn listen<F>(bind_ip: &str, mut on_packet: F) -> Result<()>
+pub async fn listen<F>(bind_ip: &str, port: u16, mut on_packet: F) -> Result<()>
 where
     F: FnMut(SocketAddr, ArtDmx),
 {
-    let addr = format!("{bind_ip}:{ARTNET_PORT}");
+    let addr = format!("{bind_ip}:{port}");
     let sock = UdpSocket::bind(&addr)
         .await
         .with_context(|| format!("binding ArtNet listener to {addr}"))?;

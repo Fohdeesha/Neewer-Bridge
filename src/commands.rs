@@ -40,9 +40,9 @@ pub async fn scan(adapter_selector: &str, seconds: u64, all: bool) -> Result<()>
 /// `monitor` — bind the ArtNet listener and print a summary of every ArtDmx
 /// packet received. Hardware-free; point a console / QLC+ at this host to verify
 /// ArtNet reception, universe addressing, and channel data without any lights.
-pub async fn monitor(bind_ip: &str) -> Result<()> {
-    info!(bind_ip, port = artnet::ARTNET_PORT, "ArtNet monitor — press Ctrl-C to stop");
-    artnet::listen(bind_ip, |src, pkt| {
+pub async fn monitor(bind_ip: &str, port: u16) -> Result<()> {
+    info!(bind_ip, port, "ArtNet monitor — press Ctrl-C to stop");
+    artnet::listen(bind_ip, port, |src, pkt| {
         let (net, sub_net, universe) = artnet::split_port_address(pkt.port_address);
         let preview: Vec<String> = pkt.data.iter().take(12).map(|b| format!("{b:3}")).collect();
         info!(

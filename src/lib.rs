@@ -6,8 +6,11 @@
 
 pub mod artnet;
 pub mod ble;
+pub mod bridge;
 pub mod commands;
 pub mod config;
+pub mod driver;
+pub mod light;
 pub mod logging;
 pub mod profile;
 pub mod protocol;

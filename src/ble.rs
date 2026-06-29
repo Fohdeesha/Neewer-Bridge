@@ -137,6 +137,52 @@ pub async fn find_by_mac(adapter: &Adapter, target_mac: &str, timeout: Duration)
     }
 }
 
+/// Start a continuous scan (idempotent-ish). The bridge runs ONE shared scan and
+/// each light actor finds its peripheral from the discovered set — avoids the
+/// per-actor `start_scan`/`stop_scan` churn that can fight on one adapter.
+pub async fn start_scan(adapter: &Adapter) -> Result<()> {
+    adapter
+        .start_scan(ScanFilter::default())
+        .await
+        .context("start_scan failed (check Bluetooth permissions / adapter power)")?;
+    Ok(())
+}
+
+/// Look for a peripheral with `target_mac` among those already discovered by the
+/// shared scan. Returns `(peripheral, ble_name)` or `None` if not seen yet.
+pub async fn find_scanned(adapter: &Adapter, target_mac: &str) -> Result<Option<(Peripheral, String)>> {
+    let target = normalize_mac(target_mac);
+    for p in adapter.peripherals().await.context("listing peripherals")? {
+        if let Ok(Some(props)) = p.properties().await {
+            if normalize_mac(&props.address.to_string()) == target {
+                let name = props.local_name.unwrap_or_default();
+                return Ok(Some((p, name)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Find any readable characteristic for use as a non-mutating liveness probe
+/// (NOTES.md §5). Standard Generic Access chars (e.g. Device Name) are usually
+/// readable even if the Neewer control chars are not.
+pub fn find_readable_char(p: &Peripheral) -> Option<Characteristic> {
+    p.characteristics()
+        .into_iter()
+        .find(|c| c.properties.contains(CharPropFlags::READ))
+}
+
+/// Read a characteristic with a timeout — the liveness probe round-trip. Returns
+/// `true` if the read completed (link is alive), `false` on error/timeout.
+pub async fn probe_read(p: &Peripheral, c: &Characteristic, timeout: Duration) -> bool {
+    matches!(tokio::time::timeout(timeout, p.read(c)).await, Ok(Ok(_)))
+}
+
+/// Whether btleplug currently believes the peripheral is connected.
+pub async fn is_connected(p: &Peripheral) -> bool {
+    p.is_connected().await.unwrap_or(false)
+}
+
 /// The characteristics needed to talk to a Neewer light.
 pub struct NeewerChars {
     pub write: Characteristic,
