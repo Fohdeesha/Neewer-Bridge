@@ -2,8 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
+use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
 use crate::artnet;
@@ -12,6 +13,20 @@ use crate::config::{self, parse_mac, LightCfg, KNOWN_DRIVERS};
 use crate::driver::Driver;
 use crate::profile::Profile;
 use crate::protocol::{classic, home, infinity};
+
+/// Minimal JSON string escaping (quotes + backslashes) for `scan --json`.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// Print a prompt and read one trimmed line from stdin.
 async fn prompt(reader: &mut BufReader<Stdin>, msg: &str) -> Result<String> {
@@ -31,11 +46,31 @@ async fn prompt_default(reader: &mut BufReader<Stdin>, msg: &str, default: &str)
 
 /// `scan` — discover and list lights. Prints a human table; Neewer lights are
 /// flagged and shown first so you can copy the MAC straight into the config.
-pub async fn scan(adapter_selector: &str, seconds: u64, all: bool) -> Result<()> {
+pub async fn scan(adapter_selector: &str, seconds: u64, all: bool, json: bool) -> Result<()> {
     let adapter = ble::acquire_adapter(adapter_selector).await?;
     let found = ble::scan(&adapter, seconds).await?;
 
     let shown: Vec<_> = found.iter().filter(|f| all || f.is_neewer).collect();
+
+    if json {
+        // Machine-readable output (one JSON array) for automated tooling.
+        let items: Vec<String> = shown
+            .iter()
+            .map(|f| {
+                let rssi = f.rssi.map(|r| r.to_string()).unwrap_or_else(|| "null".into());
+                format!(
+                    "{{\"name\":\"{}\",\"mac\":\"{}\",\"rssi\":{},\"neewer\":{}}}",
+                    json_escape(&f.name),
+                    json_escape(&f.address),
+                    rssi,
+                    f.is_neewer
+                )
+            })
+            .collect();
+        println!("[{}]", items.join(","));
+        return Ok(());
+    }
+
     if shown.is_empty() {
         println!("\nNo {}lights found. Is the light powered on and in range?", if all { "" } else { "Neewer " });
         println!("(Try `--all` to list every BLE device, or `--seconds N` for a longer scan.)");
@@ -144,6 +179,118 @@ pub async fn add(config_path: &Path, adapter_selector: &str) -> Result<()> {
     };
     config::append_light(config_path, &entry)?;
     println!("\n✓ Added {} to {}. Edit it there to fine-tune.", entry.mac, config_path.display());
+    Ok(())
+}
+
+/// Non-interactive `add` (when `--mac` is given): no prompts, scriptable. Blinks
+/// only if `blink` is set (and only then needs the light present).
+#[allow(clippy::too_many_arguments)]
+pub async fn add_noninteractive(
+    config_path: &Path,
+    adapter_selector: &str,
+    mac: &str,
+    driver: &str,
+    profile: &str,
+    universe: u16,
+    address: u16,
+    name: Option<&str>,
+    blink: bool,
+) -> Result<()> {
+    if !KNOWN_DRIVERS.contains(&driver) {
+        bail!("unknown driver {driver:?}");
+    }
+    if Profile::parse(profile).is_none() {
+        bail!("unknown profile {profile:?}");
+    }
+    let mac_bytes = parse_mac(mac)?;
+    let mut resolved_name = name.map(|s| s.to_string());
+
+    if blink {
+        let adapter = ble::acquire_adapter(adapter_selector).await?;
+        let peripheral = ble::find_by_mac(&adapter, mac, Duration::from_secs(10)).await?;
+        let ble_name = ble::peripheral_name(&peripheral).await;
+        if resolved_name.is_none() && !ble_name.is_empty() {
+            resolved_name = Some(ble_name.clone());
+        }
+        let drv = Driver::resolve(driver, Profile::Full, mac_bytes, &ble_name);
+        match ble::connect_and_verify(&peripheral).await {
+            Ok(chars) => {
+                info!("blinking light to identify");
+                for _ in 0..3 {
+                    let _ = ble::write_command(&peripheral, &chars.write, &drv.power(false)).await;
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    let _ = ble::write_command(&peripheral, &chars.write, &drv.power(true)).await;
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                }
+                let _ = ble::disconnect(&peripheral).await;
+            }
+            Err(e) => warn!(error = %e, "could not connect to blink; adding anyway"),
+        }
+    }
+
+    let entry = LightCfg {
+        mac: config::normalize_mac(mac),
+        name: resolved_name,
+        driver: driver.to_string(),
+        profile: profile.to_string(),
+        universe,
+        address,
+        power_on_connect: true,
+    };
+    config::append_light(config_path, &entry)?;
+    println!("Added {} ({}, u{} a{}) to {}", entry.mac, entry.profile, universe, address, config_path.display());
+    Ok(())
+}
+
+/// `artnet-send` — send ArtDmx to drive the bridge (or any node) without a
+/// physical console. One-shot by default; `--hz` streams for `--seconds`.
+/// Channels are placed starting at `address`; earlier channels are zero-padded.
+pub async fn artnet_send(
+    target: &str,
+    port: u16,
+    universe: u16,
+    address: u16,
+    channels: &[u8],
+    hz: Option<f64>,
+    seconds: f64,
+) -> Result<()> {
+    let sock = UdpSocket::bind("0.0.0.0:0").await.context("binding sender socket")?;
+    let dest = format!("{target}:{port}");
+
+    let start = (address.max(1) - 1) as usize;
+    let mut data = vec![0u8; start + channels.len()];
+    data[start..].copy_from_slice(channels);
+    if data.len() < 2 {
+        data.resize(2, 0); // ArtNet length is 2..=512
+    }
+    if data.len() % 2 == 1 {
+        data.push(0); // even length
+    }
+
+    match hz {
+        Some(h) if h > 0.0 => {
+            let period = Duration::from_secs_f64(1.0 / h);
+            let end = Instant::now() + Duration::from_secs_f64(seconds);
+            let mut seq: u8 = 1;
+            let mut count = 0u64;
+            while Instant::now() < end {
+                let pkt = artnet::encode_artdmx(universe, seq, &data);
+                sock.send_to(&pkt, &dest).await.context("sending")?;
+                seq = seq.wrapping_add(1);
+                if seq == 0 {
+                    seq = 1;
+                }
+                count += 1;
+                tokio::time::sleep(period).await;
+            }
+            info!(target = %dest, universe, address, packets = count, "streamed ArtDmx @ {h}Hz for {seconds}s");
+        }
+        _ => {
+            let pkt = artnet::encode_artdmx(universe, 1, &data);
+            sock.send_to(&pkt, &dest).await.context("sending")?;
+            info!(target = %dest, universe, address, channels = ?channels, "sent 1 ArtDmx packet");
+        }
+    }
     Ok(())
 }
 

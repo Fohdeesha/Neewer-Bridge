@@ -248,6 +248,16 @@ pub async fn spawn_notify_logger(p: &Peripheral, notify: &Characteristic) -> Res
     Ok(())
 }
 
+/// The peripheral's advertised local name (empty if unavailable).
+pub async fn peripheral_name(p: &Peripheral) -> String {
+    p.properties()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|pr| pr.local_name)
+        .unwrap_or_default()
+}
+
 /// Cleanly drop a connection (best-effort).
 pub async fn disconnect(p: &Peripheral) -> Result<()> {
     p.disconnect().await.context("disconnect failed")?;

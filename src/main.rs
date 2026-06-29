@@ -39,9 +39,59 @@ enum Command {
         /// Show all BLE devices, not just Neewer ones.
         #[arg(long)]
         all: bool,
+        /// Output machine-readable JSON (for scripting).
+        #[arg(long)]
+        json: bool,
     },
-    /// Interactively scan, blink-to-identify, and add a light to the config.
-    Add,
+    /// Add a light to the config. With no `--mac`, runs interactively (scan +
+    /// blink-to-identify + prompts); with `--mac`, runs non-interactively.
+    Add {
+        /// Light MAC. If given, runs non-interactively.
+        #[arg(long)]
+        mac: Option<String>,
+        /// Protocol driver: auto | classic | infinity | home.
+        #[arg(long, default_value = "auto")]
+        driver: String,
+        /// DMX profile (required with --mac): cct | cct_gm | hsi | full.
+        #[arg(long)]
+        profile: Option<String>,
+        /// ArtNet universe / Port-Address (required with --mac).
+        #[arg(long)]
+        universe: Option<u16>,
+        /// DMX start address (required with --mac).
+        #[arg(long)]
+        address: Option<u16>,
+        /// Optional light name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Blink the light to identify it (non-interactive mode).
+        #[arg(long)]
+        blink: bool,
+    },
+    /// Send ArtDmx to drive the bridge/a node (no console needed). Test helper.
+    ArtnetSend {
+        /// Destination IP.
+        #[arg(long, default_value = "127.0.0.1")]
+        target: String,
+        /// Destination UDP port.
+        #[arg(long, default_value_t = 6454)]
+        port: u16,
+        /// ArtNet universe / Port-Address.
+        #[arg(long, default_value_t = 0)]
+        universe: u16,
+        /// DMX start address for the channel values.
+        #[arg(long, default_value_t = 1)]
+        address: u16,
+        /// Comma-separated channel values, e.g. 255,128,64.
+        #[arg(long, value_delimiter = ',', required = true)]
+        channels: Vec<u8>,
+        /// Stream at this rate (Hz). Omit for a single packet.
+        #[arg(long)]
+        hz: Option<f64>,
+        /// Stream duration in seconds (with --hz).
+        #[arg(long, default_value_t = 2.0)]
+        seconds: f64,
+    },
     /// Connect to one light by MAC and prove BLE control (blink + set CCT).
     Test {
         /// Target light MAC, e.g. AA:BB:CC:DD:EE:FF.
@@ -75,13 +125,28 @@ async fn dispatch(cli: &Cli) -> Result<()> {
     match &cli.command {
         // scan/test/monitor don't require a config file — fall back to defaults
         // so the tools work out of the box.
-        Command::Scan { seconds, all } => {
+        Command::Scan { seconds, all, json } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
-            commands::scan(&cfg.ble.adapter, *seconds, *all).await
+            commands::scan(&cfg.ble.adapter, *seconds, *all, *json).await
         }
-        Command::Add => {
+        Command::Add { mac, driver, profile, universe, name, blink, address } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
-            commands::add(&cli.config, &cfg.ble.adapter).await
+            match mac {
+                Some(mac) => {
+                    let profile = profile.as_deref().context("--profile is required with --mac")?;
+                    let universe = universe.context("--universe is required with --mac")?;
+                    let address = address.context("--address is required with --mac")?;
+                    commands::add_noninteractive(
+                        &cli.config, &cfg.ble.adapter, mac, driver, profile, universe, address,
+                        name.as_deref(), *blink,
+                    )
+                    .await
+                }
+                None => commands::add(&cli.config, &cfg.ble.adapter).await,
+            }
+        }
+        Command::ArtnetSend { target, port, universe, address, channels, hz, seconds } => {
+            commands::artnet_send(target, *port, *universe, *address, channels, *hz, *seconds).await
         }
         Command::Test { mac, driver, seconds } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();

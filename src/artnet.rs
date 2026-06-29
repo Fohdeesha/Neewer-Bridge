@@ -64,6 +64,23 @@ pub fn parse_artdmx(buf: &[u8]) -> Option<ArtDmx> {
     Some(ArtDmx { sequence, physical, port_address, data })
 }
 
+/// Encode an ArtDmx datagram for a given Port-Address. Used by the `artnet-send`
+/// test command (and the parser round-trip test). `data` is truncated to 512.
+pub fn encode_artdmx(port_address: u16, sequence: u8, data: &[u8]) -> Vec<u8> {
+    let len = data.len().min(512);
+    let mut p = Vec::with_capacity(18 + len);
+    p.extend_from_slice(ARTNET_ID);
+    p.extend_from_slice(&OP_DMX.to_le_bytes()); // opcode, low byte first
+    p.extend_from_slice(&[0x00, 14]); // ProtVer, big-endian (current = 14)
+    p.push(sequence);
+    p.push(0); // physical
+    p.push((port_address & 0xFF) as u8); // SubUni
+    p.push(((port_address >> 8) & 0x7F) as u8); // Net
+    p.extend_from_slice(&(len as u16).to_be_bytes()); // length, big-endian
+    p.extend_from_slice(&data[..len]);
+    p
+}
+
 /// Decompose a 15-bit Port-Address back into (Net, Sub-Net, Universe) — handy
 /// for human-readable logging.
 pub fn split_port_address(port_address: u16) -> (u8, u8, u8) {
@@ -181,5 +198,14 @@ mod tests {
         let data = vec![0xAB; 512];
         let pkt = parse_artdmx(&make(0, 0, 0, &data)).unwrap();
         assert_eq!(pkt.data.len(), 512);
+    }
+
+    #[test]
+    fn encode_parse_round_trip() {
+        let data = [1u8, 2, 3, 4, 5, 6];
+        let pkt = parse_artdmx(&encode_artdmx(0x0123, 9, &data)).unwrap();
+        assert_eq!(pkt.port_address, 0x0123);
+        assert_eq!(pkt.sequence, 9);
+        assert_eq!(pkt.data, data);
     }
 }
