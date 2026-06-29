@@ -248,6 +248,17 @@ pub async fn spawn_notify_logger(p: &Peripheral, notify: &Characteristic) -> Res
     Ok(())
 }
 
+/// The most recent advertisement RSSI for this peripheral (dBm), if known.
+///
+/// This is **advertisement** RSSI (btleplug exposes no on-demand connected-link
+/// RSSI — see NOTES.md). It's refreshed by the shared scan while the device
+/// advertises; a device that stops advertising once connected keeps its last
+/// value. Good for signal-strength diagnostics, NOT for liveness (we use a GATT
+/// read probe for that). Always `None` on macOS/CoreBluetooth.
+pub async fn rssi(p: &Peripheral) -> Option<i16> {
+    p.properties().await.ok().flatten().and_then(|pr| pr.rssi)
+}
+
 /// The peripheral's advertised local name (empty if unavailable).
 pub async fn peripheral_name(p: &Peripheral) -> String {
     p.properties()

@@ -128,7 +128,14 @@ impl LightActor {
 
         let mut last_sent: Option<LightState> = None;
         let mut failures: u32 = 0;
-        info!(light = %label, flush_hz = self.flush_hz, probe_secs = self.probe_secs, "session active");
+        let rssi0 = ble::rssi(p).await;
+        info!(
+            light = %label,
+            flush_hz = self.flush_hz,
+            probe_secs = self.probe_secs,
+            rssi = ?rssi0,
+            "session active"
+        );
 
         loop {
             tokio::select! {
@@ -156,6 +163,8 @@ impl LightActor {
                     }
                 }
                 _ = probe.tick() => {
+                    // Advertisement RSSI (diagnostics only — not the liveness signal).
+                    let rssi = ble::rssi(p).await;
                     if !ble::is_connected(p).await {
                         bail!("peripheral reports disconnected");
                     }
@@ -165,13 +174,16 @@ impl LightActor {
                                 debug!(light = %label, "liveness restored");
                             }
                             failures = 0;
+                            debug!(light = %label, rssi = ?rssi, "liveness ok");
                         } else {
                             failures += 1;
-                            warn!(light = %label, failures, "liveness probe failed");
+                            warn!(light = %label, failures, rssi = ?rssi, "liveness probe failed");
                             if failures >= MAX_PROBE_FAILURES {
                                 bail!("stale session: {failures} consecutive probe failures");
                             }
                         }
+                    } else {
+                        debug!(light = %label, rssi = ?rssi, "alive (is_connected; no readable char)");
                     }
                 }
             }
