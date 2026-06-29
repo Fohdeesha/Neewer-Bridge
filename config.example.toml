@@ -1,0 +1,38 @@
+# Neewer-Bridge configuration example.
+# Copy to `neewer-bridge.toml` and edit. Lights are bound by MAC address, so the
+# DMX-channel -> physical-light mapping is identical on every boot regardless of
+# power-on or discovery order.
+
+[artnet]
+# Local IP to receive ArtNet on (UDP 6454). 0.0.0.0 = listen on all interfaces.
+bind_ip = "0.0.0.0"
+
+[ble]
+adapter    = "default"   # "default" = first Bluetooth adapter
+flush_hz   = 15          # max BLE updates per light per second (coalescing cap)
+probe_secs = 20          # liveness RSSI-probe interval (stale-session detection)
+
+[failsafe]
+# What lights do when ArtNet data stops. v1 implements "hold" only.
+mode         = "hold"    # hold | blackout | poweroff  (latter two: future)
+timeout_secs = 0         # 0 = hold forever; >0 = act after N seconds of silence
+
+# --- Lights -----------------------------------------------------------------
+# Add one [[lights]] block per fixture. Use `neewer-bridge scan` to find MACs.
+
+[[lights]]
+mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)
+name     = "Key light"          # optional label
+driver   = "auto"               # auto | classic | infinity | home
+profile  = "full"               # cct | cct_gm | hsi | full   (see NOTES.md §8.1)
+universe = 0                    # ArtNet 15-bit Port-Address (Net/Sub-Net/Universe)
+address  = 1                    # 1-based DMX start channel
+power_on_connect = true
+
+# [[lights]]
+# mac      = "11:22:33:44:55:66"
+# name     = "Back light"
+# driver   = "auto"
+# profile  = "cct_gm"
+# universe = 0
+# address  = 8

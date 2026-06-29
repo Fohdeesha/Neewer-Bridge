@@ -14,8 +14,20 @@ name = "neewer_bridge"
 path = "src/lib.rs"
 
 [dependencies]
-# Deps are added per-milestone to keep build times fast while iterating.
-# Protocol + ArtNet parsing need nothing external. BLE/CLI/config deps come next.
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "net"] }
+futures = "0.3"
+# Cross-platform BLE (WinRT / BlueZ / CoreBluetooth)
+btleplug = "0.11"
+uuid = "1"
+# CLI + config
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Errors + logging (debuggability)
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 lto = true
