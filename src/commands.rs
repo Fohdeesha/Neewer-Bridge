@@ -95,6 +95,57 @@ pub fn models() -> Result<()> {
     Ok(())
 }
 
+/// `lights` — print every configured light and its DMX channel mapping, showing
+/// the absolute ArtNet universe + DMX channel each parameter lands on. This is a
+/// static view of the config bindings (the source of truth for DMX→light); live
+/// connection state appears in `run`'s logs.
+pub fn lights(cfg: &config::Config) -> Result<()> {
+    println!(
+        "ArtNet {}:{}   BLE adapter: {:?}   failsafe: {} (timeout {}s)",
+        cfg.artnet.bind_ip, cfg.artnet.port, cfg.ble.adapter, cfg.failsafe.mode, cfg.failsafe.timeout_secs,
+    );
+    if cfg.lights.is_empty() {
+        println!("\nNo lights configured. Use `neewer-bridge add` to bind one by MAC.");
+        return Ok(());
+    }
+    println!("\nConfigured lights ({}):", cfg.lights.len());
+
+    let mut advanced_used = false;
+    for (i, l) in cfg.lights.iter().enumerate() {
+        // Profile is validated at config load, so parse can't fail here.
+        let profile = Profile::parse(&l.profile).unwrap_or(Profile::Cct);
+        if profile == Profile::Advanced {
+            advanced_used = true;
+        }
+        let (net, sub_net, uni) = artnet::split_port_address(l.universe);
+        let last = l.address + profile.channel_count() - 1;
+
+        println!("\n  [{}] {}  ({})", i + 1, l.name.as_deref().unwrap_or("(unnamed)"), l.mac);
+        println!(
+            "      driver {} · profile {} · CCT {}00-{}00K · power-on-connect {}",
+            l.driver, l.profile, l.cct_min, l.cct_max, l.power_on_connect,
+        );
+        println!(
+            "      universe {} (Net {} / Sub-Net {} / Universe {}) · DMX channels {}-{}",
+            l.universe, net, sub_net, uni, l.address, last,
+        );
+        for (off, role) in profile.channel_roles().iter().enumerate() {
+            println!("        U{} ch{:<3} → {}", l.universe, l.address + off as u16, role);
+        }
+    }
+
+    if advanced_used {
+        println!(
+            "\n  `advanced` Mode-select (ch1) value bands — selects how ch3+ are read:\n   \
+             0-31 CCT (ch3 CCT, ch4 GM) · 32-63 HSI (ch3 Hue, ch4 Sat) ·\n   \
+             64-95 FX (ch3 FX-id 1-18, ch4 Speed, ch5 CCT, ch6 Hue, ch7 Sat/GM, ch8 Extra, ch9 2nd-val) ·\n   \
+             128-159 RGBCW (ch3-7 = R,G,B,CW,WW) · 192-231 XY (ch3 X, ch4 Y).\n   \
+             Other bands → neutral white."
+        );
+    }
+    Ok(())
+}
+
 /// `scan` — discover and list lights. Prints a human table; Neewer lights are
 /// flagged and shown first so you can copy the MAC straight into the config.
 pub async fn scan(adapter_selector: &str, seconds: u64, all: bool, json: bool) -> Result<()> {

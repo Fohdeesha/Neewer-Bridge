@@ -56,6 +56,37 @@ impl Profile {
             Profile::Advanced => 10,
         }
     }
+
+    /// Per-channel role labels, in order from the light's start address (index 0
+    /// = the start channel). For `full` and `advanced` the later channels are
+    /// reinterpreted by the live Mode channel, so their labels list every mode's
+    /// meaning (`A / B / …`). Used by the `lights` command to print the mapping.
+    pub fn channel_roles(&self) -> &'static [&'static str] {
+        match self {
+            Profile::Cct => &["Dimmer", "CCT"],
+            Profile::CctGm => &["Dimmer", "CCT", "GM"],
+            Profile::Hsi => &["Dimmer", "Hue", "Saturation"],
+            Profile::Full => &[
+                "Dimmer",
+                "Mode-select (0-127 CCT / 128-255 HSI)",
+                "CCT / Hue",
+                "GM / Saturation",
+                "(reserved)",
+            ],
+            Profile::Advanced => &[
+                "Mode-select (CCT/HSI/FX/RGBCW/XY — see bands)",
+                "Dimmer",
+                "CCT / Hue / FX-id / R / X",
+                "GM / Saturation / FX-speed / G / Y",
+                "— / — / FX-CCT / B / —",
+                "— / — / FX-Hue / CW / —",
+                "— / — / FX-Sat+GM / WW / —",
+                "— / — / FX-extra / — / —",
+                "— / — / FX-2nd-value / — / —",
+                "(reserved)",
+            ],
+        }
+    }
 }
 
 /// `advanced` profile mode-channel (ch1) value bands. Mirrors the official Neewer

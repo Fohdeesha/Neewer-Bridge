@@ -80,6 +80,9 @@ enum Command {
     },
     /// List the known light-model catalog (capabilities `add` matches against).
     Models,
+    /// Show configured lights and their DMX channel mapping (absolute universe +
+    /// channel per parameter). Reads the config; requires a valid one.
+    Lights,
     /// Send ArtDmx to drive the bridge/a node (no console needed). Test helper.
     ArtnetSend {
         /// Destination IP.
@@ -174,6 +177,11 @@ async fn dispatch(cli: &Cli) -> Result<()> {
             }
         }
         Command::Models => commands::models(),
+        Command::Lights => {
+            let cfg = Config::load(&cli.config)
+                .with_context(|| format!("loading config {} (required for `lights`)", cli.config.display()))?;
+            commands::lights(&cfg)
+        }
         Command::Inspect { mac, seconds } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
             commands::inspect(&cfg.ble.adapter, mac, *seconds).await
