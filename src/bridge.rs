@@ -55,7 +55,8 @@ pub async fn run(cfg: Config) -> Result<()> {
         // as it connects, before any ArtNet arrives.
         let initial = LightState { power: light.power_on_connect, ..LightState::default() };
         let (tx, rx) = watch::channel(initial);
-        let sink = Arc::new(Sink { address: light.address, profile, cct: CctRange::default(), tx });
+        let cct = CctRange { min: light.cct_min, max: light.cct_max };
+        let sink = Arc::new(Sink { address: light.address, profile, cct, tx });
         universe_map.entry(light.universe).or_default().push(sink.clone());
         all_sinks.push(sink);
 

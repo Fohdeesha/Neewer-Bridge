@@ -47,8 +47,13 @@ fn notify_uuid() -> Uuid {
     Uuid::parse_str(uuids::NOTIFY_CHAR).expect("valid notify char uuid")
 }
 
-/// Acquire a BLE adapter. `selector` is currently only `"default"` (first
-/// adapter); kept as a param so config-driven selection can grow later.
+/// Acquire a BLE adapter by `[ble] adapter` selector:
+///
+/// - `"default"` → first adapter,
+/// - a number (`"0"`, `"1"`) → that adapter index (see `adapters` command),
+/// - any other string → case-insensitive substring match on the OS info string.
+///
+/// On a miss it logs the available adapters and falls back to the first.
 pub async fn acquire_adapter(selector: &str) -> Result<Adapter> {
     let manager = Manager::new().await.context("creating BLE manager")?;
     let adapters = manager.adapters().await.context("listing BLE adapters")?;
@@ -57,23 +62,55 @@ pub async fn acquire_adapter(selector: &str) -> Result<Adapter> {
     if count == 0 {
         bail!("no Bluetooth adapter found — is Bluetooth enabled?");
     }
+
+    // Resolve the per-adapter info strings up front (used for index/substring
+    // matching and for the diagnostic listing).
+    let mut infos = Vec::with_capacity(count);
+    for a in &adapters {
+        infos.push(a.adapter_info().await.unwrap_or_else(|_| "<unknown>".into()));
+    }
+
     if selector != "default" {
-        // Best-effort: match adapter by its OS info string.
-        for a in &adapters {
-            if let Ok(info) = a.adapter_info().await {
-                if info.contains(selector) {
-                    info!(adapter = %info, "selected BLE adapter");
+        // 1) Numeric selector => adapter index (as printed by `adapters` / on a
+        //    mismatch). Lets users pick deterministically when info strings clash.
+        if let Ok(idx) = selector.parse::<usize>() {
+            if let Some(a) = adapters.get(idx) {
+                info!(index = idx, adapter = %infos[idx], "selected BLE adapter (by index)");
+                return Ok(a.clone());
+            }
+            warn!(selector, count, "adapter index out of range; falling back to first");
+        } else {
+            // 2) Otherwise, case-insensitive substring match on the info string.
+            let needle = selector.to_lowercase();
+            for (i, a) in adapters.iter().enumerate() {
+                if infos[i].to_lowercase().contains(&needle) {
+                    info!(index = i, adapter = %infos[i], "selected BLE adapter (by name)");
                     return Ok(a.clone());
                 }
             }
+            warn!(selector, "no adapter matched selector; falling back to first");
         }
-        warn!(selector, "no adapter matched selector; falling back to first");
+        // Help the user fix their config: show what IS available.
+        for (i, info) in infos.iter().enumerate() {
+            warn!(index = i, adapter = %info, "available adapter");
+        }
     }
+
     let adapter = adapters.into_iter().next().unwrap();
-    if let Ok(info) = adapter.adapter_info().await {
-        info!(adapter = %info, "using BLE adapter");
-    }
+    info!(index = 0usize, adapter = %infos[0], total = count, "using BLE adapter");
     Ok(adapter)
+}
+
+/// Enumerate BLE adapters with their index + OS info string (for `adapters` CLI
+/// and so users know what to put in `[ble] adapter`).
+pub async fn list_adapters() -> Result<Vec<(usize, String)>> {
+    let manager = Manager::new().await.context("creating BLE manager")?;
+    let adapters = manager.adapters().await.context("listing BLE adapters")?;
+    let mut out = Vec::with_capacity(adapters.len());
+    for (i, a) in adapters.iter().enumerate() {
+        out.push((i, a.adapter_info().await.unwrap_or_else(|_| "<unknown>".into())));
+    }
+    Ok(out)
 }
 
 /// Scan for `secs` seconds and return everything seen (Neewer or not). Sorted by
@@ -88,6 +125,7 @@ pub async fn scan(adapter: &Adapter, secs: u64) -> Result<Vec<Found>> {
     let peripherals = adapter.peripherals().await.context("listing peripherals")?;
     let _ = adapter.stop_scan().await;
 
+    let service_uuid = Uuid::parse_str(crate::protocol::uuids::SERVICE).ok();
     let mut out = Vec::new();
     for p in peripherals {
         match p.properties().await {
@@ -95,8 +133,14 @@ pub async fn scan(adapter: &Adapter, secs: u64) -> Result<Vec<Found>> {
                 let name = props.local_name.unwrap_or_default();
                 let address = props.address.to_string();
                 let rssi = props.rssi;
-                let is_neewer = is_neewer_name(&name);
-                debug!(%address, name = %name, ?rssi, is_neewer, "discovered peripheral");
+                // Definitive: advertises the Neewer service UUID. Fallback: name.
+                let advertises_service =
+                    service_uuid.map(|su| props.services.contains(&su)).unwrap_or(false);
+                let is_neewer = advertises_service || is_neewer_name(&name);
+                debug!(
+                    %address, name = %name, ?rssi, is_neewer, advertises_service,
+                    services = ?props.services, "discovered peripheral"
+                );
                 out.push(Found { name, address, rssi, is_neewer, peripheral: p });
             }
             Ok(None) => debug!("peripheral with no properties; skipping"),
@@ -246,6 +290,36 @@ pub async fn spawn_notify_logger(p: &Peripheral, notify: &Characteristic) -> Res
         debug!("notification stream ended");
     });
     Ok(())
+}
+
+/// One characteristic's identity + value, for the `inspect` diagnostic.
+pub struct CharInfo {
+    pub uuid: String,
+    pub props: String,
+    pub value: Option<Vec<u8>>,
+}
+
+/// Connect, discover services, and read every readable characteristic — a
+/// generic GATT dump for identifying unknown / non-standard lights.
+pub async fn inspect(p: &Peripheral) -> Result<Vec<CharInfo>> {
+    if !p.is_connected().await.unwrap_or(false) {
+        p.connect().await.context("connect failed")?;
+    }
+    p.discover_services().await.context("service discovery failed")?;
+    let mut out = Vec::new();
+    for c in p.characteristics() {
+        let value = if c.properties.contains(CharPropFlags::READ) {
+            p.read(&c).await.ok()
+        } else {
+            None
+        };
+        out.push(CharInfo {
+            uuid: c.uuid.to_string(),
+            props: format!("{:?}", c.properties),
+            value,
+        });
+    }
+    Ok(out)
 }
 
 /// The most recent advertisement RSSI for this peripheral (dBm), if known.

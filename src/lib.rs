@@ -12,5 +12,6 @@ pub mod config;
 pub mod driver;
 pub mod light;
 pub mod logging;
+pub mod models;
 pub mod profile;
 pub mod protocol;

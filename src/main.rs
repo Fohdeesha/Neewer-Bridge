@@ -31,6 +31,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List BLE adapters (index + name) for the `[ble] adapter` config setting.
+    Adapters,
     /// Scan for Neewer lights and list name / MAC / RSSI.
     Scan {
         /// Scan duration in seconds.
@@ -44,15 +46,17 @@ enum Command {
         json: bool,
     },
     /// Add a light to the config. With no `--mac`, runs interactively (scan +
-    /// blink-to-identify + prompts); with `--mac`, runs non-interactively.
+    /// blink-to-identify + prompts); with `--mac`, runs non-interactively. The
+    /// light's model is identified from its BLE name against the catalog, so
+    /// driver/profile/CCT-range are filled automatically — any flag overrides.
     Add {
         /// Light MAC. If given, runs non-interactively.
         #[arg(long)]
         mac: Option<String>,
-        /// Protocol driver: auto | classic | infinity | home.
-        #[arg(long, default_value = "auto")]
-        driver: String,
-        /// DMX profile (required with --mac): cct | cct_gm | hsi | full.
+        /// Protocol driver: auto | classic | infinity | home (default: from model).
+        #[arg(long)]
+        driver: Option<String>,
+        /// DMX profile: cct | cct_gm | hsi | full (default: from model).
         #[arg(long)]
         profile: Option<String>,
         /// ArtNet universe / Port-Address (required with --mac).
@@ -61,13 +65,21 @@ enum Command {
         /// DMX start address (required with --mac).
         #[arg(long)]
         address: Option<u16>,
-        /// Optional light name.
+        /// Optional light name (default: from model).
         #[arg(long)]
         name: Option<String>,
+        /// Override CCT range minimum, raw ×100K (default: from model).
+        #[arg(long)]
+        cct_min: Option<u8>,
+        /// Override CCT range maximum, raw ×100K (default: from model).
+        #[arg(long)]
+        cct_max: Option<u8>,
         /// Blink the light to identify it (non-interactive mode).
         #[arg(long)]
         blink: bool,
     },
+    /// List the known light-model catalog (capabilities `add` matches against).
+    Models,
     /// Send ArtDmx to drive the bridge/a node (no console needed). Test helper.
     ArtnetSend {
         /// Destination IP.
@@ -92,6 +104,14 @@ enum Command {
         #[arg(long, default_value_t = 2.0)]
         seconds: f64,
     },
+    /// Connect to a device and dump its full GATT (identify unknown lights).
+    Inspect {
+        /// Target MAC.
+        mac: String,
+        /// How long to wait to find the device, seconds.
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+    },
     /// Connect to one light by MAC and prove BLE control (blink + set CCT).
     Test {
         /// Target light MAC, e.g. AA:BB:CC:DD:EE:FF.
@@ -102,6 +122,14 @@ enum Command {
         /// How long to wait to find the light, seconds.
         #[arg(long, default_value_t = 8)]
         seconds: u64,
+        /// After CCT, cycle HSI red→green→blue to probe RGB capability (watch
+        /// whether the light changes colour — confirms RGB vs bi-color).
+        #[arg(long)]
+        colors: bool,
+        /// Probe the advanced modes: cycle RGBCW, XY, and a few FX effects (watch
+        /// the light to confirm each engages). Implies the light supports them.
+        #[arg(long)]
+        modes: bool,
     },
     /// Listen for ArtNet and print received ArtDmx packets (no BLE needed).
     Monitor,
@@ -125,32 +153,37 @@ async fn dispatch(cli: &Cli) -> Result<()> {
     match &cli.command {
         // scan/test/monitor don't require a config file — fall back to defaults
         // so the tools work out of the box.
+        Command::Adapters => commands::adapters().await,
         Command::Scan { seconds, all, json } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
             commands::scan(&cfg.ble.adapter, *seconds, *all, *json).await
         }
-        Command::Add { mac, driver, profile, universe, name, blink, address } => {
+        Command::Add { mac, driver, profile, universe, name, blink, address, cct_min, cct_max } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
             match mac {
                 Some(mac) => {
-                    let profile = profile.as_deref().context("--profile is required with --mac")?;
                     let universe = universe.context("--universe is required with --mac")?;
                     let address = address.context("--address is required with --mac")?;
                     commands::add_noninteractive(
-                        &cli.config, &cfg.ble.adapter, mac, driver, profile, universe, address,
-                        name.as_deref(), *blink,
+                        &cli.config, &cfg.ble.adapter, mac, driver.as_deref(), profile.as_deref(),
+                        universe, address, name.as_deref(), *cct_min, *cct_max, *blink,
                     )
                     .await
                 }
                 None => commands::add(&cli.config, &cfg.ble.adapter).await,
             }
         }
+        Command::Models => commands::models(),
+        Command::Inspect { mac, seconds } => {
+            let cfg = Config::load(&cli.config).unwrap_or_default();
+            commands::inspect(&cfg.ble.adapter, mac, *seconds).await
+        }
         Command::ArtnetSend { target, port, universe, address, channels, hz, seconds } => {
             commands::artnet_send(target, *port, *universe, *address, channels, *hz, *seconds).await
         }
-        Command::Test { mac, driver, seconds } => {
+        Command::Test { mac, driver, seconds, colors, modes } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
-            commands::test(&cfg.ble.adapter, mac, driver, *seconds).await
+            commands::test(&cfg.ble.adapter, mac, driver, *seconds, *colors, *modes).await
         }
         Command::Monitor => {
             let cfg = Config::load(&cli.config).unwrap_or_default();

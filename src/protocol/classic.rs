@@ -15,6 +15,8 @@ const PREFIX: u8 = 0x78;
 const TAG_POWER: u8 = 0x81;
 const TAG_CCT: u8 = 0x87;
 const TAG_HSI: u8 = 0x86;
+const TAG_RGBCW: u8 = 0xA8;
+const TAG_XY: u8 = 0xB9;
 
 /// `78 81 01 01 FB`
 pub fn power_on() -> Vec<u8> {
@@ -57,6 +59,27 @@ pub fn hsi(hue: u16, sat: u8, brr: u8) -> Vec<u8> {
     with_checksum(vec![PREFIX, TAG_HSI, 0x04, lo, hi, sat, brr])
 }
 
+/// RGBCW direct mix: `78 A8 07 <brr> <R> <G> <B> <CW> <WW> <decBrr> 00`.
+/// `brr` 0..=100 (master), `r/g/b/cw/ww` 0..=255, `dec_brr` is the 0.1% fractional
+/// brightness (0..=9; we pass 0). (`createRGBCWCommand`, cn.java:2728.)
+pub fn rgbcw(brr: u8, r: u8, g: u8, b: u8, cw: u8, ww: u8) -> Vec<u8> {
+    with_checksum(vec![PREFIX, TAG_RGBCW, 0x07, brr, r, g, b, cw, ww, 0x00])
+}
+
+/// CIE xy coordinate: `78 B9 06 <brr> <x_lo> <x_hi> <y_lo> <y_hi> 00`.
+/// `x`/`y` are the coordinate ×10000 (0..=8000 = 0.0000..=0.8000), 16-bit
+/// little-endian. (`createColorCoordinateBluetoothCommand`, cn.java:1365.)
+pub fn xy(brr: u8, x: u16, y: u16) -> Vec<u8> {
+    let x = x.min(8000);
+    let y = y.min(8000);
+    with_checksum(vec![
+        PREFIX, TAG_XY, 0x06, brr,
+        (x & 0xFF) as u8, (x >> 8) as u8,
+        (y & 0xFF) as u8, (y >> 8) as u8,
+        0x00,
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +111,17 @@ mod tests {
     fn hsi_matches_rgb62_capture() {
         // Doc: "7886 040C 0132 3273" -> hue_lo=0C hue_hi=01 (hue=0x010C=268), sat=0x32, brr=0x32
         assert_eq!(hex(&hsi(0x010C, 0x32, 0x32)), "7886040C01323273");
+    }
+
+    #[test]
+    fn rgbcw_pure_red_full() {
+        // brr=100(0x64), R=255, rest 0, decBrr=0. ck = (78+A8+07+64+FF)&FF = 0x8A.
+        assert_eq!(hex(&rgbcw(100, 255, 0, 0, 0, 0)), "78A80764FF00000000008A");
+    }
+
+    #[test]
+    fn xy_d65_white_point() {
+        // x=0.3127 -> 3127=0x0C37 (lo 37, hi 0C); y=0.3290 -> 3290=0x0CDA (lo DA, hi 0C).
+        assert_eq!(hex(&xy(100, 3127, 3290)), "78B90664370CDA0C00C4");
     }
 }

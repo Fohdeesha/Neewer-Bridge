@@ -19,6 +19,9 @@ pub enum Profile {
     Hsi,
     /// 5ch: Dimmer, Mode, CCT/Hue, GM/Sat, (reserved). Mode <128 = CCT, ≥128 = HSI.
     Full,
+    /// 10ch unified mode-channel personality (NOTES.md §8.1). ch1 Mode-select
+    /// (value bands → CCT/HSI/FX/RGBCW/XY), ch2 Dimmer, ch3-10 mode-specific.
+    Advanced,
 }
 
 impl Profile {
@@ -28,7 +31,19 @@ impl Profile {
             "cct_gm" => Some(Profile::CctGm),
             "hsi" => Some(Profile::Hsi),
             "full" => Some(Profile::Full),
+            "advanced" => Some(Profile::Advanced),
             _ => None,
+        }
+    }
+
+    /// The canonical config string for this profile (inverse of `parse`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Profile::Cct => "cct",
+            Profile::CctGm => "cct_gm",
+            Profile::Hsi => "hsi",
+            Profile::Full => "full",
+            Profile::Advanced => "advanced",
         }
     }
 
@@ -38,8 +53,20 @@ impl Profile {
             Profile::Cct => 2,
             Profile::Hsi | Profile::CctGm => 3,
             Profile::Full => 5,
+            Profile::Advanced => 10,
         }
     }
+}
+
+/// `advanced` profile mode-channel (ch1) value bands. Mirrors the official Neewer
+/// DMX personality so a console patched for the fixture feels familiar. Bands not
+/// listed (GEL 96-127, Pixel 160-191, 232-255) are unimplemented → neutral white.
+pub mod mode_band {
+    pub const CCT: std::ops::RangeInclusive<u8> = 0..=31;
+    pub const HSI: std::ops::RangeInclusive<u8> = 32..=63;
+    pub const FX: std::ops::RangeInclusive<u8> = 64..=95;
+    pub const RGBCW: std::ops::RangeInclusive<u8> = 128..=159;
+    pub const XY: std::ops::RangeInclusive<u8> = 192..=231;
 }
 
 /// Raw CCT-value range used to scale the CCT channel. Model-dependent; default
@@ -91,6 +118,24 @@ fn sat_value(dmx: u8) -> u8 {
     scale_to(dmx, 100) as u8
 }
 
+/// FX effect-select: DMX 0..=255 → effect id 1..=18.
+#[inline]
+fn fx_select(dmx: u8) -> u8 {
+    (1 + scale_to(dmx, 17)) as u8
+}
+
+/// FX speed/rate: DMX 0..=255 → 1..=10.
+#[inline]
+fn speed_value(dmx: u8) -> u8 {
+    (1 + scale_to(dmx, 9)) as u8
+}
+
+/// CIE xy coordinate channel: DMX 0..=255 → ×10000 (0..=8000 = 0.0000..=0.8000).
+#[inline]
+fn xy_value(dmx: u8) -> u16 {
+    scale_to(dmx, 8000) as u16
+}
+
 /// Map a light's DMX channel slice to a desired `LightState`.
 ///
 /// `slice` should be `profile.channel_count()` bytes; missing channels are read
@@ -134,6 +179,53 @@ pub fn map_dmx(profile: Profile, slice: &[u8], cct: CctRange) -> LightState {
             }
             // ch(4) reserved (future: FX band / hue-fine)
         }
+        Profile::Advanced => {
+            // ch1 = mode select, ch2 = dimmer, ch3..ch10 = mode-specific.
+            let mode_sel = ch(0);
+            st.brightness = brightness_value(ch(1));
+            use mode_band as mb;
+            if mb::CCT.contains(&mode_sel) {
+                st.mode = Mode::Cct;
+                st.cct = cct_value(ch(2), cct);
+                st.gm = gm_value(ch(3));
+            } else if mb::HSI.contains(&mode_sel) {
+                st.mode = Mode::Hsi;
+                st.hue = hue_value(ch(2));
+                st.sat = sat_value(ch(3));
+            } else if mb::FX.contains(&mode_sel) {
+                st.mode = Mode::Fx;
+                st.fx_id = fx_select(ch(2));
+                st.fx_speed = speed_value(ch(3));
+                st.cct = cct_value(ch(4), cct);
+                st.hue = hue_value(ch(5));
+                // ch7 doubles as Sat (HUE effects) / GM (CCT effects); store both.
+                st.sat = sat_value(ch(6));
+                st.gm = gm_value(ch(6));
+                // ch8 = effect-specific extra (ember/colour/mode); builder clamps.
+                st.fx_extra = scale_to(ch(7), 10) as u8;
+                // ch9 = effect-specific 2nd value: CCT-loop CCT2 (raw) else Hue2.
+                st.fx_val2 = if st.fx_id == 13 {
+                    cct_value(ch(8), cct) as u16
+                } else {
+                    hue_value(ch(8))
+                };
+            } else if mb::RGBCW.contains(&mode_sel) {
+                st.mode = Mode::Rgbcw;
+                st.r = ch(2);
+                st.g = ch(3);
+                st.b = ch(4);
+                st.cw = ch(5);
+                st.ww = ch(6);
+            } else if mb::XY.contains(&mode_sel) {
+                st.mode = Mode::Xy;
+                st.x = xy_value(ch(2));
+                st.y = xy_value(ch(3));
+            } else {
+                // Unimplemented band (GEL / Pixel / reserved) → safe neutral white.
+                st.mode = Mode::Cct;
+                st.cct = cct_value(128, cct);
+            }
+        }
     }
     st
 }
@@ -173,6 +265,11 @@ mod tests {
         assert_eq!(gm_value(128), 0);
         assert_eq!(cct_value(0, CctRange::default()), 32);
         assert_eq!(cct_value(255, CctRange::default()), 56);
+        // TL120C real range 2500..10000K (raw 25..100): endpoints + midpoint.
+        let tl = CctRange { min: 25, max: 100 };
+        assert_eq!(cct_value(0, tl), 25); // 2500K
+        assert_eq!(cct_value(255, tl), 100); // 10000K
+        assert_eq!(cct_value(128, tl), 63); // ~6300K mid
     }
 
     #[test]
@@ -198,6 +295,41 @@ mod tests {
         assert_eq!(hsi_mode.brightness, 50);
         assert_eq!(hsi_mode.hue, 360);
         assert_eq!(hsi_mode.sat, 100);
+    }
+
+    #[test]
+    fn advanced_mode_bands() {
+        let tl = CctRange { min: 25, max: 100 };
+        let m = |sel: u8, rest: &[u8]| {
+            let mut s = vec![sel, 255]; // mode-select, full dimmer
+            s.extend_from_slice(rest);
+            map_dmx(Profile::Advanced, &s, tl)
+        };
+        // CCT band (0-31)
+        let c = m(0, &[255, 128]);
+        assert_eq!(c.mode, Mode::Cct);
+        assert_eq!(c.cct, 100); // ch3=255 -> max
+        // HSI band (32-63)
+        let h = m(40, &[255, 255]);
+        assert_eq!(h.mode, Mode::Hsi);
+        assert_eq!(h.hue, 360);
+        assert_eq!(h.sat, 100);
+        // FX band (64-95): ch3 effect-select, ch4 speed
+        let f = m(80, &[0, 255, 255, 0, 0, 0, 0]);
+        assert_eq!(f.mode, Mode::Fx);
+        assert_eq!(f.fx_id, 1); // ch3=0 -> effect 1
+        assert_eq!(f.fx_speed, 10); // ch4=255 -> 10
+        // RGBCW band (128-159): ch3-7 = R,G,B,CW,WW
+        let rgbcw = m(130, &[10, 20, 30, 40, 50]);
+        assert_eq!(rgbcw.mode, Mode::Rgbcw);
+        assert_eq!((rgbcw.r, rgbcw.g, rgbcw.b, rgbcw.cw, rgbcw.ww), (10, 20, 30, 40, 50));
+        // XY band (192-231): ch3=X, ch4=Y
+        let xy = m(200, &[255, 0]);
+        assert_eq!(xy.mode, Mode::Xy);
+        assert_eq!(xy.x, 8000); // ch3=255 -> 0.8000
+        assert_eq!(xy.y, 0);
+        // Unimplemented band (GEL 96-127) -> neutral CCT
+        assert_eq!(m(100, &[0, 0]).mode, Mode::Cct);
     }
 
     #[test]

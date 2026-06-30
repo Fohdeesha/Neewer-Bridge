@@ -74,6 +74,13 @@ pub struct LightCfg {
     /// Power the light on when it first connects.
     #[serde(default = "default_true")]
     pub power_on_connect: bool,
+    /// CCT scaling range, raw ×100K units (25 = 2500K, 100 = 10000K). Per-model —
+    /// see the light's manual. Defaults to 32..56 (3200..5600K). The TL120C is
+    /// 25..100 (2500..10000K).
+    #[serde(default = "default_cct_min")]
+    pub cct_min: u8,
+    #[serde(default = "default_cct_max")]
+    pub cct_max: u8,
 }
 
 impl Default for ArtNet {
@@ -111,6 +118,15 @@ fn default_flush_hz() -> u32 {
 fn default_probe_secs() -> u64 {
     20
 }
+/// Default CCT scaling range (raw ×100K): 3200K..5600K, the common bi-color span.
+pub const DEFAULT_CCT_MIN: u8 = 32;
+pub const DEFAULT_CCT_MAX: u8 = 56;
+fn default_cct_min() -> u8 {
+    DEFAULT_CCT_MIN
+}
+fn default_cct_max() -> u8 {
+    DEFAULT_CCT_MAX
+}
 fn default_failsafe_mode() -> String {
     "hold".into()
 }
@@ -122,7 +138,7 @@ fn default_true() -> bool {
 }
 
 /// Known DMX profiles (kept in sync with NOTES.md §8.1).
-pub const KNOWN_PROFILES: &[&str] = &["cct", "cct_gm", "hsi", "full"];
+pub const KNOWN_PROFILES: &[&str] = &["cct", "cct_gm", "hsi", "full", "advanced"];
 /// Known driver selectors.
 pub const KNOWN_DRIVERS: &[&str] = &["auto", "classic", "infinity", "home"];
 /// Known failsafe modes (only `hold` is fully implemented in v1).
@@ -170,6 +186,14 @@ impl Config {
                     l.profile, profile.channel_count(), l.address, last
                 );
             }
+            // CCT scaling range must be ordered (raw ×100K). Equal is allowed for
+            // fixed-CCT lights (e.g. Apollo 150D @ 5600K → the CCT channel is inert).
+            if l.cct_min > l.cct_max {
+                bail!(
+                    "{who}: cct_min {} must be ≤ cct_max {} (raw ×100K, e.g. 25..100 = 2500..10000K)",
+                    l.cct_min, l.cct_max
+                );
+            }
         }
         // Detect duplicate MAC bindings — a config mistake that would make the
         // DMX→light mapping ambiguous.
@@ -193,7 +217,7 @@ pub fn append_light(path: &Path, light: &LightCfg) -> Result<()> {
         text.push('\n');
     }
     text.push_str(&format!(
-        "\n[[lights]]\nmac = \"{}\"\nname = \"{}\"\ndriver = \"{}\"\nprofile = \"{}\"\nuniverse = {}\naddress = {}\npower_on_connect = {}\n",
+        "\n[[lights]]\nmac = \"{}\"\nname = \"{}\"\ndriver = \"{}\"\nprofile = \"{}\"\nuniverse = {}\naddress = {}\npower_on_connect = {}\ncct_min = {}\ncct_max = {}\n",
         normalize_mac(&light.mac),
         light.name.clone().unwrap_or_default(),
         light.driver,
@@ -201,6 +225,8 @@ pub fn append_light(path: &Path, light: &LightCfg) -> Result<()> {
         light.universe,
         light.address,
         light.power_on_connect,
+        light.cct_min,
+        light.cct_max,
     ));
 
     // Parse + validate the whole file before committing it to disk.
@@ -287,6 +313,8 @@ mod tests {
             universe: 2,
             address: 5,
             power_on_connect: true,
+            cct_min: DEFAULT_CCT_MIN,
+            cct_max: DEFAULT_CCT_MAX,
         };
         append_light(&path, &light).unwrap();
         // Append a second one to confirm multiple [[lights]] blocks accumulate.
@@ -312,6 +340,8 @@ mod tests {
             universe: 0,
             address: 1,
             power_on_connect: true,
+            cct_min: DEFAULT_CCT_MIN,
+            cct_max: DEFAULT_CCT_MAX,
         });
         assert!(c.validate().is_err()); // bad profile
 

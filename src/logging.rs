@@ -22,5 +22,8 @@ pub fn init(verbosity: u8) {
         .with_env_filter(filter)
         .with_target(true)
         .with_level(true)
+        // Logs go to stderr so machine-readable command output (e.g. `scan
+        // --json`) stays clean on stdout.
+        .with_writer(std::io::stderr)
         .init();
 }

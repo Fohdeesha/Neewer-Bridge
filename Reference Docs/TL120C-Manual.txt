@@ -1,0 +1,384 @@
+================================================================================
+NEEWER TL120C MULTIFUNCTIONAL STICK LIGHT — USER MANUAL
+Source: TL120CEN.pdf
+================================================================================
+
+
+================================================================================
+PRODUCT OVERVIEW
+================================================================================
+
+Thank you for purchasing the TL120C multifunctional stick light!
+
+The TL120C stick light is an innovative product that offers a good selection
+of colors and over 25 special effects, including 18 scene effects and 7 pixel
+effects. The device can be easily controlled via APP, directly through the
+control panel, 2.4G, and DMX professional lighting control, catering to the
+needs of both professional and amateur users. Whether you're an experienced
+user or a novice, you can easily adjust the lighting to your preference using
+any of the multiple control methods available. With its versatility and
+user-friendly design, the TL120C stick light is a must-have tool for any
+lighting enthusiast.
+
+
+================================================================================
+PACKAGE CONTENTS
+================================================================================
+
+- TL120C Stick Light  x1
+- Charger             x1
+- Power Cord          x1
+- Steel Wire          x2
+- Power Supply Clamp  x2
+- DMX Cable           x1
+- Storage Bag         x1
+
+
+================================================================================
+PRODUCT ILLUSTRATION
+================================================================================
+
+Front/Body controls and indicators (numbered):
+
+ 1  Screen
+ 2  Infinity Connection Indicator Light
+ 3  2.4G Connection Indicator Light
+ 4  Touchpad Lock Status Indicator Light
+ 5  DMX Connection Indicator Light
+ 6  Color Touchpad
+ 7  Power On/Off Button
+ 8  Mode Switch Button
+ 9  Wireless Connection Switch Button
+10  Curve Adjustment Key / Unlock Hue Touch Bar / Lock
+11  DMX Channel Adjustment Button
+12  Mode Settings Switch Button
+13  Mode Settings Value Adjustment Dial
+14  Microphone Port
+15  Brightness Adjustment Dial
+
+Bottom/side connections (numbered):
+
+16  1/4" Screw Hole
+17  DMX Input Socket
+18  DMX Output Socket
+19  Power Input Socket
+
+NOTE: Long press the "**/2.4G" button for 5 seconds to reset the
+Infinity connection.
+
+
+================================================================================
+INSTALLATION
+================================================================================
+
+1. Installing on a Stand
+   Twist the 1/4" threaded screw located on the top of the stand into the
+   1/4" screw hole found at the bottom of the light.
+
+2. Installing with the Power Supply Clamp
+   (1) To insert the light body into the supporting bracket, first open the
+       latch by pulling it outward in the direction of the arrow.
+   (2) Reposition the latch of the support bracket inward (in the direction
+       of the arrow) to secure the light body.
+   (3) Take the 1/4" screw bolt located at the top of the stand and insert
+       it into the screw hole situated at the bottom of the power supply
+       clamp. Secure the bolt by twisting it into place.
+
+3. Using the Steel Wire
+   Adapt the use of the steel wire to your specific needs when using the
+   light.
+
+
+================================================================================
+HOW TO USE
+================================================================================
+
+------------------------------------------------------------------------
+Charging
+------------------------------------------------------------------------
+To begin charging, connect the power cord to the DC socket. While charging,
+the screen will display a charging icon "||||" to indicate the progress of
+the charging process. Once the battery is fully charged, the screen will
+display a full battery icon and remain on.
+
+------------------------------------------------------------------------
+Powering On/Off
+------------------------------------------------------------------------
+To turn the light on using the DC power supply or the built-in lithium
+battery, press and hold the "Power" button for 1 second. The display will
+show "UNLOCK". Then, rotate any knob three times to activate the light.
+While the light is powered on, press and hold the "Power" button for 1
+second to switch off the light.
+
+------------------------------------------------------------------------
+Standby
+------------------------------------------------------------------------
+When the light is powered on, short press the ON/OFF button "Power" to enter
+standby mode. Press again to exit this mode.
+
+------------------------------------------------------------------------
+Brightness Adjustment
+------------------------------------------------------------------------
+In any mode, rotate the brightness adjustment knob to adjust the brightness.
+
+------------------------------------------------------------------------
+Color Temperature Adjustment
+------------------------------------------------------------------------
+Short press the "M" button until the screen displays "CCT" to switch to
+color temperature mode. Short press the "Settings Switch" button until the
+screen selects the "00K" option, then rotate the settings value adjustment
+knob to set the color temperature value.
+
+------------------------------------------------------------------------
+Red/Green Compensation Adjustment
+------------------------------------------------------------------------
+Short press the "M" button until the screen displays "CCT" to switch to
+color temperature mode. Short press the "Settings Switch" button until the
+screen selects the "GM" option, then rotate the setting value adjustment.
+
+------------------------------------------------------------------------
+Saturation Adjustment
+------------------------------------------------------------------------
+Short press the "M" button until the screen displays "HSI" and switches to
+HSI mode. Then, short press the "Settings Switch" button until the "S"
+option is selected on the screen. Finally, rotate the settings value
+adjustment dial to set the saturation.
+
+------------------------------------------------------------------------
+Hue Adjustment (with touch panel)
+------------------------------------------------------------------------
+Short press the "Curve Adj/Lock" button in any mode, and the lock indicator
+light will not light up. Then, adjust the hue by sliding your finger on the
+touch panel. Short press the "Curve Adj/Lock" button again, and the lock
+indicator light will light up. The touch panel is now locked and disabled.
+
+------------------------------------------------------------------------
+Hue Adjustment (with button)
+------------------------------------------------------------------------
+Short press the "M" button until the screen displays "HSI" and switches to
+RGB mode. Then, short press the "Settings Switch" button until the "H"
+option is selected on the screen. Finally, rotate the settings value
+adjustment dial to set the hue.
+
+------------------------------------------------------------------------
+Scene Adjustment
+------------------------------------------------------------------------
+Short press the "M" button until the screen displays "FX" and switches to
+scene mode. Then, rotate the settings value adjustment dial until the screen
+switches to a different scene.
+
+------------------------------------------------------------------------
+Scene Modes (18 types)
+------------------------------------------------------------------------
+- Lightning
+- Paparazzi
+- Defective Bulb
+- Explosion
+- Welding
+- CCT Flash
+- Hue flash
+- CCT Pulse
+- HUE Pulse
+- Cop car
+- Candlelight
+- HUE loop
+- CCT loop
+- INT loop
+- TV screen
+- Fireworks
+- Party
+- Music
+
+------------------------------------------------------------------------
+Pixel Effect Adjustment
+------------------------------------------------------------------------
+Short press the "M" button until the screen displays "PIXEL" and switches to
+pixel effect mode. Then, short press the "Settings Switch" button or rotate
+the settings value adjustment dial until the desired effect is displayed on
+the screen.
+
+NOTE: In pixel effect mode, you can scan the QR code to download the app and
+adjust the specific setting for the selected effect.
+
+Pixel Effects (7 types):
+- Color Replacement
+- Color Wheel Rotation
+- Single Color Movement
+- Dual Color Movement
+- Three-Color Movement
+- Rainbow Color
+- Point Flame Control
+
+------------------------------------------------------------------------
+RGBCW Mode
+------------------------------------------------------------------------
+Short press the "M" button until the screen displays "RGBCW" and switches to
+RGBCW mode. Then, short press the "Settings Switch" button until the setting
+is selected on the screen. Finally, rotate the value adjustment dial to set.
+
+------------------------------------------------------------------------
+Gel Adjustment
+------------------------------------------------------------------------
+Short press the "M" button until the screen displays "GEL" and switches to
+gel mode. Then, short press the "Settings Switch" button until the setting
+is selected on the screen. Finally, rotate the dial to set the value.
+
+------------------------------------------------------------------------
+Curve Adjustment
+------------------------------------------------------------------------
+Long press the "Curve Adj/Lock" button until the screen displays the curve
+adjustment interface, then use the settings dial to adjust the curve.
+
+------------------------------------------------------------------------
+XY Coordinate Mode
+------------------------------------------------------------------------
+Short press the "M" button until the screen switches to XY coordinate mode.
+Short press the "Settings Switch" button to select the XY decimal point
+option, then use the settings dial to set the value.
+
+NOTE: XY Value Range (0.0001~0.8000).
+
+
+================================================================================
+DMX CONNECTION
+================================================================================
+
+------------------------------------------------------------------------
+DMX Connection (Connected to a console)
+------------------------------------------------------------------------
+When the light stick is connected to a console, the "DMX" indicator lights
+up, indicating that it is in DMX mode. Rotate the settings value adjustment
+dial to adjust the DMX channel.
+
+------------------------------------------------------------------------
+Channel Selection
+------------------------------------------------------------------------
+When the channel number of DMX console and that of DMX control box are the
+same, you can use the console to adjust various functions. This is suitable
+for one light or multiple light connection.
+
+* In DMX mode, the channel number is 1 by default.
+* In DMX mode, the channel range can be set to 1-512.
+* After the DMX signal is lost, the last signal will be remembered and can
+  be used to control the lights.
+
+------------------------------------------------------------------------
+DMX Console Control
+------------------------------------------------------------------------
+NOTE: In DMX mode, please refer to the "TL60 RGB DMX Channel Table" in the
+appendix for relevant control schemes.
+
+1. Connect the DMX cable to the light.
+2. Connect the XLR to RJ45 adapter cable to the DMX cable.
+3. Connect the DMX standard console to the light.
+
+NOTE: The XLR to RJ45 adapter cable and DMX console are not included in
+the package.
+
+------------------------------------------------------------------------
+Connecting a Single Light
+------------------------------------------------------------------------
+DMX512 console OUTPUT -> DMX cable -> TL120C light
+
+------------------------------------------------------------------------
+Connecting Multiple Lights
+------------------------------------------------------------------------
+DMX512 console OUTPUT -> DMX cable -> TL120C light 1 (DMX Out) -> TL120C light 2
+
+------------------------------------------------------------------------
+XLR to RJ45 Adapter Cable Pin Definition
+------------------------------------------------------------------------
+To ensure compatibility with the lights, please check the DMX interface
+definition of the XLR to RJ45 adapter cable before purchase, as shown
+in the diagram.
+
+  PIN1: Data (+)
+  PIN2: Data (-)
+  PIN7: Ground
+  PIN8: Ground
+
+------------------------------------------------------------------------
+DMX Channel Adjustment (Not connected to a console)
+------------------------------------------------------------------------
+When connected to Infinity or 2.4G, short press the "DMX" button to enter
+the DMX channel adjustment interface. Then, rotate the settings value
+adjustment dial to configure the DMX channel.
+
+Short press the "DMX" or "M" button to exit the DMX adjustment interface.
+
+------------------------------------------------------------------------
+Connecting via 2.4G
+------------------------------------------------------------------------
+Short press the "**/2.4G" button until the indicator light "2.4G" lights up
+to enter the 2.4G connection mode. Press and hold the "**/2.4G" button for
+1 second until the screen displays "CH", then rotate the settings value
+adjustment dial to set the channel value.
+
+NOTE: In 2.4G mode, you can set multiple LED lights to the same channel
+(CH8 for example). When you adjust one LED light, the other lights sharing
+the same channel will also change in sync.
+
+------------------------------------------------------------------------
+Connecting via the Infinity Connection Mode
+------------------------------------------------------------------------
+Short press the "**/2.4G" button until the indicator light "**" lights up
+to enter Infinity connection mode. If you want to control the device via
+your phone, you need to connect the device from the "NEEWER" APP. For
+further guidance, please scan the QR code on the APP prompt card and refer
+to the "APP Guide" page.
+
+NOTE: Before connecting via the APP, please reset the Infinity connection.
+To do so, simply press and hold the middle button on the dial "**/2.4G"
+for 5 seconds.
+
+
+================================================================================
+IMPORTANT NOTES
+================================================================================
+
+1. DO NOT place the product in an environment with a temperature higher
+   than 40°C.
+2. DO NOT drop the product on the ground, subject it to collisions, or
+   strong impact.
+3. DO NOT stare directly at the light when using it, as direct light can
+   cause visual impairment.
+4. DO NOT use the product in a dusty or humid environment.
+5. DO NOT modify the circuit board or disassemble the product without
+   authorization.
+6. Please unplug the power cord when not in use.
+7. If not used for a long time, store the product in a well-ventilated, dry
+   area, away from heat and magnetic fields.
+
+
+================================================================================
+SPECIFICATIONS
+================================================================================
+
+Model                        | TL120C
+Rated Power                  | 42W
+Color Rendering Index (CRI)  | 97
+TLCI                         | 98
+Maximum Illuminance          | 5600K@0.5M (2000Lux)
+Color Temperature Adjustment | 2500K~10000K
+Brightness Adjustment        | 0%-100% (in increments of 1%)
+Color Tone Adjustment        | 0~360°
+Saturation Adjustment        | 0~100
+Red/Green Compensation Range | -50~+50
+Number of Scenes             | 18 Types
+R/G/B/C/W                   | 0~255
+Pixel Effects                | 7 Types
+Color Gels                   | RESCO (20 color gels), LEE (20 color gels)
+Power Supply                 | DC Power/Lithium Battery
+Built-in Battery             | 14.4V/6000mAh/86.4Wh
+Battery Life                 | Approx. 2 hours at 100% brightness
+Control Methods              | APP, Control Panel, 2.4G, DMX Control
+Charging Time                | Approx. 2.5 hours
+DC Input                     | DC 20V/5A
+Operating Temperature        | -10°C~40°C
+Frequency Range              | 2402MHz ~ 2480MHz
+Maximum radio-frequency power| 0.79dBm
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

@@ -39,13 +39,20 @@ pub enum Mode {
     Cct,
     /// Colour: hue + saturation + intensity.
     Hsi,
+    /// Raw 5-channel mixing: red/green/blue/cool-white/warm-white (+ brightness).
+    Rgbcw,
+    /// CIE xy colour-coordinate (+ brightness).
+    Xy,
+    /// Built-in effect engine: one of 18 effects with per-effect parameters.
+    Fx,
 }
 
 /// The desired output of a single light, in native parameter ranges.
 ///
 /// This is the value the ArtNet→light mapper produces and the per-light BLE
 /// actor flushes. Brightness/sat are 0..=100, hue 0..=360, gm -50..=50, cct is a
-/// raw model-dependent value.
+/// raw model-dependent value. The RGBCW/XY/FX fields are only meaningful in their
+/// respective `mode`; the CCT/HSI fields (cct/gm/hue/sat) are reused by FX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LightState {
     pub power: bool,
@@ -55,6 +62,22 @@ pub struct LightState {
     pub gm: i8,
     pub hue: u16,
     pub sat: u8,
+    // RGBCW (raw 0..=255 each).
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub cw: u8,
+    pub ww: u8,
+    // CIE xy, encoded ×10000 (0..=8000 = 0.0000..=0.8000).
+    pub x: u16,
+    pub y: u16,
+    // FX: effect id 1..=18, speed 1..=10, a per-effect "extra" byte (ember/sparks
+    // 1..=10, cop-car colour 0..=4, fireworks/party mode 0..=2), and a 16-bit
+    // second value (loop effects: CCT2 or Hue2).
+    pub fx_id: u8,
+    pub fx_speed: u8,
+    pub fx_extra: u8,
+    pub fx_val2: u16,
 }
 
 impl Default for LightState {
@@ -67,6 +90,17 @@ impl Default for LightState {
             gm: 0,
             hue: 0,
             sat: 0,
+            r: 0,
+            g: 0,
+            b: 0,
+            cw: 0,
+            ww: 0,
+            x: 0,
+            y: 0,
+            fx_id: 1,
+            fx_speed: 5,
+            fx_extra: 0,
+            fx_val2: 0,
         }
     }
 }

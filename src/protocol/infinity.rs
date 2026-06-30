@@ -15,6 +15,10 @@ const SUB_HSI: u8 = 0x86;
 const TAG_CCT: u8 = 0x90;
 const SUB_CCT: u8 = 0x87;
 const DIMMING_CURVE: u8 = 0x04;
+// FX (built-in effect engine): EFFECT_MODE_NEW = 0x91, EFFECT_MODE_OLD = 0x8B
+// (EffectType.java). Frame: `78 91 <N+7> <MAC6> 8B <effId params...> ck`.
+const TAG_FX: u8 = 0x91;
+const SUB_FX: u8 = 0x8B;
 
 /// Power: `78 8D 08 <MAC6> 81 <01 on | 02 off> <ck>`.
 ///
@@ -50,6 +54,52 @@ pub fn hsi(mac: [u8; 6], hue: u16, sat: u8, brr: u8) -> Vec<u8> {
     with_checksum(f)
 }
 
+/// Lay out the effect-data array `[effId, params...]` for one of the 18 built-in
+/// effects, exactly as `getEffectData` (cn.java:702). Params already in native
+/// ranges: `int`/`sat` 0..=100, `cct` raw, `gm` -50..=50, `hue` 0..=360,
+/// `speed` 1..=10. `extra` is the effect-specific byte (ember/sparks 1..=10,
+/// cop-car colour 0..=4, fireworks/party mode 0..=2, INT-loop sub-mode 0/1) and
+/// `val2` the 16-bit second value (HUE-loop Hue2 0..=360, CCT-loop CCT2 raw).
+#[allow(clippy::too_many_arguments)]
+fn fx_data(id: u8, int: u8, cct: u8, gm: i8, hue: u16, sat: u8, speed: u8, extra: u8, val2: u16) -> Vec<u8> {
+    let g = gm_byte(gm);
+    let spd = speed.clamp(1, 10);
+    let hue = hue.min(360);
+    let (hlo, hhi) = ((hue & 0xFF) as u8, (hue >> 8) as u8);
+    let h2 = val2.min(360);
+    let (h2lo, h2hi) = ((h2 & 0xFF) as u8, (h2 >> 8) as u8);
+    let cct2 = val2 as u8; // CCT-loop second temperature (raw, single byte)
+    match id {
+        1 => vec![1, int, cct, spd],                              // Lightning
+        2 | 3 | 6 | 8 => vec![id, int, cct, g, spd],              // Paparazzi/Defective/CCTflash/CCTpulse
+        4 => vec![4, int, cct, g, spd, extra.clamp(1, 10)],       // Explosion (extra = sparks)
+        5 | 15 => vec![id, 0, int, cct, g, spd],                  // Welding/TVscreen (INTmin=0, INTmax=int)
+        7 | 9 => vec![id, int, hlo, hhi, sat, spd],               // HUEflash/HUEpulse
+        10 => vec![10, int, extra.min(4), spd],                   // Cop Car (extra = colour 0..4)
+        11 => vec![11, 0, int, cct, g, spd, extra.clamp(1, 10)],  // Candlelight (INTmin/max, ember)
+        12 => vec![12, int, hlo, hhi, h2lo, h2hi, spd],           // HUE loop (hue1, hue2=val2)
+        13 => vec![13, int, cct, cct2, spd],                      // CCT loop (cct1, cct2=val2)
+        14 => vec![14, extra.min(1), 0, int, hlo, hhi, cct, spd], // INT loop (sub-mode, min/max, hue, cct)
+        16 => vec![16, int, extra.min(2), spd, 5],                // Fireworks (mode, ember fixed mid)
+        17 => vec![17, int, extra.min(2), spd],                   // Party (mode)
+        18 => vec![18, int],                                      // Music
+        _ => vec![1, int, cct, spd],                              // default: Lightning
+    }
+}
+
+/// Built-in effect (FX) frame: `78 91 <N+7> <MAC6> 8B <effId params...> ck`.
+/// `id` selects one of the 18 effects (see `fx_data`); the remaining args are the
+/// effect parameters in native ranges (unused ones are ignored per effect).
+#[allow(clippy::too_many_arguments)]
+pub fn fx(mac: [u8; 6], id: u8, int: u8, cct: u8, gm: i8, hue: u16, sat: u8, speed: u8, extra: u8, val2: u16) -> Vec<u8> {
+    let data = fx_data(id, int, cct, gm, hue, sat, speed, extra, val2);
+    let mut f = vec![PREFIX, TAG_FX, (data.len() + 7) as u8];
+    f.extend_from_slice(&mac);
+    f.push(SUB_FX);
+    f.extend_from_slice(&data);
+    with_checksum(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +122,31 @@ mod tests {
         // "788F 0CF7 AC16 F158 9686 4500 5C32 0004"
         // hue=0x0045=69, sat=0x5C=92, brr=0x32=50
         assert_eq!(hex(&hsi(MAC, 0x0045, 0x5C, 0x32)), "788F0CF7AC16F158968645005C320004");
+    }
+
+    #[test]
+    fn fx_lightning_frame() {
+        // Lightning(1), INT=100(0x64), CCT=0x38(5600K), speed=5. data=[01 64 38 05],
+        // len=4+7=0x0B. 78 91 0B <MAC6> 8B 01 64 38 05 <ck>.
+        assert_eq!(hex(&fx(MAC, 1, 100, 0x38, 0, 0, 0, 5, 0, 0)), "78910BF7AC16F158968B01643805D9");
+    }
+
+    #[test]
+    fn fx_hue_pulse_layout() {
+        // HUE pulse(9): data = [09 INT hueLo hueHi SAT speed], len=6+7=0x0D.
+        let f = fx(MAC, 9, 80, 0, 0, 0x0078 /*120*/, 100, 7, 0, 0);
+        assert_eq!(&f[0..3], &[0x78, 0x91, 0x0D]);
+        assert_eq!(&f[3..9], &MAC);
+        assert_eq!(f[9], 0x8B);
+        assert_eq!(&f[10..16], &[9, 80, 0x78, 0x00, 100, 7]); // id,int,hueLo,hueHi,sat,speed
+        assert_eq!(*f.last().unwrap(), super::super::checksum(&f[..f.len() - 1]));
+    }
+
+    #[test]
+    fn fx_cct_loop_uses_val2_as_second_cct() {
+        // CCT loop(13): [13 INT CCT1 CCT2 speed]; val2 low byte = CCT2.
+        let f = fx(MAC, 13, 100, 0x20, 0, 0, 0, 4, 0, 0x0048);
+        assert_eq!(&f[10..15], &[13, 100, 0x20, 0x48, 4]);
     }
 
     #[test]

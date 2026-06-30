@@ -11,6 +11,7 @@ use crate::artnet;
 use crate::ble;
 use crate::config::{self, parse_mac, LightCfg, KNOWN_DRIVERS};
 use crate::driver::Driver;
+use crate::models::Catalog;
 use crate::profile::Profile;
 use crate::protocol::{classic, home, infinity};
 
@@ -42,6 +43,56 @@ async fn prompt(reader: &mut BufReader<Stdin>, msg: &str) -> Result<String> {
 async fn prompt_default(reader: &mut BufReader<Stdin>, msg: &str, default: &str) -> Result<String> {
     let s = prompt(reader, msg).await?;
     Ok(if s.is_empty() { default.to_string() } else { s })
+}
+
+/// `adapters` — list the BLE adapters the OS exposes, with the index/name to put
+/// in `[ble] adapter`. Helps pick a specific dongle when more than one is present.
+pub async fn adapters() -> Result<()> {
+    let list = ble::list_adapters().await?;
+    if list.is_empty() {
+        bail!("no Bluetooth adapter found — is Bluetooth enabled?");
+    }
+    println!("Available BLE adapters ({}):", list.len());
+    for (i, info) in &list {
+        println!("  [{i}] {info}");
+    }
+    println!(
+        "\nSet `[ble] adapter` in your config to the index (e.g. \"{}\") or a\n\
+         substring of the name. \"default\" uses the first one.",
+        list.last().map(|(i, _)| *i).unwrap_or(0)
+    );
+    Ok(())
+}
+
+/// `models` — list the known light-model catalog (what `add` matches against).
+pub fn models() -> Result<()> {
+    let cat = Catalog::builtin();
+    println!("Known light models ({}):\n", cat.models.len());
+    println!("  {:<14} {:<8} {:<4} {:<3} {:<11} {:<14} extra", "MODEL", "PROFILE", "RGB", "GM", "CCT(K)", "MATCH");
+    for m in &cat.models {
+        let mut extra = Vec::new();
+        if m.supports_rgbcw { extra.push("RGBCW"); }
+        if m.supports_xy { extra.push("XY"); }
+        if m.supports_dmx { extra.push("DMX"); }
+        if m.pixel_classify > 0 { extra.push("Pixel"); }
+        let matchstr = if !m.product_ids.is_empty() {
+            m.product_ids.join(",")
+        } else {
+            m.name_matches.first().cloned().unwrap_or_default()
+        };
+        println!(
+            "  {:<14} {:<8} {:<4} {:<3} {:<11} {:<14} {}",
+            m.name,
+            m.profile().as_str(),
+            if m.supports_rgb { "yes" } else { "—" },
+            if m.supports_gm { "yes" } else { "—" },
+            format!("{}00-{}00", m.cct_min, m.cct_max),
+            matchstr,
+            extra.join(","),
+        );
+    }
+    println!("\n{} models. Edit models.toml to add/correct; `add` auto-fills these from a light's BLE name.", cat.models.len());
+    Ok(())
 }
 
 /// `scan` — discover and list lights. Prints a human table; Neewer lights are
@@ -124,8 +175,36 @@ pub async fn add(config_path: &Path, adapter_selector: &str) -> Result<()> {
         - 1;
     let light = &neewer[idx];
 
-    let driver =
-        prompt_default(&mut reader, "Driver [auto/classic/infinity/home] (auto): ", "auto").await?;
+    // Identify the model from its advertised BLE name against the catalog, and
+    // derive sensible defaults so the user doesn't hand-specify capabilities.
+    let model = Catalog::builtin().identify(&light.name);
+    let (def_driver, def_profile, def_cct_min, def_cct_max, def_name) = match model {
+        Some(m) => {
+            println!(
+                "\nIdentified model: {} — {}, CCT {}00-{}00K, driver {}",
+                m.name,
+                if m.supports_rgb { "RGB" } else { "bi-colour" },
+                m.cct_min, m.cct_max, m.driver,
+            );
+            (m.driver.clone(), m.profile().as_str().to_string(), m.cct_min, m.cct_max, m.name.clone())
+        }
+        None => {
+            println!(
+                "\nUnknown model (BLE name {:?}) — using safe defaults; verify the\n\
+                 driver/profile/CCT range afterwards (add it to models.toml once known).",
+                light.name
+            );
+            let dn = if light.name.is_empty() { light.address.clone() } else { light.name.clone() };
+            ("auto".to_string(), "full".to_string(), config::DEFAULT_CCT_MIN, config::DEFAULT_CCT_MAX, dn)
+        }
+    };
+
+    let driver = prompt_default(
+        &mut reader,
+        &format!("Driver [auto/classic/infinity/home] ({def_driver}): "),
+        &def_driver,
+    )
+    .await?;
     if !KNOWN_DRIVERS.contains(&driver.as_str()) {
         bail!("unknown driver {driver:?}");
     }
@@ -153,7 +232,9 @@ pub async fn add(config_path: &Path, adapter_selector: &str) -> Result<()> {
         return Ok(());
     }
 
-    let profile = prompt_default(&mut reader, "Profile [cct/cct_gm/hsi/full] (full): ", "full").await?;
+    let profile =
+        prompt_default(&mut reader, &format!("Profile [cct/cct_gm/hsi/full] ({def_profile}): "), &def_profile)
+            .await?;
     if Profile::parse(&profile).is_none() {
         bail!("unknown profile {profile:?}");
     }
@@ -165,8 +246,7 @@ pub async fn add(config_path: &Path, adapter_selector: &str) -> Result<()> {
         .await?
         .parse()
         .context("invalid DMX address")?;
-    let default_name = if light.name.is_empty() { light.address.clone() } else { light.name.clone() };
-    let name = prompt_default(&mut reader, &format!("Name [{default_name}]: "), &default_name).await?;
+    let name = prompt_default(&mut reader, &format!("Name [{def_name}]: "), &def_name).await?;
 
     let entry = LightCfg {
         mac: config::normalize_mac(&light.address),
@@ -176,69 +256,135 @@ pub async fn add(config_path: &Path, adapter_selector: &str) -> Result<()> {
         universe,
         address,
         power_on_connect: true,
+        cct_min: def_cct_min,
+        cct_max: def_cct_max,
     };
     config::append_light(config_path, &entry)?;
-    println!("\n✓ Added {} to {}. Edit it there to fine-tune.", entry.mac, config_path.display());
+    println!(
+        "\n✓ Added {} to {} (profile {}, CCT {}00-{}00K). Saved to config.",
+        entry.mac, config_path.display(), entry.profile, entry.cct_min, entry.cct_max
+    );
     Ok(())
 }
 
-/// Non-interactive `add` (when `--mac` is given): no prompts, scriptable. Blinks
-/// only if `blink` is set (and only then needs the light present).
+/// `inspect` — connect to a device and dump its full GATT (every characteristic,
+/// with readable values shown as hex + ASCII). Identifies unknown lights via the
+/// standard Device Information characteristics (2a29 manufacturer, 2a24 model,
+/// 2a00 name) and reveals non-standard protocols.
+pub async fn inspect(adapter_selector: &str, mac: &str, seconds: u64) -> Result<()> {
+    let adapter = ble::acquire_adapter(adapter_selector).await?;
+    let peripheral = ble::find_by_mac(&adapter, mac, Duration::from_secs(seconds)).await?;
+    let infos = ble::inspect(&peripheral).await?;
+    println!("\nConnected to {mac} — {} characteristics:\n", infos.len());
+    for ci in &infos {
+        print!("  {}  {}", ci.uuid, ci.props);
+        if let Some(v) = &ci.value {
+            let text: String =
+                v.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+            print!("  = [{}] \"{}\"", ble::hexstr(v), text);
+        }
+        println!();
+    }
+    let _ = ble::disconnect(&peripheral).await;
+    Ok(())
+}
+
+/// Non-interactive `add` (when `--mac` is given): no prompts, scriptable. Scans
+/// briefly to read the light's BLE name and identify its model from the catalog,
+/// so driver / profile / CCT range are filled automatically; any explicit flag
+/// overrides the model. Blinks if `blink` is set.
 #[allow(clippy::too_many_arguments)]
 pub async fn add_noninteractive(
     config_path: &Path,
     adapter_selector: &str,
     mac: &str,
-    driver: &str,
-    profile: &str,
+    driver: Option<&str>,
+    profile: Option<&str>,
     universe: u16,
     address: u16,
     name: Option<&str>,
+    cct_min: Option<u8>,
+    cct_max: Option<u8>,
     blink: bool,
 ) -> Result<()> {
-    if !KNOWN_DRIVERS.contains(&driver) {
+    let mac_bytes = parse_mac(mac)?;
+
+    // Find the light (if present) to read its advertised name → identify model.
+    let adapter = ble::acquire_adapter(adapter_selector).await?;
+    let peripheral = ble::find_by_mac(&adapter, mac, Duration::from_secs(8)).await.ok();
+    let ble_name = match &peripheral {
+        Some(p) => ble::peripheral_name(p).await,
+        None => {
+            warn!("light not found in scan; can't auto-identify — relying on flags/defaults");
+            String::new()
+        }
+    };
+    let model = if ble_name.is_empty() { None } else { Catalog::builtin().identify(&ble_name) };
+    if let Some(m) = model {
+        info!(model = %m.name, rgb = m.supports_rgb, cct = format!("{}-{}", m.cct_min, m.cct_max),
+              driver = %m.driver, "identified model from catalog");
+    }
+
+    // Resolve each field: explicit flag > catalog model > safe default.
+    let driver = driver
+        .map(str::to_string)
+        .or_else(|| model.map(|m| m.driver.clone()))
+        .unwrap_or_else(|| "auto".to_string());
+    if !KNOWN_DRIVERS.contains(&driver.as_str()) {
         bail!("unknown driver {driver:?}");
     }
-    if Profile::parse(profile).is_none() {
+    let profile = match profile.map(str::to_string).or_else(|| model.map(|m| m.profile().as_str().to_string())) {
+        Some(p) => p,
+        None => bail!("could not identify the light's model (not found / unknown) — pass --profile"),
+    };
+    if Profile::parse(&profile).is_none() {
         bail!("unknown profile {profile:?}");
     }
-    let mac_bytes = parse_mac(mac)?;
-    let mut resolved_name = name.map(|s| s.to_string());
+    let cct_min = cct_min.or_else(|| model.map(|m| m.cct_min)).unwrap_or(config::DEFAULT_CCT_MIN);
+    let cct_max = cct_max.or_else(|| model.map(|m| m.cct_max)).unwrap_or(config::DEFAULT_CCT_MAX);
+    let resolved_name = name
+        .map(str::to_string)
+        .or_else(|| model.map(|m| m.name.clone()))
+        .or_else(|| (!ble_name.is_empty()).then(|| ble_name.clone()));
 
     if blink {
-        let adapter = ble::acquire_adapter(adapter_selector).await?;
-        let peripheral = ble::find_by_mac(&adapter, mac, Duration::from_secs(10)).await?;
-        let ble_name = ble::peripheral_name(&peripheral).await;
-        if resolved_name.is_none() && !ble_name.is_empty() {
-            resolved_name = Some(ble_name.clone());
-        }
-        let drv = Driver::resolve(driver, Profile::Full, mac_bytes, &ble_name);
-        match ble::connect_and_verify(&peripheral).await {
-            Ok(chars) => {
-                info!("blinking light to identify");
-                for _ in 0..3 {
-                    let _ = ble::write_command(&peripheral, &chars.write, &drv.power(false)).await;
-                    tokio::time::sleep(Duration::from_millis(450)).await;
-                    let _ = ble::write_command(&peripheral, &chars.write, &drv.power(true)).await;
-                    tokio::time::sleep(Duration::from_millis(450)).await;
+        match &peripheral {
+            Some(p) => {
+                let drv = Driver::resolve(&driver, Profile::Full, mac_bytes, &ble_name);
+                match ble::connect_and_verify(p).await {
+                    Ok(chars) => {
+                        info!("blinking light to identify");
+                        for _ in 0..3 {
+                            let _ = ble::write_command(p, &chars.write, &drv.power(false)).await;
+                            tokio::time::sleep(Duration::from_millis(450)).await;
+                            let _ = ble::write_command(p, &chars.write, &drv.power(true)).await;
+                            tokio::time::sleep(Duration::from_millis(450)).await;
+                        }
+                        let _ = ble::disconnect(p).await;
+                    }
+                    Err(e) => warn!(error = %e, "could not connect to blink; adding anyway"),
                 }
-                let _ = ble::disconnect(&peripheral).await;
             }
-            Err(e) => warn!(error = %e, "could not connect to blink; adding anyway"),
+            None => warn!("--blink requested but light not found; adding without blinking"),
         }
     }
 
     let entry = LightCfg {
         mac: config::normalize_mac(mac),
         name: resolved_name,
-        driver: driver.to_string(),
-        profile: profile.to_string(),
+        driver,
+        profile,
         universe,
         address,
         power_on_connect: true,
+        cct_min,
+        cct_max,
     };
     config::append_light(config_path, &entry)?;
-    println!("Added {} ({}, u{} a{}) to {}", entry.mac, entry.profile, universe, address, config_path.display());
+    println!(
+        "Added {} ({}, CCT {}00-{}00K, u{} a{}) to {}",
+        entry.mac, entry.profile, entry.cct_min, entry.cct_max, universe, address, config_path.display()
+    );
     Ok(())
 }
 
@@ -321,7 +467,14 @@ pub async fn monitor(bind_ip: &str, port: u16) -> Result<()> {
 /// `test` — connect to one light and prove the BLE path end to end:
 /// verify GATT, blink power (also serves as visual identify), then set a known
 /// CCT. Uses our real protocol encoders so this validates them on hardware.
-pub async fn test(adapter_selector: &str, mac: &str, driver: &str, seconds: u64) -> Result<()> {
+pub async fn test(
+    adapter_selector: &str,
+    mac: &str,
+    driver: &str,
+    seconds: u64,
+    colors: bool,
+    modes: bool,
+) -> Result<()> {
     let mac_bytes = parse_mac(mac)?;
     let adapter = ble::acquire_adapter(adapter_selector).await?;
     let peripheral = ble::find_by_mac(&adapter, mac, Duration::from_secs(seconds)).await?;
@@ -361,6 +514,73 @@ pub async fn test(adapter_selector: &str, mac: &str, driver: &str, seconds: u64)
     info!("setting CCT: 5600K @ 50% brightness");
     // cct raw 56 = 5600K for most lights; 50 = 50% brightness.
     ble::write_command(&peripheral, &chars.write, &set_cct(50, 56)).await?;
+
+    // Optional RGB capability probe: cycle saturated red→green→blue via HSI so a
+    // human can SEE whether the light is RGB or bi-color. The classic HSI encoder
+    // is used for all classic-family drivers; infinity uses its MAC-embedded HSI.
+    if colors {
+        let set_hsi = |hue: u16| -> Vec<u8> {
+            match driver {
+                "infinity" => infinity::hsi(mac_bytes, hue, 100, 100),
+                "home" => home::hsi(1000, hue, 100),
+                _ => classic::hsi(hue, 100, 100),
+            }
+        };
+        info!("RGB capability probe — watch for colour changes (bi-color lights stay white/ignore)");
+        for (hue, label) in [(0u16, "RED"), (120, "GREEN"), (240, "BLUE")] {
+            info!(hue, "HSI {label} @ 100% sat / 100% brightness");
+            ble::write_command(&peripheral, &chars.write, &set_hsi(hue)).await?;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+        // Return to a neutral white so we don't leave it stuck on a colour.
+        info!("restoring 5600K white");
+        ble::write_command(&peripheral, &chars.write, &set_cct(50, 56)).await?;
+    }
+
+    // Optional advanced-mode probe: exercise RGBCW, XY, and a couple of FX
+    // effects. RGBCW/XY are direct classic frames; FX is the MAC-embedded effect
+    // frame (the only FX form). Watch the light to confirm each mode engages.
+    if modes {
+        info!("RGBCW probe — direct R/G/B/CW/WW mixing (0xA8)");
+        for (label, c) in [
+            ("RED", (255u8, 0u8, 0u8, 0u8, 0u8)),
+            ("GREEN", (0, 255, 0, 0, 0)),
+            ("BLUE", (0, 0, 255, 0, 0)),
+            ("COOL-WHITE", (0, 0, 0, 255, 0)),
+            ("WARM-WHITE", (0, 0, 0, 0, 255)),
+        ] {
+            info!("RGBCW {label}");
+            ble::write_command(&peripheral, &chars.write, &classic::rgbcw(100, c.0, c.1, c.2, c.3, c.4)).await?;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+
+        info!("XY probe — CIE coordinate (0xB9)");
+        for (label, x, y) in [("D65 white", 3127u16, 3290u16), ("deep red", 6400, 3300), ("green", 3000, 6000)] {
+            info!(x, y, "XY {label}");
+            ble::write_command(&peripheral, &chars.write, &classic::xy(100, x, y)).await?;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+
+        info!("FX probe — built-in effect engine (0x91, MAC-embedded)");
+        for (label, bytes) in [
+            ("Lightning", infinity::fx(mac_bytes, 1, 100, 56, 0, 0, 0, 5, 0, 0)),
+            ("HUE-pulse (blue)", infinity::fx(mac_bytes, 9, 100, 0, 0, 240, 100, 6, 0, 0)),
+            ("Cop-Car (red/blue)", infinity::fx(mac_bytes, 10, 100, 0, 0, 0, 0, 7, 2, 0)),
+        ] {
+            info!("FX {label}");
+            ble::write_command(&peripheral, &chars.write, &bytes).await?;
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+        }
+
+        // FX may latch the light into effect mode; power-cycle restores direct
+        // control (per protocol-analysis.md), then set a neutral white.
+        info!("exiting FX (power-cycle) and restoring 5600K white");
+        ble::write_command(&peripheral, &chars.write, &power(false)).await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        ble::write_command(&peripheral, &chars.write, &power(true)).await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        ble::write_command(&peripheral, &chars.write, &set_cct(50, 56)).await?;
+    }
 
     // Give notifications a moment to arrive, then leave cleanly.
     tokio::time::sleep(Duration::from_millis(800)).await;
