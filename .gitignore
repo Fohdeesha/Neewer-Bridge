@@ -15,6 +15,9 @@
 /config.toml
 /neewer-bridge.toml
 
+# Local scratch / personal notes
+/how2run.txt
+
 # OS / editor
 .DS_Store
 *.swp

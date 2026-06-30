@@ -27,6 +27,15 @@
 # to prompts/defaults. List with `neewer-bridge models`.
 
 [[model]]
+name = "A19C 220V"
+name_matches = ["A19C 220V"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 27
+cct_max = 65
+
+[[model]]
 name = "A19C(E26)"
 name_matches = ["A19C(E26)"]
 driver = "classic"
@@ -48,8 +57,8 @@ supports_rgbcw = true
 supports_xy = true
 
 [[model]]
-name = "AP150C-2"
-name_matches = ["AP150C-2"]
+name = "AP150C"
+name_matches = ["AP150C"]
 driver = "classic"
 supports_rgb = true
 supports_gm = true
@@ -139,6 +148,15 @@ cct_max = 100
 supports_rgbcw = true
 
 [[model]]
+name = "BH40C"
+name_matches = ["BH40C"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 25
+cct_max = 100
+
+[[model]]
 name = "CB100C"
 product_ids = ["20220051"]
 name_matches = ["CB100C"]
@@ -180,6 +198,24 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+
+[[model]]
+name = "CL124 RGB(II)"
+name_matches = ["CL124 RGB(II)"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 25
+cct_max = 100
+
+[[model]]
+name = "CL124-RGB"
+name_matches = ["CL124-RGB"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 25
+cct_max = 100
 
 [[model]]
 name = "CT90C"
@@ -299,6 +335,45 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+
+[[model]]
+name = "GL1"
+name_matches = ["GL1"]
+driver = "classic"
+supports_rgb = true
+supports_gm = false
+cct_min = 29
+cct_max = 70
+
+[[model]]
+name = "GL1C"
+name_matches = ["GL1C"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 29
+cct_max = 70
+
+[[model]]
+name = "GL25C"
+name_matches = ["GL25C"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 29
+cct_max = 70
+supports_rgbcw = true
+
+[[model]]
+name = "GR18C"
+name_matches = ["GR18C"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 25
+cct_max = 85
+supports_fx = true
+supports_rgbcw = true
 
 [[model]]
 name = "HB200C"
@@ -432,7 +507,7 @@ name = "RGB-P280"
 name_matches = ["RGB-P280"]
 driver = "classic"
 supports_rgb = true
-supports_gm = true
+supports_gm = false
 cct_min = 32
 cct_max = 56
 
@@ -444,7 +519,7 @@ driver = "classic"
 supports_rgb = true
 supports_gm = true
 cct_min = 32
-cct_max = 56
+cct_max = 85
 supports_fx = true
 
 [[model]]
@@ -468,6 +543,15 @@ cct_max = 85
 supports_fx = true
 
 [[model]]
+name = "RGB140"
+name_matches = ["RGB140"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 25
+cct_max = 100
+
+[[model]]
 name = "RGB168"
 name_matches = ["RGB168"]
 driver = "classic"
@@ -481,7 +565,7 @@ name = "RGB176"
 name_matches = ["RGB176"]
 driver = "classic"
 supports_rgb = true
-supports_gm = true
+supports_gm = false
 cct_min = 32
 cct_max = 56
 
@@ -493,6 +577,15 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+
+[[model]]
+name = "RGB18"
+name_matches = ["RGB18"]
+driver = "classic"
+supports_rgb = true
+supports_gm = false
+cct_min = 32
+cct_max = 56
 
 [[model]]
 name = "RGB18(II)"
@@ -508,7 +601,7 @@ name = "RGB190"
 name_matches = ["RGB190"]
 driver = "classic"
 supports_rgb = true
-supports_gm = true
+supports_gm = false
 cct_min = 32
 cct_max = 56
 
@@ -617,23 +710,24 @@ name = "RGB960"
 name_matches = ["RGB960"]
 driver = "classic"
 supports_rgb = true
-supports_gm = true
+supports_gm = false
 cct_min = 32
 cct_max = 56
 
 [[model]]
-name = "RP19C"
-product_ids = ["20220046"]
-name_matches = ["RP19C"]
+name = "RL45C"
+name_matches = ["RL45C"]
 driver = "classic"
 supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+supports_rgbcw = true
 
 [[model]]
-name = "RP19C-2"
-name_matches = ["RP19C-2"]
+name = "RP19C"
+product_ids = ["20220046"]
+name_matches = ["RP19C"]
 driver = "classic"
 supports_rgb = true
 supports_gm = true
@@ -678,6 +772,15 @@ supports_gm = true
 cct_min = 25
 cct_max = 100
 supports_fx = true
+
+[[model]]
+name = "SRP18C"
+name_matches = ["SRP18C"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 25
+cct_max = 100
 
 [[model]]
 name = "T100C"
@@ -725,6 +828,19 @@ supports_rgbcw = true
 pixel_classify = 1
 
 [[model]]
+name = "TL90C"
+name_matches = ["TL90C"]
+driver = "classic"
+supports_rgb = true
+supports_gm = true
+cct_min = 25
+cct_max = 100
+supports_fx = true
+supports_rgbcw = true
+supports_xy = true
+pixel_classify = 1
+
+[[model]]
 name = "TL97C"
 name_matches = ["TL97C"]
 driver = "classic"
@@ -753,6 +869,35 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 85
+
+[[model]]
+name = "ZK-RY"
+name_matches = ["ZK-RY"]
+driver = "classic"
+supports_rgb = true
+supports_gm = false
+cct_min = 56
+cct_max = 56
+
+[[model]]
+name = "AP100B"
+name_matches = ["AP100B"]
+driver = "classic"
+supports_rgb = false
+supports_gm = false
+cct_min = 25
+cct_max = 85
+supports_fx = true
+
+[[model]]
+name = "AP150B"
+name_matches = ["AP150B"]
+driver = "classic"
+supports_rgb = false
+supports_gm = false
+cct_min = 25
+cct_max = 85
+supports_fx = true
 
 [[model]]
 name = "AS1200B"
@@ -832,6 +977,16 @@ cct_max = 65
 supports_fx = true
 
 [[model]]
+name = "CB200B Pro"
+name_matches = ["CB200B Pro"]
+driver = "classic"
+supports_rgb = false
+supports_gm = true
+cct_min = 27
+cct_max = 65
+supports_fx = true
+
+[[model]]
 name = "CB300"
 name_matches = ["CB300"]
 driver = "classic"
@@ -881,6 +1036,16 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+
+[[model]]
+name = "FS150B"
+product_ids = ["20220043"]
+name_matches = ["FS150B"]
+driver = "classic"
+supports_rgb = false
+supports_gm = false
+cct_min = 27
+cct_max = 65
 
 [[model]]
 name = "FS230 5600K"
@@ -951,8 +1116,8 @@ cct_min = 27
 cct_max = 65
 
 [[model]]
-name = "GL1"
-name_matches = ["GL1"]
+name = "GL1 PRO"
+name_matches = ["GL1 PRO"]
 driver = "classic"
 supports_rgb = false
 supports_gm = false
@@ -962,6 +1127,16 @@ cct_max = 70
 [[model]]
 name = "HB60B"
 name_matches = ["HB60B"]
+driver = "classic"
+supports_rgb = false
+supports_gm = false
+cct_min = 27
+cct_max = 65
+supports_fx = true
+
+[[model]]
+name = "HB80B"
+name_matches = ["HB80B"]
 driver = "classic"
 supports_rgb = false
 supports_gm = false
@@ -998,6 +1173,17 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+
+[[model]]
+name = "MS150B"
+product_ids = ["20220035"]
+name_matches = ["MS150B"]
+driver = "classic"
+supports_rgb = false
+supports_gm = false
+cct_min = 27
+cct_max = 65
+supports_fx = true
 
 [[model]]
 name = "MS60"
@@ -1065,6 +1251,16 @@ cct_min = 27
 cct_max = 65
 
 [[model]]
+name = "PL60B"
+name_matches = ["PL60B"]
+driver = "classic"
+supports_rgb = false
+supports_gm = false
+cct_min = 25
+cct_max = 85
+supports_fx = true
+
+[[model]]
 name = "R06S"
 name_matches = ["R06S"]
 driver = "classic"
@@ -1076,6 +1272,15 @@ cct_max = 65
 [[model]]
 name = "RB12B"
 name_matches = ["RB12B"]
+driver = "classic"
+supports_rgb = false
+supports_gm = false
+cct_min = 29
+cct_max = 70
+
+[[model]]
+name = "RH100B"
+name_matches = ["RH100B"]
 driver = "classic"
 supports_rgb = false
 supports_gm = false
@@ -1193,6 +1398,24 @@ cct_max = 85
 [[model]]
 name = "WRP18"
 name_matches = ["WRP18"]
+driver = "classic"
+supports_rgb = false
+supports_gm = false
+cct_min = 32
+cct_max = 56
+
+[[model]]
+name = "X2"
+name_matches = ["X2"]
+driver = "classic"
+supports_rgb = false
+supports_gm = false
+cct_min = 56
+cct_max = 56
+
+[[model]]
+name = "ZRP"
+name_matches = ["ZRP"]
 driver = "classic"
 supports_rgb = false
 supports_gm = false

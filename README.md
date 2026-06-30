@@ -11,7 +11,7 @@ protocol. CLI, config-file driven, runs on **Windows and Linux**.
   `NH-*`) lights.
 - Full built-in control: **CCT (+GM), HSI, raw RGBCW, CIE XY, and the 18-effect
   FX engine** — selectable live from a single DMX mode channel.
-- **118-model capability catalog** so `add` auto-fills a light's driver, profile,
+- **141-model capability catalog** so `add` auto-fills a light's driver, profile,
   and CCT range from its Bluetooth name.
 
 > Status: hardware-validated end-to-end on a Neewer TL120C — CCT, HSI, RGBCW, XY,
