@@ -28,6 +28,9 @@ toml = "0.8"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Non-blocking file logging + size-based rotation (long-lived daemon)
+tracing-appender = "0.2"
+file-rotate = "0.7"
 
 [profile.release]
 lto = true

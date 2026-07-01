@@ -143,7 +143,12 @@ enum Command {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    logging::init(cli.verbose);
+    // Initialise logging from the config's [logging] section (falling back to
+    // defaults if the config is missing/invalid — logging must never fail to come
+    // up). The returned guards must live for the whole run to keep the
+    // non-blocking file writer flushing.
+    let log_cfg = Config::load(&cli.config).map(|c| c.logging).unwrap_or_default();
+    let _log_guards = logging::init(&log_cfg, cli.verbose);
 
     if let Err(e) = dispatch(&cli).await {
         // Print the full error chain for debuggability.

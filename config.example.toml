@@ -25,6 +25,20 @@ probe_secs = 20          # liveness GATT-probe interval, seconds (stale-session 
 mode         = "hold"
 timeout_secs = 0         # 0 = never act (hold); >0 = act after N seconds of silence
 
+[logging]
+# Log verbosity + destinations. Console and file are independent — enable either,
+# both, or neither. Activity (connects, reconnects, power on/off, failsafe) logs at
+# `info`; every BLE command sent to a light logs at `debug`.
+# Level precedence: RUST_LOG env var > -v/-vv CLI flags > these settings.
+level         = "info"    # trace | debug | info | warn | error (global default)
+console       = true      # log to the console (stderr; stdout stays clean for --json)
+# console_level = "info"  # optional per-console override (defaults to `level`)
+# file          = "neewer-bridge.log"  # path; omit/empty = no file logging
+# file_level    = "debug" # optional per-file override — keep a full debug record
+                          # on disk while the console stays at info
+max_size_mb   = 10        # rotate the log file once it passes this size
+max_files     = 5         # how many rotated files to keep (older are deleted)
+
 # --- Lights -----------------------------------------------------------------
 # Easiest: run `neewer-bridge add` (interactive) or `add --mac <MAC> --universe N
 # --address N`. It identifies the light's model from its BLE name and fills in

@@ -73,6 +73,7 @@ impl LightActor {
 
             match ble::connect_and_verify(&peripheral).await {
                 Ok(chars) => {
+                    info!(light = %label, "connected");
                     // Power is driven entirely by the flushed LightState (the
                     // bridge seeds the initial state's power from
                     // `power_on_connect`), so there's no separate power-on here.
@@ -85,6 +86,7 @@ impl LightActor {
 
             // Best-effort disconnect so the OS doesn't keep a half-open handle.
             let _ = ble::disconnect(&peripheral).await;
+            info!(light = %label, backoff_secs = RECONNECT_BACKOFF.as_secs(), "disconnected; reconnecting after backoff");
             tokio::time::sleep(RECONNECT_BACKOFF).await;
         }
     }
@@ -146,15 +148,20 @@ impl LightActor {
                         if desired.power {
                             // Power-on only on transition (or the first send).
                             if prev_power != Some(true) {
+                                info!(light = %label, "power on");
                                 ble::write_command(p, &chars.write, &driver.power(true))
                                     .await
                                     .map_err(|e| anyhow::anyhow!("power-on write failed: {e}"))?;
                             }
+                            // The state command itself is per-frame at ArtNet rates,
+                            // so it's debug (kept off the info console but in the file).
+                            debug!(light = %label, state = %desired.summary(), "flush");
                             ble::write_command(p, &chars.write, &driver.apply(&desired))
                                 .await
                                 .map_err(|e| anyhow::anyhow!("flush write failed: {e}"))?;
                         } else if prev_power != Some(false) {
                             // Power-off only on transition (failsafe poweroff).
+                            info!(light = %label, "power off");
                             ble::write_command(p, &chars.write, &driver.power(false))
                                 .await
                                 .map_err(|e| anyhow::anyhow!("power-off write failed: {e}"))?;

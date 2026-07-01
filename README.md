@@ -94,7 +94,14 @@ neewer-bridge [--config PATH] [-v|-vv] <COMMAND>
 | `--version` | — | Print version. |
 | `--help` | — | Help (works on any subcommand too, e.g. `add --help`). |
 
-`RUST_LOG` overrides logging, e.g. `RUST_LOG=neewer_bridge=trace`.
+Logging destinations and default level come from the `[logging]` config section
+(console and/or a size-rotating file — see [Configuration](#configuration)).
+Precedence, highest first: `RUST_LOG` (e.g. `RUST_LOG=neewer_bridge=trace`) >
+`-v`/`-vv` > `[logging] level`. Activity — connects, reconnects, power on/off,
+failsafe — logs at `info`; every BLE command sent to a light logs at `debug`, so
+setting `file_level = "debug"` keeps a full on-disk record while the console stays
+clean at `info`.
+
 `scan`, `add`, `test`, `inspect`, `monitor`, `adapters`, and `artnet-send` work
 without a config file (they fall back to defaults); `lights` and `run` require a
 valid config.
@@ -176,6 +183,14 @@ probe_secs = 20         # liveness GATT-probe interval (stale-session detection)
 [failsafe]              # what to do when ArtNet data stops arriving
 mode         = "hold"   # hold | blackout | poweroff
 timeout_secs = 0        # 0 = never act (hold forever); >0 = act after N seconds
+
+[logging]               # verbosity + destinations (console and/or rotating file)
+level         = "info"  # trace | debug | info | warn | error (global default)
+console       = true    # log to stderr (stdout stays clean for --json output)
+# file        = "neewer-bridge.log"  # omit/empty = no file; rotated by size
+# file_level  = "debug" # keep a full debug record on disk while console stays info
+max_size_mb   = 10      # rotate the file past this size
+max_files     = 5       # rotated files to keep
 
 [[lights]]
 mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)

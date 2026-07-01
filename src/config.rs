@@ -18,6 +18,8 @@ pub struct Config {
     #[serde(default)]
     pub failsafe: Failsafe,
     #[serde(default)]
+    pub logging: Logging,
+    #[serde(default)]
     pub lights: Vec<LightCfg>,
 }
 
@@ -53,6 +55,35 @@ pub struct Failsafe {
     /// Seconds of no ArtNet before acting. `0` = never (hold forever).
     #[serde(default)]
     pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Logging {
+    /// Global default level: `trace` | `debug` | `info` | `warn` | `error`.
+    /// Per-destination overrides fall back to this. `debug` includes every BLE
+    /// command sent to a light; `info` is the clean operational level.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// Log to the console (stderr). Machine-readable command output stays on
+    /// stdout, so this never corrupts `scan --json` etc.
+    #[serde(default = "default_true")]
+    pub console: bool,
+    /// Optional console level override (defaults to `level`).
+    #[serde(default)]
+    pub console_level: Option<String>,
+    /// Log file path. Empty / absent = no file. Rotated by size (see below).
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Optional file level override (defaults to `level`). Handy to keep the
+    /// console at `info` while the file captures full `debug` history.
+    #[serde(default)]
+    pub file_level: Option<String>,
+    /// Rotate the log file once it exceeds this many megabytes.
+    #[serde(default = "default_log_max_size_mb")]
+    pub max_size_mb: u64,
+    /// How many rotated files to keep (older ones are deleted).
+    #[serde(default = "default_log_max_files")]
+    pub max_files: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -102,6 +133,19 @@ impl Default for Failsafe {
         Self { mode: default_failsafe_mode(), timeout_secs: 0 }
     }
 }
+impl Default for Logging {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            console: true,
+            console_level: None,
+            file: None,
+            file_level: None,
+            max_size_mb: default_log_max_size_mb(),
+            max_files: default_log_max_files(),
+        }
+    }
+}
 
 fn default_bind_ip() -> String {
     "0.0.0.0".into()
@@ -130,6 +174,17 @@ fn default_cct_max() -> u8 {
 fn default_failsafe_mode() -> String {
     "hold".into()
 }
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_log_max_size_mb() -> u64 {
+    10
+}
+fn default_log_max_files() -> usize {
+    5
+}
+/// Valid `tracing` levels, low → high verbosity.
+pub const KNOWN_LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 fn default_driver() -> String {
     "auto".into()
 }
@@ -162,6 +217,18 @@ impl Config {
                 "failsafe.mode {:?} unknown; expected one of {KNOWN_FAILSAFE_MODES:?}",
                 self.failsafe.mode
             );
+        }
+        // Logging levels (global + optional per-destination overrides).
+        for (field, val) in [
+            ("logging.level", Some(&self.logging.level)),
+            ("logging.console_level", self.logging.console_level.as_ref()),
+            ("logging.file_level", self.logging.file_level.as_ref()),
+        ] {
+            if let Some(lvl) = val {
+                if !KNOWN_LOG_LEVELS.contains(&lvl.to_lowercase().as_str()) {
+                    bail!("{field} {lvl:?} unknown; expected one of {KNOWN_LOG_LEVELS:?}");
+                }
+            }
         }
         for (i, l) in self.lights.iter().enumerate() {
             let who = format!("lights[{i}] (mac={:?})", l.mac);
@@ -327,6 +394,20 @@ mod tests {
         assert_eq!(loaded.lights[0].universe, 2);
         assert_eq!(loaded.lights[1].address, 5);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_checks_logging_levels() {
+        let mut c = Config::default();
+        assert!(c.validate().is_ok()); // default level "info"
+        c.logging.level = "verbose".into();
+        assert!(c.validate().is_err()); // unknown global level
+        c.logging.level = "debug".into();
+        assert!(c.validate().is_ok());
+        c.logging.file_level = Some("nope".into());
+        assert!(c.validate().is_err()); // unknown per-sink override
+        c.logging.file_level = Some("trace".into());
+        assert!(c.validate().is_ok());
     }
 
     #[test]

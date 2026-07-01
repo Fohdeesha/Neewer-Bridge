@@ -80,6 +80,34 @@ pub struct LightState {
     pub fx_val2: u16,
 }
 
+impl LightState {
+    /// A concise, human-readable one-line summary for logs, e.g.
+    /// `"CCT 5600K @ 50% gm+0"` or `"HSI hue=180 sat=100 @ 75%"`. Only the fields
+    /// relevant to the current mode are shown. `cct` is the raw ×100K value.
+    pub fn summary(&self) -> String {
+        match self.mode {
+            Mode::Cct => format!(
+                "CCT {}K @ {}% gm{:+}",
+                self.cct as u32 * 100,
+                self.brightness,
+                self.gm
+            ),
+            Mode::Hsi => {
+                format!("HSI hue={} sat={} @ {}%", self.hue, self.sat, self.brightness)
+            }
+            Mode::Rgbcw => format!(
+                "RGBCW r={} g={} b={} cw={} ww={} @ {}%",
+                self.r, self.g, self.b, self.cw, self.ww, self.brightness
+            ),
+            Mode::Xy => format!("XY x={} y={} @ {}%", self.x, self.y, self.brightness),
+            Mode::Fx => format!(
+                "FX #{} speed={} @ {}%",
+                self.fx_id, self.fx_speed, self.brightness
+            ),
+        }
+    }
+}
+
 impl Default for LightState {
     fn default() -> Self {
         LightState {
