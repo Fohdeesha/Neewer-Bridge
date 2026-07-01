@@ -56,7 +56,9 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 # mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)
 # name     = "Key light"          # optional label
 # driver   = "auto"               # auto | classic | infinity | home
-# profile  = "advanced"           # cct | cct_gm | hsi | full | advanced | pixel (NOTES.md §8.1)
+# profile  = "advanced"           # cct | cct_gm | hsi | rgbcw | full | advanced | pixel (NOTES.md §8.1)
+#                                 # `rgbcw` (5ch) = direct R,G,B,CW,WW passthrough — maps onto
+#                                 #   openHAB's DMX color (3ch) + tunablewhite (2ch) things
 #                                 # `advanced` (10ch) = mode-channel: CCT/HSI/FX/RGBCW/XY
 #                                 # `pixel` (20ch) = 8-segment colour, 5 animated effects
 #                                 # (ColorReplacement/Single/Two/Three-Moving/Fire), TL-series only
@@ -67,3 +69,16 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 # # manual. Default 32..56 (3200..5600K); e.g. the TL120C is 25..100 (2500..10000K).
 # cct_min  = 32
 # cct_max  = 56
+
+# TL120C driven as a native RGBCW fixture from openHAB (color + tunablewhite things).
+# DMX: ch1=R ch2=G ch3=B ch4=CW ch5=WW at universe 0, start address 1.
+[[lights]]
+mac      = "D6:50:F2:F6:BB:1B"
+name     = "TL120C"
+driver   = "classic"
+profile  = "rgbcw"
+universe = 0
+address  = 1
+power_on_connect = true
+cct_min  = 25
+cct_max  = 100

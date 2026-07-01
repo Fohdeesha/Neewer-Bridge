@@ -96,7 +96,8 @@ pub struct LightCfg {
     /// Protocol family: `auto` | `classic` | `infinity` | `home`.
     #[serde(default = "default_driver")]
     pub driver: String,
-    /// DMX profile name (see NOTES.md §8.1): `cct` | `cct_gm` | `hsi` | `full`.
+    /// DMX profile name (see NOTES.md §8.1): `cct` | `cct_gm` | `hsi` | `rgbcw` |
+    /// `full` | `advanced` | `pixel`.
     pub profile: String,
     /// ArtNet 15-bit Port-Address (Net/Sub-Net/Universe combined), 0..=32767.
     pub universe: u16,
@@ -193,7 +194,7 @@ fn default_true() -> bool {
 }
 
 /// Known DMX profiles (kept in sync with NOTES.md §8.1).
-pub const KNOWN_PROFILES: &[&str] = &["cct", "cct_gm", "hsi", "full", "advanced", "pixel"];
+pub const KNOWN_PROFILES: &[&str] = &["cct", "cct_gm", "hsi", "rgbcw", "full", "advanced", "pixel"];
 /// Known driver selectors.
 pub const KNOWN_DRIVERS: &[&str] = &["auto", "classic", "infinity", "home"];
 /// Known failsafe modes (only `hold` is fully implemented in v1).

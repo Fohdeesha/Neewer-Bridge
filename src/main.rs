@@ -56,7 +56,7 @@ enum Command {
         /// Protocol driver: auto | classic | infinity | home (default: from model).
         #[arg(long)]
         driver: Option<String>,
-        /// DMX profile: cct | cct_gm | hsi | full (default: from model).
+        /// DMX profile: cct | cct_gm | hsi | rgbcw | full | advanced | pixel (default: from model).
         #[arg(long)]
         profile: Option<String>,
         /// ArtNet universe / Port-Address (required with --mac).

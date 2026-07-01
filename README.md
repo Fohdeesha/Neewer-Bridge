@@ -130,7 +130,7 @@ driver / profile / CCT range are filled automatically; any flag overrides.
 | `--universe N` | with `--mac` | ArtNet universe / Port-Address (0–32767). |
 | `--address N` | with `--mac` | 1-based DMX start channel. |
 | `--driver D` | — | `auto`\|`classic`\|`infinity`\|`home` (default: from model). |
-| `--profile P` | — | `cct`\|`cct_gm`\|`hsi`\|`full`\|`advanced`\|`pixel` (default: from model). |
+| `--profile P` | — | `cct`\|`cct_gm`\|`hsi`\|`rgbcw`\|`full`\|`advanced`\|`pixel` (default: from model). |
 | `--name X` | — | Label (default: model name). |
 | `--cct-min N` | — | CCT range min, raw ×100K (default: from model). |
 | `--cct-max N` | — | CCT range max, raw ×100K (default: from model). |
@@ -205,7 +205,7 @@ max_files     = 5       # rotated files to keep
 mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)
 name     = "Key light"          # optional label
 driver   = "auto"               # auto | classic | infinity | home
-profile  = "advanced"           # cct | cct_gm | hsi | full | advanced
+profile  = "advanced"           # cct | cct_gm | hsi | rgbcw | full | advanced | pixel
 universe = 0                    # ArtNet 15-bit Port-Address (Net/Sub-Net/Universe)
 address  = 1                    # 1-based DMX start channel
 power_on_connect = true         # power the light on when it first connects
@@ -229,12 +229,46 @@ externally to turn them off).
 | `cct`      | 2  | 1 Dimmer · 2 CCT |
 | `cct_gm`   | 3  | 1 Dimmer · 2 CCT · 3 GM |
 | `hsi`      | 3  | 1 Dimmer · 2 Hue · 3 Saturation |
+| `rgbcw`    | 5  | 1 Red · 2 Green · 3 Blue · 4 Cool White · 5 Warm White — direct (below) |
 | `full`     | 5  | 1 Dimmer · 2 **Mode** · 3 CCT/Hue · 4 GM/Sat · 5 reserved |
 | `advanced` | 10 | 1 **Mode-select** · 2 Dimmer · 3–10 mode-specific (below) |
 | `pixel`    | 20 | 1 Dimmer · 2 Effect-select · 3 Speed · 4 Direction · 5–20 = 8×(Hue, Sat) — 5 animated effects (below) |
 
 For **`full`**, the Mode channel (ch2) selects sub-mode live: `0–127` = CCT
 (ch3=CCT, ch4=GM), `128–255` = HSI (ch3=Hue, ch4=Saturation).
+
+For **`rgbcw`** (opt-in; RGBCW-capable models such as the TL120C), five channels are
+passed **straight through** to the light's native RGBCW mode — Red, Green, Blue,
+Cool-White, Warm-White, one DMX channel per physical LED bank, with no colour-space
+conversion. Each channel drives its own emitter, so you get independent colour + white
+mixing (what `hsi`/`xy` can't do). Level rides in the channel values themselves.
+
+This lays out exactly onto **openHAB's** native RGBCW support: a DMX `color` thing
+(3ch RGB) plus a `tunablewhite` thing (2ch, in "cool white, warm white" order), patched
+contiguously. Patch the light at DMX address `N`; the color thing gets channels
+`N/3` and the tunablewhite gets `N+3,N+4`. Example for a light at `universe = 0`,
+`address = 1`:
+
+```
+// things/neewer.things
+Bridge dmx:artnet-bridge:neewer [ address="127.0.0.1", universe=0, refreshrate=30 ] {
+    color        tl120c_rgb   [ dmxid="1/3", fadetime=0 ]
+    tunablewhite tl120c_white [ dmxid="4,5", fadetime=0 ]
+}
+```
+```
+// items/neewer.items
+Color  TL120C_Colour "Colour"          { channel="dmx:color:neewer:tl120c_rgb:color" }
+Dimmer TL120C_White  "White [%d %%]"   { channel="dmx:tunablewhite:neewer:tl120c_white:brightness" }
+Number TL120C_WTemp  "White temp"      { channel="dmx:tunablewhite:neewer:tl120c_white:color_temperature" }
+```
+
+Set the bridge's `[artnet] bind_ip` reachable from openHAB and point the thing's
+`address` at the bridge host (`127.0.0.1` if co-located; default port 6454). `refreshrate`
+is openHAB's Art-Net send rate — the bridge coalesces to `[ble] flush_hz` regardless.
+Raise `fadetime` for smooth console-side fades. (No separate master-dimmer channel; the
+color thing's own brightness scales R/G/B, tunablewhite's scales CW/WW. Use `advanced`'s
+RGBCW band if you want a single master dimmer over all five.)
 
 For **`advanced`** (the default for RGB-capable models), the Mode-select channel
 (ch1) chooses among all built-in modes via value bands, and ch3–ch10 are

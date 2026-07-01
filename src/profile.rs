@@ -22,6 +22,12 @@ pub enum Profile {
     CctGm,
     /// 3ch: Dimmer, Hue, Sat.
     Hsi,
+    /// 5ch: Red, Green, Blue, Cool-White, Warm-White. Standard 8-bit values (0..=255)
+    /// passed **straight through** to the light's native RGBCW mode — one DMX channel
+    /// per physical LED bank, no colour-space conversion. Lays out exactly onto an
+    /// openHAB DMX `color` thing (3ch RGB) + `tunablewhite` thing (2ch, "cool white,
+    /// warm white" order) patched contiguously.
+    Rgbcw,
     /// 5ch: Dimmer, Mode, CCT/Hue, GM/Sat, (reserved). Mode <128 = CCT, ≥128 = HSI.
     Full,
     /// 10ch unified mode-channel personality (NOTES.md §8.1). ch1 Mode-select
@@ -40,6 +46,7 @@ impl Profile {
             "cct" => Some(Profile::Cct),
             "cct_gm" => Some(Profile::CctGm),
             "hsi" => Some(Profile::Hsi),
+            "rgbcw" => Some(Profile::Rgbcw),
             "full" => Some(Profile::Full),
             "advanced" => Some(Profile::Advanced),
             "pixel" => Some(Profile::Pixel),
@@ -53,6 +60,7 @@ impl Profile {
             Profile::Cct => "cct",
             Profile::CctGm => "cct_gm",
             Profile::Hsi => "hsi",
+            Profile::Rgbcw => "rgbcw",
             Profile::Full => "full",
             Profile::Advanced => "advanced",
             Profile::Pixel => "pixel",
@@ -64,7 +72,7 @@ impl Profile {
         match self {
             Profile::Cct => 2,
             Profile::Hsi | Profile::CctGm => 3,
-            Profile::Full => 5,
+            Profile::Full | Profile::Rgbcw => 5,
             Profile::Advanced => 10,
             // 1 Dimmer + 1 Effect + 1 Speed + 1 Direction + PIXEL_SEGMENTS × (Hue, Sat).
             Profile::Pixel => 4 + PIXEL_SEGMENTS as u16 * 2,
@@ -80,6 +88,7 @@ impl Profile {
             Profile::Cct => &["Dimmer", "CCT"],
             Profile::CctGm => &["Dimmer", "CCT", "GM"],
             Profile::Hsi => &["Dimmer", "Hue", "Saturation"],
+            Profile::Rgbcw => &["Red", "Green", "Blue", "Cool White", "Warm White"],
             Profile::Full => &[
                 "Dimmer",
                 "Mode-select (0-127 CCT / 128-255 HSI)",
@@ -243,6 +252,20 @@ pub fn map_dmx(profile: Profile, slice: &[u8], cct: CctRange) -> LightState {
             st.hue = hue_value(ch(1));
             st.sat = sat_value(ch(2));
         }
+        Profile::Rgbcw => {
+            // Native RGBCW passthrough: five raw channels straight into the by-MAC
+            // 0xA9 frame — R, G, B, cool-white, warm-white, one DMX channel per LED
+            // bank. Lays out onto openHAB's DMX `color` thing (3ch RGB) + `tunablewhite`
+            // thing (2ch, "cool white, warm white") patched contiguously. Level rides in
+            // the channel values themselves, so the frame's master brightness is 100.
+            st.mode = Mode::Rgbcw;
+            st.brightness = 100;
+            st.r = ch(0);
+            st.g = ch(1);
+            st.b = ch(2);
+            st.cw = ch(3);
+            st.ww = ch(4);
+        }
         Profile::Full => {
             st.brightness = brightness_value(ch(0));
             if ch(1) < MODE_HSI_THRESHOLD {
@@ -347,7 +370,26 @@ mod tests {
         assert_eq!(Profile::Cct.channel_count(), 2);
         assert_eq!(Profile::CctGm.channel_count(), 3);
         assert_eq!(Profile::Hsi.channel_count(), 3);
+        assert_eq!(Profile::Rgbcw.channel_count(), 5);
         assert_eq!(Profile::Full.channel_count(), 5);
+    }
+
+    #[test]
+    fn rgbcw_profile_direct_passthrough() {
+        // ch1-5 = R, G, B, CW, WW straight through; master brightness fixed at 100.
+        let st = map_dmx(Profile::Rgbcw, &[10, 20, 30, 40, 50], CctRange::default());
+        assert_eq!(st.mode, Mode::Rgbcw);
+        assert!(st.power);
+        assert_eq!(st.brightness, 100);
+        assert_eq!((st.r, st.g, st.b, st.cw, st.ww), (10, 20, 30, 40, 50));
+
+        // Full white via the dedicated white channels (openHAB tunablewhite), colour off.
+        let w = map_dmx(Profile::Rgbcw, &[0, 0, 0, 255, 255], CctRange::default());
+        assert_eq!((w.r, w.g, w.b, w.cw, w.ww), (0, 0, 0, 255, 255));
+
+        // Short slice is defensive: missing white channels read as 0.
+        let s = map_dmx(Profile::Rgbcw, &[255, 0, 0], CctRange::default());
+        assert_eq!((s.r, s.g, s.b, s.cw, s.ww), (255, 0, 0, 0, 0));
     }
 
     #[test]
