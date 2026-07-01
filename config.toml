@@ -56,8 +56,10 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 # mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)
 # name     = "Key light"          # optional label
 # driver   = "auto"               # auto | classic | infinity | home
-# profile  = "advanced"           # cct | cct_gm | hsi | full | advanced (NOTES.md §8.1)
-#                                 # `advanced` (10ch) = mode-channel: CCT/HSI/RGBCW/XY/FX
+# profile  = "advanced"           # cct | cct_gm | hsi | full | advanced | pixel (NOTES.md §8.1)
+#                                 # `advanced` (10ch) = mode-channel: CCT/HSI/FX/RGBCW/XY
+#                                 # `pixel` (20ch) = 8-segment colour, 5 animated effects
+#                                 # (ColorReplacement/Single/Two/Three-Moving/Fire), TL-series only
 # universe = 0                    # ArtNet 15-bit Port-Address (Net/Sub-Net/Universe)
 # address  = 1                    # 1-based DMX start channel
 # power_on_connect = true

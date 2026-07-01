@@ -4,9 +4,11 @@
 # Reference projects (kept on disk for research, not part of this repo)
 /NeewerLite
 /NeewerLite-Python
-# Decompiled NEEWER Studio APK + separate daemon project (151MB research material;
-# our derived findings live in protocol-analysis.md and models.toml, which ARE tracked)
-/from-bengt
+# Decompiled NEEWER Studio APK (APK/) + the mature bengt/verygeeky daemon project
+# (bengt-neewerd/, has its own git). Large research material; our derived findings
+# live in protocol-analysis.md and models.toml, which ARE tracked.
+/APK
+/bengt-neewerd
 
 # Large reference artifact
 /artnet_protocol_specs.txt

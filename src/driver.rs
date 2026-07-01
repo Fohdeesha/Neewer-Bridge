@@ -4,14 +4,14 @@
 //! which classic CCT frame form to use), per NOTES.md §6.
 
 use crate::profile::Profile;
-use crate::protocol::{classic, home, infinity, LightState, Mode};
+use crate::protocol::{classic, home, infinity, pixel, LightState, Mode};
 
 /// A bound driver for one physical light.
 #[derive(Debug, Clone)]
 pub enum Driver {
-    /// Classic `0x78`. `supports_gm` selects the 5-byte CCT (with GM) vs the
-    /// universally-accepted 2-byte form. `mac` is carried so FX (which only has a
-    /// MAC-embedded frame) can be sent even on a classic-driven light.
+    /// Classic `0x78`. `supports_gm` selects the app's 4-byte CCT (with GM,
+    /// `classic::cct4`) vs the universally-accepted 2-byte form. `mac` is carried so
+    /// FX (which only has a MAC-embedded frame) can be sent even on a classic light.
     Classic { supports_gm: bool, mac: [u8; 6] },
     /// Infinity `0x78` with the MAC embedded in every payload.
     Infinity { mac: [u8; 6] },
@@ -49,15 +49,18 @@ impl Driver {
     }
 
     /// The command that realises `state`'s current mode. CCT/HSI use the driver's
-    /// native family; RGBCW/XY use the direct classic frames (universal); FX uses
-    /// the MAC-embedded effect frame (the only FX form). Home lacks the advanced
-    /// modes, so they degrade to a neutral CCT.
+    /// native family; **XY and RGBCW use the MAC-addressed classic frames** (`0xB7`/
+    /// `0xA9` — the direct `0xB9`/`0xA8` forms are ignored on Infinity fixtures like
+    /// the TL120C, hardware-confirmed); FX uses the MAC-embedded effect frame (the
+    /// only FX form). Home lacks the advanced modes, so they degrade to a neutral CCT.
     pub fn apply(&self, st: &LightState) -> Vec<u8> {
         match st.mode {
             Mode::Cct => match self {
                 Driver::Classic { supports_gm, .. } => {
                     if *supports_gm {
-                        classic::cct_gm5(st.brightness, st.cct, st.gm)
+                        // The app's exact 4-byte GM form (was our 5-byte cct_gm5);
+                        // byte-verified on the TL120C by bengt/verygeeky (NOTES.md §2.1/§3.3).
+                        classic::cct4(st.brightness, st.cct, st.gm)
                     } else {
                         classic::cct2(st.brightness, st.cct)
                     }
@@ -70,15 +73,23 @@ impl Driver {
                 Driver::Infinity { mac } => infinity::hsi(*mac, st.hue, st.sat, st.brightness),
                 Driver::Home => home::hsi(st.brightness as u16 * 10, st.hue, st.sat),
             },
-            // RGBCW / XY: direct classic frames work on the colour lights that
-            // expose these modes; Home degrades to neutral CCT.
-            Mode::Rgbcw => match self {
-                Driver::Home => home::cct(st.brightness as u16 * 10, st.cct),
-                _ => classic::rgbcw(st.brightness, st.r, st.g, st.b, st.cw, st.ww),
-            },
+            // XY: MAC-addressed frame (0xB7). Verified on the TL120C, which ignores
+            // the direct 0xB9 form — like its FX and pixel frames, the advanced-mode
+            // commands must embed the MAC. Home degrades to neutral CCT.
             Mode::Xy => match self {
+                Driver::Classic { mac, .. } | Driver::Infinity { mac } => {
+                    classic::xy_mac(*mac, st.brightness, st.x, st.y)
+                }
                 Driver::Home => home::cct(st.brightness as u16 * 10, st.cct),
-                _ => classic::xy(st.brightness, st.x, st.y),
+            },
+            // RGBCW: MAC-addressed frame (0xA9). Hardware-confirmed on the TL120C
+            // (2026-07-01) — the direct 0xA8 is ignored (like XY's direct 0xB9), but
+            // the by-MAC form renders. Home degrades to neutral CCT.
+            Mode::Rgbcw => match self {
+                Driver::Classic { mac, .. } | Driver::Infinity { mac } => {
+                    classic::rgbcw_mac(*mac, st.brightness, st.r, st.g, st.b, st.cw, st.ww, 0)
+                }
+                Driver::Home => home::cct(st.brightness as u16 * 10, st.cct),
             },
             // FX: MAC-embedded effect frame (we always carry the MAC).
             Mode::Fx => match self {
@@ -88,6 +99,36 @@ impl Driver {
                 ),
                 Driver::Home => home::cct(st.brightness as u16 * 10, st.cct),
             },
+            // Pixel is inherently multi-frame; `apply` returns the first frame
+            // (params). Callers that can render it fully use `apply_frames`.
+            Mode::Pixel => self.apply_frames(st).into_iter().next().unwrap_or_default(),
+        }
+    }
+
+    /// Every BLE frame that realises `state`, in send order. Most modes are a
+    /// single frame; **Pixel** emits a params frame plus 1–2 palette frames (each
+    /// may itself need MTU chunking at the BLE layer). This is what the per-light
+    /// actor flushes.
+    pub fn apply_frames(&self, st: &LightState) -> Vec<Vec<u8>> {
+        if st.mode == Mode::Pixel {
+            return match self {
+                // Home lights aren't pixel fixtures; degrade to a neutral CCT.
+                Driver::Home => vec![home::cct(st.brightness as u16 * 10, st.cct)],
+                Driver::Classic { mac, .. } | Driver::Infinity { mac } => pixel::paint(
+                    *mac, st.pixel_blocks(), st.brightness, st.pixel_effect, st.pixel_speed, st.pixel_dir,
+                ),
+            };
+        }
+        vec![self.apply(st)]
+    }
+
+    /// The bound light's 6-byte MAC, if this driver family uses one. Used by the
+    /// actor to build MAC-addressed status queries (battery/temp/version/state);
+    /// `Home` (`0x7A`) has no such reads, so it returns `None`.
+    pub fn mac(&self) -> Option<[u8; 6]> {
+        match self {
+            Driver::Classic { mac, .. } | Driver::Infinity { mac } => Some(*mac),
+            Driver::Home => None,
         }
     }
 
@@ -117,7 +158,7 @@ mod tests {
         let no_gm = Driver::Classic { supports_gm: false, mac };
         assert_eq!(no_gm.apply(&cct_state(50, 56, 0)), classic::cct2(50, 56));
         let gm = Driver::Classic { supports_gm: true, mac };
-        assert_eq!(gm.apply(&cct_state(50, 56, -10)), classic::cct_gm5(50, 56, -10));
+        assert_eq!(gm.apply(&cct_state(50, 56, -10)), classic::cct4(50, 56, -10));
         assert_eq!(no_gm.apply(&hsi_state(180, 100, 75)), classic::hsi(180, 100, 75));
     }
 
@@ -125,14 +166,31 @@ mod tests {
     fn advanced_mode_dispatch() {
         let mac = [1, 2, 3, 4, 5, 6];
         let d = Driver::Classic { supports_gm: true, mac };
-        // RGBCW + XY use the direct classic frames.
-        let rgbcw = LightState { mode: Mode::Rgbcw, brightness: 100, r: 255, ..LightState::default() };
-        assert_eq!(d.apply(&rgbcw), classic::rgbcw(100, 255, 0, 0, 0, 0));
+        // XY uses the MAC-addressed frame (TL120C ignores the direct form).
         let xy = LightState { mode: Mode::Xy, brightness: 80, x: 3127, y: 3290, ..LightState::default() };
-        assert_eq!(d.apply(&xy), classic::xy(80, 3127, 3290));
+        assert_eq!(d.apply(&xy), classic::xy_mac(mac, 80, 3127, 3290));
         // FX uses the MAC-embedded frame even under a classic driver.
         let fx = LightState { mode: Mode::Fx, brightness: 100, cct: 56, fx_id: 1, fx_speed: 5, ..LightState::default() };
         assert_eq!(d.apply(&fx), infinity::fx(mac, 1, 100, 56, 0, 0, 0, 5, 0, 0));
+        // RGBCW uses the by-MAC frame (0xA9) — direct 0xA8 is ignored on the TL120C.
+        let rgbcw = LightState { mode: Mode::Rgbcw, brightness: 100, r: 255, g: 0, b: 0, ..LightState::default() };
+        assert_eq!(d.apply(&rgbcw), classic::rgbcw_mac(mac, 100, 255, 0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn pixel_apply_frames_emits_params_and_palette() {
+        let mac = [0xCC, 0x8D, 0xBE, 0xBB, 0x25, 0xB0];
+        let d = Driver::Classic { supports_gm: true, mac };
+        let mut st = LightState { mode: Mode::Pixel, brightness: 100, seg_count: 2, pixel_speed: 30, pixel_effect: 1, ..LightState::default() };
+        st.segments[0] = pixel::Block::Hsi { hue: 0, sat: 100 };
+        st.segments[1] = pixel::Block::Hsi { hue: 240, sat: 100 };
+        let frames = d.apply_frames(&st);
+        // params + one palette (≤6 colours) = 2 frames.
+        assert_eq!(frames.len(), 2);
+        // Palette frame must match the pixel encoder for the same blocks.
+        assert_eq!(frames[1], pixel::palette(mac, 1, 1, st.pixel_blocks()));
+        // Home degrades pixel to a single neutral-CCT frame.
+        assert_eq!(Driver::Home.apply_frames(&st).len(), 1);
     }
 
     #[test]

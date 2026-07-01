@@ -277,15 +277,58 @@ pub async fn write_command(p: &Peripheral, write: &Characteristic, data: &[u8]) 
     Ok(())
 }
 
-/// Subscribe to the notify characteristic and spawn a background task that logs
-/// every inbound frame as hex (useful for reverse-engineering / liveness debug).
-pub async fn spawn_notify_logger(p: &Peripheral, notify: &Characteristic) -> Result<()> {
+/// Max payload for a single ATT write at the default MTU of 23 (23 − 3 ATT
+/// header bytes). Neewer pixel/OTA frames longer than this are rejected as a
+/// single write and must be split; the device reassembles them by the frame's
+/// header length byte (continuation chunks do NOT re-start with `0x78`).
+pub const MAX_ATT_WRITE: usize = 20;
+
+/// Write a possibly-oversized command, splitting it into ≤`MAX_ATT_WRITE`-byte
+/// GATT writes when needed (for pixel palettes and other long frames). Short
+/// frames go out as a single write, identical to [`write_command`].
+pub async fn write_command_chunked(p: &Peripheral, write: &Characteristic, data: &[u8]) -> Result<()> {
+    if data.len() <= MAX_ATT_WRITE {
+        return write_command(p, write, data).await;
+    }
+    let wt = if write.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE) {
+        WriteType::WithoutResponse
+    } else {
+        WriteType::WithResponse
+    };
+    debug!(bytes = %hexstr(data), ?wt, "BLE write (chunked)");
+    for chunk in data.chunks(MAX_ATT_WRITE) {
+        p.write(write, chunk, wt)
+            .await
+            .with_context(|| format!("writing chunk of command {}", hexstr(data)))?;
+        // Small settle between fragments so the device's reassembler keeps up.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+/// A stream of inbound notification frames from a peripheral.
+pub type NotifyStream = std::pin::Pin<Box<dyn futures::Stream<Item = btleplug::api::ValueNotification> + Send>>;
+
+/// Subscribe to the notify characteristic and return the notification stream, so a
+/// caller (the per-light actor) can decode status replies inline in its select loop.
+pub async fn subscribe_notify(p: &Peripheral, notify: &Characteristic) -> Result<NotifyStream> {
     p.subscribe(notify).await.context("subscribe to notify char")?;
-    let mut stream = p.notifications().await.context("opening notification stream")?;
+    let stream = p.notifications().await.context("opening notification stream")?;
+    Ok(stream)
+}
+
+/// Subscribe to the notify characteristic and spawn a background task that logs
+/// every inbound frame as hex, plus a decoded summary when we recognise the reply
+/// (battery/temp/version/state) — useful for reverse-engineering / the `test` probes.
+pub async fn spawn_notify_logger(p: &Peripheral, notify: &Characteristic) -> Result<()> {
+    let mut stream = subscribe_notify(p, notify).await?;
     tokio::spawn(async move {
         use futures::StreamExt;
         while let Some(n) = stream.next().await {
-            info!(uuid = %n.uuid, data = %hexstr(&n.value), "BLE notify");
+            match crate::protocol::replies::parse(&n.value) {
+                Some(reply) => info!(uuid = %n.uuid, data = %hexstr(&n.value), decoded = %reply.summary(), "BLE notify"),
+                None => info!(uuid = %n.uuid, data = %hexstr(&n.value), "BLE notify"),
+            }
         }
         debug!("notification stream ended");
     });

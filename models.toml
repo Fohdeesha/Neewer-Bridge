@@ -5,7 +5,7 @@
 # add hand-curated [[model]] blocks; fold lasting fixes back into the script.)
 #
 # AUTHORITATIVE SOURCE: the decompiled NEEWER Studio Android app
-# (from-bengt/reference/decompiled/sources/defpackage/nj0.java = DeviceConfigInfo
+# (APK/decompiled/sources/defpackage/nj0.java = DeviceConfigInfo
 # table, joined with ck0.getProjectName for names). See protocol-analysis.md.
 # Legacy classic panels not in that table (RGB660-era, SNL/SRP, SL80...) are
 # supplemented from NeewerLite. Corrected from manuals/hardware where needed

@@ -1,6 +1,8 @@
 //! CLI command implementations (orchestration). Thin glue over `ble` + `protocol`.
 
 use anyhow::{bail, Context, Result};
+use btleplug::api::Characteristic;
+use btleplug::platform::Peripheral;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
@@ -13,7 +15,8 @@ use crate::config::{self, parse_mac, LightCfg, KNOWN_DRIVERS};
 use crate::driver::Driver;
 use crate::models::Catalog;
 use crate::profile::Profile;
-use crate::protocol::{classic, home, infinity};
+use crate::protocol::pixel::{self, Block};
+use crate::protocol::{classic, home, infinity, queries};
 
 /// Minimal JSON string escaping (quotes + backslashes) for `scan --json`.
 fn json_escape(s: &str) -> String {
@@ -139,8 +142,8 @@ pub fn lights(cfg: &config::Config) -> Result<()> {
             "\n  `advanced` Mode-select (ch1) value bands — selects how ch3+ are read:\n   \
              0-31 CCT (ch3 CCT, ch4 GM) · 32-63 HSI (ch3 Hue, ch4 Sat) ·\n   \
              64-95 FX (ch3 FX-id 1-18, ch4 Speed, ch5 CCT, ch6 Hue, ch7 Sat/GM, ch8 Extra, ch9 2nd-val) ·\n   \
-             128-159 RGBCW (ch3-7 = R,G,B,CW,WW) · 192-231 XY (ch3 X, ch4 Y).\n   \
-             Other bands → neutral white."
+             192-231 XY (ch3 X, ch4 Y).\n   \
+             Other bands (incl. RGBCW 128-159, ignored over direct BLE) → neutral white."
         );
     }
     Ok(())
@@ -518,6 +521,7 @@ pub async fn monitor(bind_ip: &str, port: u16) -> Result<()> {
 /// `test` — connect to one light and prove the BLE path end to end:
 /// verify GATT, blink power (also serves as visual identify), then set a known
 /// CCT. Uses our real protocol encoders so this validates them on hardware.
+#[allow(clippy::too_many_arguments)]
 pub async fn test(
     adapter_selector: &str,
     mac: &str,
@@ -525,6 +529,9 @@ pub async fn test(
     seconds: u64,
     colors: bool,
     modes: bool,
+    pixel: bool,
+    set: Option<&str>,
+    status: bool,
 ) -> Result<()> {
     let mac_bytes = parse_mac(mac)?;
     let adapter = ble::acquire_adapter(adapter_selector).await?;
@@ -533,6 +540,20 @@ pub async fn test(
 
     if let Some(notify) = &chars.notify {
         ble::spawn_notify_logger(&peripheral, notify).await?;
+    }
+
+    // Status read (`--status`): query firmware version / battery / temperature / state
+    // and print the decoded replies. Non-mutating — no blink, no colour change — so
+    // it's safe to run anytime. Short-circuits before the blink/CCT sequence.
+    if status {
+        return test_status(&peripheral, &chars.write, mac_bytes).await;
+    }
+
+    // Single-frame set (`--set SPEC`): send exactly one frame (or pixel palette) and
+    // hold it, for guided one-at-a-time testing. The light keeps the state after
+    // disconnect. Short-circuits before the blink/CCT sequence.
+    if let Some(spec) = set {
+        return test_set(&peripheral, &chars.write, mac_bytes, spec).await;
     }
 
     // Encoders per protocol family. `auto` is treated as classic for this manual
@@ -583,32 +604,21 @@ pub async fn test(
             ble::write_command(&peripheral, &chars.write, &set_hsi(hue)).await?;
             tokio::time::sleep(Duration::from_millis(1200)).await;
         }
-        // Return to a neutral white so we don't leave it stuck on a colour.
-        info!("restoring 5600K white");
-        ble::write_command(&peripheral, &chars.write, &set_cct(50, 56)).await?;
+        // Return to a comfortable dim warm white so we never leave it on a colour.
+        info!("restoring dim warm white (2700K @ 12%)");
+        ble::write_command(&peripheral, &chars.write, &set_cct(12, 27)).await?;
     }
 
-    // Optional advanced-mode probe: exercise RGBCW, XY, and a couple of FX
-    // effects. RGBCW/XY are direct classic frames; FX is the MAC-embedded effect
-    // frame (the only FX form). Watch the light to confirm each mode engages.
+    // Optional advanced-mode probe: exercise XY and a couple of FX effects (the
+    // modes that work over direct BLE on Infinity fixtures). Both use MAC-addressed
+    // frames — the TL120C ignores the direct 0xB9/0x88 forms. (RGBCW is NOT probed:
+    // the TL120C ignores it entirely over direct BLE — see NOTES.md §3.3.) Watch
+    // the light to confirm each mode engages.
     if modes {
-        info!("RGBCW probe — direct R/G/B/CW/WW mixing (0xA8)");
-        for (label, c) in [
-            ("RED", (255u8, 0u8, 0u8, 0u8, 0u8)),
-            ("GREEN", (0, 255, 0, 0, 0)),
-            ("BLUE", (0, 0, 255, 0, 0)),
-            ("COOL-WHITE", (0, 0, 0, 255, 0)),
-            ("WARM-WHITE", (0, 0, 0, 0, 255)),
-        ] {
-            info!("RGBCW {label}");
-            ble::write_command(&peripheral, &chars.write, &classic::rgbcw(100, c.0, c.1, c.2, c.3, c.4)).await?;
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-        }
-
-        info!("XY probe — CIE coordinate (0xB9)");
+        info!("XY probe — CIE coordinate (MAC-addressed 0xB7, as the bridge sends)");
         for (label, x, y) in [("D65 white", 3127u16, 3290u16), ("deep red", 6400, 3300), ("green", 3000, 6000)] {
             info!(x, y, "XY {label}");
-            ble::write_command(&peripheral, &chars.write, &classic::xy(100, x, y)).await?;
+            ble::write_command(&peripheral, &chars.write, &classic::xy_mac(mac_bytes, 100, x, y)).await?;
             tokio::time::sleep(Duration::from_millis(1200)).await;
         }
 
@@ -624,13 +634,79 @@ pub async fn test(
         }
 
         // FX may latch the light into effect mode; power-cycle restores direct
-        // control (per protocol-analysis.md), then set a neutral white.
-        info!("exiting FX (power-cycle) and restoring 5600K white");
+        // control (per protocol-analysis.md), then leave a dim warm white — never
+        // leave the light strobing an effect (it holds the last command forever).
+        info!("exiting FX (power-cycle) and restoring dim warm white (2700K @ 12%)");
         ble::write_command(&peripheral, &chars.write, &power(false)).await?;
         tokio::time::sleep(Duration::from_millis(400)).await;
         ble::write_command(&peripheral, &chars.write, &power(true)).await?;
         tokio::time::sleep(Duration::from_millis(400)).await;
-        ble::write_command(&peripheral, &chars.write, &set_cct(50, 56)).await?;
+        ble::write_command(&peripheral, &chars.write, &set_cct(12, 27)).await?;
+    }
+
+    // Optional per-segment PIXEL probe (0xB0, MAC-embedded). Paints the tube with
+    // multi-colour palettes so distinct bands appear along its length — the "set
+    // different areas to different values" capability. TL-series pixel fixtures
+    // only (verified on TL120C); other lights ignore it. Each palette is sent as
+    // its param sub-frame then its colour sub-frame(s), spaced ~80 ms as the app
+    // does, and long palettes are chunked to ≤20-byte GATT writes by write_command.
+    if pixel {
+        info!("PIXEL probe — per-segment colour + effects (0xB0); watch the tube");
+        // The 5 pixel effects that work over direct BLE on the TL120C. For the
+        // moving/fire effects, segment 0 is the background and the rest are the
+        // effect's colours. A CCT frame is sent before each to clear the previous
+        // effect's latch (a running pixel effect ignores a new one otherwise).
+        let demos: [(&str, u8, Vec<Block>); 4] = [
+            (
+                "ColorReplacement: red|green|blue|yellow bands",
+                1,
+                vec![
+                    Block::Hsi { hue: 0, sat: 100 },
+                    Block::Hsi { hue: 120, sat: 100 },
+                    Block::Hsi { hue: 240, sat: 100 },
+                    Block::Hsi { hue: 55, sat: 100 },
+                ],
+            ),
+            (
+                "TwoColorMoving: red+blue over dark bg",
+                4,
+                vec![Block::Off, Block::Hsi { hue: 0, sat: 100 }, Block::Hsi { hue: 240, sat: 100 }],
+            ),
+            (
+                "ThreeColorMoving: red/green/blue over dark bg",
+                5,
+                vec![
+                    Block::Off,
+                    Block::Hsi { hue: 0, sat: 100 },
+                    Block::Hsi { hue: 120, sat: 100 },
+                    Block::Hsi { hue: 240, sat: 100 },
+                ],
+            ),
+            ("Fire: orange flicker over dark bg", 7, vec![Block::Off, Block::Hsi { hue: 25, sat: 100 }]),
+        ];
+        for (label, effect, blocks) in &demos {
+            // Clear the previous effect's latch first (see NOTES.md §3.3).
+            ble::write_command(&peripheral, &chars.write, &set_cct(50, 56)).await?;
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            info!("PIXEL {label}");
+            for frame in pixel::paint(mac_bytes, blocks, 100, *effect, 40, 1) {
+                ble::write_command_chunked(&peripheral, &chars.write, &frame).await?;
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(2800)).await;
+        }
+
+        // Best-effort: leave the light on a comfortable dim warm white. After a long
+        // rapid probe the write-without-response link can jam (frames silently
+        // dropped), so this may not always take — if the light is left on an effect,
+        // run `neewer-bridge test <MAC> --set warmdim` (a fresh connection is
+        // reliable). The production bridge (`run`) doesn't have this issue: its
+        // per-light actor paces writes and reconnects on a stale link.
+        info!("restoring dim warm white (2700K @ 12%); if it sticks on an effect, run `--set warmdim`");
+        for _ in 0..3 {
+            ble::write_command(&peripheral, &chars.write, &classic::cct2(12, 27)).await?;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
     }
 
     // Give notifications a moment to arrive, then leave cleanly.
@@ -646,5 +722,226 @@ pub async fn test(
              --driver infinity (newer lights) or --driver home (NH-* devices)."
         );
     }
+    Ok(())
+}
+
+/// A few hand-tuned FX presets (effect id → full parameter set) so `--set fx:<id>`
+/// renders a recognisable effect. Ids without a preset fall back to generic params.
+/// Signature: `fx(mac, effId, brr, cct, gm, hue, sat, speed, extra, val2)`.
+fn fx_preset(mac: [u8; 6], id: u8, bri: u8) -> Vec<u8> {
+    match id {
+        1 => infinity::fx(mac, 1, bri, 56, 0, 0, 0, 5, 0, 0), // Lightning
+        9 => infinity::fx(mac, 9, bri, 0, 0, 240, 100, 6, 0, 0), // HUE-pulse (blue)
+        10 => infinity::fx(mac, 10, bri, 0, 0, 0, 0, 7, 2, 0), // Cop-Car
+        11 => infinity::fx(mac, 11, bri, 32, 0, 0, 0, 4, 0, 0), // Candlelight
+        12 => infinity::fx(mac, 12, bri, 0, 0, 0, 100, 5, 0, 0), // HUE-loop
+        _ => infinity::fx(mac, id, bri, 56, 0, 0, 100, 5, 0, 0), // generic
+    }
+}
+
+/// Build the exact frames for one pixel effect id (1..=10, the `PixelEffectType`
+/// wire type) using the app's own default parameters from `createPixelEffectData`
+/// plus the Pixel-N-Model defaults (decompiled), with `running=PLAY`. This is the
+/// exhaustive hardware probe for `test --set pixfx:<id>` — effects 8/9/10 remap
+/// their wire id to 10/11/12 (the app does this). Returns (frames, effect name).
+fn build_pixel_effect_test(mac: [u8; 6], id: u8) -> (Vec<Vec<u8>>, String) {
+    let hsi = |h: u16, s: u8| Block::Hsi { hue: h, sat: s }.bytes();
+    let cct = |c: u8, g: i8| Block::Cct { cct: c, gm: g }.bytes();
+    let off = Block::Off.bytes();
+    let run = pixel::RUN_PLAY; // 1
+    // Each arm: (params effectData, palette effectData, effect name). subIndex 0 =
+    // params, subIndex 1 = colours. Wire id is the first byte of each sub-frame.
+    let pal = |wire: u8, colours: &[[u8; 3]]| {
+        let mut c = vec![wire, 1u8];
+        for b in colours {
+            c.extend_from_slice(b);
+        }
+        c
+    };
+    let (params, palette, name): (Vec<u8>, Vec<u8>, &str) = match id {
+        1 => (
+            vec![1, 0, 50, 2, 40, 1, run], // bri,colorNum,speed,dir,running
+            pal(1, &[hsi(0, 100), hsi(240, 100)]),
+            "ColorReplacement",
+        ),
+        2 => (
+            vec![2, 0, 50, 40, 1, 0, run], // bri,speed,dir,transition,running
+            pal(2, &[hsi(0, 100), hsi(240, 100)]),
+            "ColorAlternate",
+        ),
+        3 => (
+            vec![3, 0, 50, 50, 0, 40, 1, 0, run], // colorBri,bgBri,way,speed,dir,movement,running
+            pal(3, &[cct(55, 0), hsi(0, 100)]),    // bg + 1 moving colour
+            "SingleColorMoving",
+        ),
+        4 => (
+            vec![4, 0, 50, 50, 0, 40, 1, 0, run],
+            pal(4, &[cct(55, 0), hsi(0, 100), hsi(60, 100)]), // bg + 2
+            "TwoColorMoving",
+        ),
+        5 => (
+            vec![5, 0, 50, 50, 0, 40, 1, 0, run],
+            pal(5, &[cct(55, 0), hsi(0, 100), hsi(60, 100), hsi(120, 100)]), // bg + 3
+            "ThreeColorMoving",
+        ),
+        6 => (
+            vec![6, 0, 50, 40, 1, run], // bri,speed,dir,running
+            pal(6, &[hsi(0, 100), hsi(240, 100)]),
+            "Colorful",
+        ),
+        7 => (
+            vec![7, 0, 50, 100, 50, 20, 0, run], // briLo,briHi,bgBri,speed,orientation,running
+            pal(7, &[off, hsi(30, 100)]),         // bg + fire colour
+            "Fire",
+        ),
+        8 => (
+            vec![10, 0, 50, 2, 40, 1, 0, run], // wire 10; bri,colorNum,speed,dir,sectionType,running
+            pal(10, &[hsi(0, 100), hsi(240, 100)]),
+            "ColorGradient",
+        ),
+        9 => (
+            vec![11, 0, 50, 3, 40, 1, 0, run], // wire 11; bri,colorNum,speed,dir,satType,running
+            pal(11, &[hsi(0, 100), hsi(60, 100), hsi(120, 100)]),
+            "Trail",
+        ),
+        _ => (
+            vec![12, 0, 50, 3, 40, 1, run], // wire 12; bri,colorNum,speed,dir,running
+            pal(12, &[hsi(0, 100), hsi(60, 100), hsi(120, 100)]),
+            "ColorShift",
+        ),
+    };
+    (
+        vec![pixel::raw_frame(mac, &params), pixel::raw_frame(mac, &palette)],
+        format!("effect {id} ({name})"),
+    )
+}
+
+/// Read device status: send the MAC-addressed version / battery / temperature /
+/// state queries and let the notify logger print the decoded replies. Non-mutating
+/// (no blink, no output change), so it's safe to run against a light in use. The
+/// replies arrive asynchronously on the notify characteristic — hence the settle
+/// wait at the end. The TL120C firmware handles these MAC reads (the direct `0x80`/
+/// `0x85` version/state queries are dropped — see NOTES.md §2.1/§3.6).
+async fn test_status(p: &Peripheral, write: &Characteristic, mac: [u8; 6]) -> Result<()> {
+    info!("reading status (version / battery / temperature / state); decoded replies below");
+    for (label, frame) in [
+        ("version (0x9E)", queries::version(mac)),
+        ("battery (0x95)", queries::battery(mac)),
+        ("temperature (0xB3)", queries::temperature(mac)),
+        ("state (0x8E)", queries::state(mac)),
+    ] {
+        info!(query = label, "→ query");
+        ble::write_command(p, write, &frame).await?;
+        // Space the queries so the light's reply queue isn't outrun.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+    }
+    // Let any late replies land before we disconnect (decoded by spawn_notify_logger).
+    info!("waiting for replies…");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    info!("status read complete");
+    Ok(())
+}
+
+/// Send one frame (or pixel palette) described by `spec` and hold it — the engine
+/// behind `test --set`, for guided one-value-at-a-time hardware testing. The light
+/// keeps the state after disconnect. Non-CCT/pixel specs first send a CCT-white
+/// frame to clear any latched pixel/FX mode (a plain CCT overrides the animation
+/// where a power-cycle does not — see NOTES.md §3.3).
+async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &str) -> Result<()> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let get = |i: usize| parts.get(i).copied();
+    let num = |i: usize, what: &str| -> Result<u32> {
+        get(i)
+            .with_context(|| format!("--set {spec}: missing {what}"))?
+            .parse::<u32>()
+            .with_context(|| format!("--set {spec}: {what} must be a number"))
+    };
+
+    // Build the frame(s) + a human description. `reset` = clear a pixel/FX latch first.
+    let (frames, desc, reset): (Vec<Vec<u8>>, String, bool) = match parts[0] {
+        "warmdim" => (vec![classic::cct2(12, 27)], "dim warm white 2700K @ 12%".into(), false),
+        "cct" => {
+            let (k, bri) = (num(1, "kelvin")?, num(2, "bri")? as u8);
+            (vec![classic::cct2(bri, (k / 100) as u8)], format!("CCT {k}K @ {bri}%"), false)
+        }
+        "hsi" => {
+            let (hue, sat, bri) = (num(1, "hue")? as u16, num(2, "sat")? as u8, num(3, "bri")? as u8);
+            (vec![classic::hsi(hue, sat, bri)], format!("HSI hue={hue} sat={sat} @ {bri}%"), true)
+        }
+        "xy" => {
+            let (x, y, bri) = (num(1, "x")? as u16, num(2, "y")? as u16, num(3, "bri")? as u8);
+            (vec![classic::xy_mac(mac, bri, x, y)], format!("XY x={x} y={y} @ {bri}%"), true)
+        }
+        "fx" => {
+            let (id, bri) = (num(1, "id")? as u8, num(2, "bri")? as u8);
+            (vec![fx_preset(mac, id, bri)], format!("FX #{id} @ {bri}%"), true)
+        }
+        "pixel" => {
+            let blocks: Vec<Block> = get(1)
+                .context("--set pixel:<hue,hue,...>:<eff>:<speed>: missing hues")?
+                .split(',')
+                .map(|h| Ok(Block::Hsi { hue: h.trim().parse::<u16>().context("bad hue")?, sat: 100 }))
+                .collect::<Result<_>>()?;
+            let (eff, speed) = (num(2, "effect")? as u8, num(3, "speed")? as u8);
+            let n = blocks.len();
+            // reset=true: a running pixel effect ignores a new pixel palette/effect
+            // until a CCT frame clears the latch first (verified on TL120C).
+            (pixel::paint(mac, &blocks, 100, eff, speed, 1), format!("PIXEL {n} seg eff={eff} speed={speed}"), true)
+        }
+        "pixfx" => {
+            // Exhaustive per-effect probe: build effect `id` (1..=10) with the app's
+            // own default params from the decompile.
+            let id = num(1, "effect id")? as u8;
+            let (frames, name) = build_pixel_effect_test(mac, id);
+            (frames, format!("PIXEL {name}"), true)
+        }
+        "rgbcw" | "rgbcwmac" => {
+            // RGBCW probe. `rgbcwmac` (by-MAC 0xA9) is the WORKING production form
+            // (hardware-confirmed 2026-07-01); `rgbcw` (direct 0xA8) is IGNORED on the
+            // TL120C and kept only to demonstrate that. reset=true paints CCT-white
+            // first, so an ignored frame leaves the light white, a working one jumps
+            // to the R/G/B/CW/WW mix.
+            // Spec: rgbcw:<r>:<g>:<b>[:<cw>:<ww>:<bri>]  (values 0..=255; bri 0..=100).
+            let optu8 = |i: usize, what: &str, dflt: u8| -> Result<u8> {
+                get(i)
+                    .map(|s| s.parse::<u8>().with_context(|| format!("--set {spec}: {what} must be 0..=255")))
+                    .transpose()
+                    .map(|o| o.unwrap_or(dflt))
+            };
+            let (r, g, b) = (num(1, "r")? as u8, num(2, "g")? as u8, num(3, "b")? as u8);
+            let (cw, ww, bri) = (optu8(4, "cw", 0)?, optu8(5, "ww", 0)?, optu8(6, "bri", 100)?);
+            let (frame, form) = if parts[0] == "rgbcwmac" {
+                (classic::rgbcw_mac(mac, bri, r, g, b, cw, ww, 0), "by-MAC 0xA9 (production form — should render)")
+            } else {
+                (classic::rgbcw(bri, r, g, b, cw, ww, 0), "direct 0xA8 (ignored on TL120C — should stay white)")
+            };
+            (
+                vec![frame],
+                format!("RGBCW {form}: R={r} G={g} B={b} CW={cw} WW={ww} @ {bri}%"),
+                true,
+            )
+        }
+        other => bail!("--set: unknown spec kind '{other}' (cct|hsi|xy|fx|pixel|pixfx|warmdim|rgbcw|rgbcwmac)"),
+    };
+
+    if reset {
+        info!("clearing any latched pixel/FX mode with a CCT-white frame");
+        ble::write_command(p, write, &classic::cct2(50, 56)).await?;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+    }
+
+    info!("SET {desc}");
+    // Send the frame(s) a few times over ~4s while connected so it's easy to watch
+    // (pixel palettes are multi-frame, spaced ~80ms and MTU-chunked by the BLE layer).
+    for round in 0..4 {
+        for frame in &frames {
+            ble::write_command_chunked(p, write, frame).await?;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        if round < 3 {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    }
+    info!("held; light retains this state after disconnect");
     Ok(())
 }

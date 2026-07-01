@@ -16,7 +16,9 @@
 use std::time::Duration;
 
 use anyhow::{bail, Result};
+use btleplug::api::Characteristic;
 use btleplug::platform::{Adapter, Peripheral};
+use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -25,7 +27,8 @@ use crate::ble::{self, NeewerChars};
 use crate::config::{parse_mac, LightCfg};
 use crate::driver::Driver;
 use crate::profile::Profile;
-use crate::protocol::LightState;
+use crate::protocol::replies::{self, Reply};
+use crate::protocol::{queries, LightState};
 
 /// How long a liveness probe may take before it counts as a failure (§5).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -139,6 +142,26 @@ impl LightActor {
             "session active"
         );
 
+        // Status reads (NOTES.md §3.6): subscribe to the notify characteristic and
+        // fire an initial battery/temp/version/state query. MAC-addressed, so only
+        // for MAC-carrying drivers (classic/infinity, not Home). All best-effort — a
+        // light without notify is still fully controllable.
+        let query_mac = driver.mac();
+        let mut notif = match &chars.notify {
+            Some(nc) => match ble::subscribe_notify(p, nc).await {
+                Ok(stream) => Some(stream),
+                Err(e) => {
+                    warn!(light = %label, error = %e, "notify subscribe failed; status reads disabled");
+                    None
+                }
+            },
+            None => None,
+        };
+        let mut status = StatusCache::default();
+        if let Some(mac) = query_mac {
+            send_status_queries(p, &chars.write, mac, true).await;
+        }
+
         loop {
             tokio::select! {
                 _ = flush.tick() => {
@@ -156,9 +179,22 @@ impl LightActor {
                             // The state command itself is per-frame at ArtNet rates,
                             // so it's debug (kept off the info console but in the file).
                             debug!(light = %label, state = %desired.summary(), "flush");
-                            ble::write_command(p, &chars.write, &driver.apply(&desired))
-                                .await
-                                .map_err(|e| anyhow::anyhow!("flush write failed: {e}"))?;
+                            // Most modes are one frame; Pixel emits several. Each
+                            // frame is MTU-chunked as needed (pixel palettes >20 B).
+                            // Multi-frame (pixel) sub-frames are spaced ~80 ms apart
+                            // as the app does, so the effect registers (and, for a
+                            // static render, so PLAY establishes before PAUSE).
+                            let frames = driver.apply_frames(&desired);
+                            let spaced = frames.len() > 1;
+                            let n = frames.len();
+                            for (i, frame) in frames.iter().enumerate() {
+                                ble::write_command_chunked(p, &chars.write, frame)
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!("flush write failed: {e}"))?;
+                                if spaced && i + 1 < n {
+                                    tokio::time::sleep(Duration::from_millis(80)).await;
+                                }
+                            }
                         } else if prev_power != Some(false) {
                             // Power-off only on transition (failsafe poweroff).
                             info!(light = %label, "power off");
@@ -192,8 +228,97 @@ impl LightActor {
                     } else {
                         debug!(light = %label, rssi = ?rssi, "alive (is_connected; no readable char)");
                     }
+                    // Refresh battery + temperature alongside the liveness probe; the
+                    // replies arrive on the notify stream and are logged there.
+                    if let Some(mac) = query_mac {
+                        send_status_queries(p, &chars.write, mac, false).await;
+                    }
+                }
+                // Status replies (battery/temp/version/state) pushed on the notify
+                // characteristic. Decoded and logged; when the stream ends (disconnect)
+                // we stop polling it. `pending()` parks this arm when there's no notify.
+                notification = async {
+                    match notif.as_mut() {
+                        Some(stream) => stream.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match notification {
+                        Some(n) => log_status(label, &n.value, &mut status),
+                        None => {
+                            debug!(light = %label, "notify stream ended");
+                            notif = None;
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+/// Last-seen status values, so the actor logs battery/temp/firmware at `info` only
+/// when they change (and at `debug` otherwise) instead of on every poll.
+#[derive(Default)]
+struct StatusCache {
+    battery: Option<u8>,
+    temp_c: Option<i16>,
+    version: Option<(u8, u8, u8)>,
+    external: bool,
+}
+
+/// Decode one notify frame and log it — known status at `info` on change (`debug`
+/// unchanged), unrecognised frames at `debug` with the raw hex.
+fn log_status(label: &str, data: &[u8], cache: &mut StatusCache) {
+    let Some(reply) = replies::parse(data) else {
+        debug!(light = %label, data = %ble::hexstr(data), "notify (undecoded)");
+        return;
+    };
+    let changed = match reply {
+        Reply::Battery { percent } => {
+            let c = cache.battery != Some(percent);
+            cache.battery = Some(percent);
+            c
+        }
+        Reply::Temperature { celsius } => {
+            let c = cache.temp_c != Some(celsius);
+            cache.temp_c = Some(celsius);
+            c
+        }
+        Reply::Version { major, minor, patch, .. } => {
+            let v = (major, minor, patch);
+            let c = cache.version != Some(v);
+            cache.version = Some(v);
+            c
+        }
+        Reply::ExternalPower { .. } => {
+            let c = !cache.external;
+            cache.external = true;
+            c
+        }
+        Reply::Power { .. } | Reply::State { .. } => true,
+    };
+    if changed {
+        info!(light = %label, status = %reply.summary(), "status");
+    } else {
+        debug!(light = %label, status = %reply.summary(), "status (unchanged)");
+    }
+}
+
+/// Best-effort MAC-addressed status queries. Replies land on the notify stream (see
+/// [`log_status`]). `full` adds the version + state reads (used once per session);
+/// otherwise just battery + temperature (polled). Failures are non-fatal — the
+/// liveness probe owns link health, not these reads.
+async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6], full: bool) {
+    let mut frames = vec![queries::battery(mac), queries::temperature(mac)];
+    if full {
+        frames.push(queries::version(mac));
+        frames.push(queries::state(mac));
+    }
+    for f in &frames {
+        if ble::write_command(p, write, f).await.is_err() {
+            debug!("status query write failed (non-fatal)");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
     }
 }

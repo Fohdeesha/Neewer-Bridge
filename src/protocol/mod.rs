@@ -24,6 +24,9 @@
 pub mod classic;
 pub mod home;
 pub mod infinity;
+pub mod pixel;
+pub mod queries;
+pub mod replies;
 
 /// BLE service / characteristic UUIDs, shared by every Neewer light.
 pub mod uuids {
@@ -39,19 +42,24 @@ pub enum Mode {
     Cct,
     /// Colour: hue + saturation + intensity.
     Hsi,
-    /// Raw 5-channel mixing: red/green/blue/cool-white/warm-white (+ brightness).
-    Rgbcw,
     /// CIE xy colour-coordinate (+ brightness).
     Xy,
+    /// Direct R/G/B + cool-white/warm-white channel mix. Independent LED-channel
+    /// control (what HSI/XY can't do). Sent via the **by-MAC** frame (`0xA9`) — the
+    /// direct `0xA8` is ignored on the TL120C, same as XY. Hardware-confirmed 2026-07-01.
+    Rgbcw,
     /// Built-in effect engine: one of 18 effects with per-effect parameters.
     Fx,
+    /// Per-segment PIXEL colour: the tube is split into `seg_count` bands, each
+    /// an HSI/CCT/off block. TL-series pixel fixtures only (e.g. TL120C).
+    Pixel,
 }
 
 /// The desired output of a single light, in native parameter ranges.
 ///
 /// This is the value the ArtNet→light mapper produces and the per-light BLE
 /// actor flushes. Brightness/sat are 0..=100, hue 0..=360, gm -50..=50, cct is a
-/// raw model-dependent value. The RGBCW/XY/FX fields are only meaningful in their
+/// raw model-dependent value. The XY/FX fields are only meaningful in their
 /// respective `mode`; the CCT/HSI fields (cct/gm/hue/sat) are reused by FX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LightState {
@@ -62,15 +70,16 @@ pub struct LightState {
     pub gm: i8,
     pub hue: u16,
     pub sat: u8,
-    // RGBCW (raw 0..=255 each).
+    // CIE xy, encoded ×10000 (0..=8000 = 0.0000..=0.8000).
+    pub x: u16,
+    pub y: u16,
+    // RGBCW: raw 0..=255 channel values (R,G,B + cool-white, warm-white). Only
+    // meaningful in `Mode::Rgbcw`.
     pub r: u8,
     pub g: u8,
     pub b: u8,
     pub cw: u8,
     pub ww: u8,
-    // CIE xy, encoded ×10000 (0..=8000 = 0.0000..=0.8000).
-    pub x: u16,
-    pub y: u16,
     // FX: effect id 1..=18, speed 1..=10, a per-effect "extra" byte (ember/sparks
     // 1..=10, cop-car colour 0..=4, fireworks/party mode 0..=2), and a 16-bit
     // second value (loop effects: CCT2 or Hue2).
@@ -78,6 +87,24 @@ pub struct LightState {
     pub fx_speed: u8,
     pub fx_extra: u8,
     pub fx_val2: u16,
+    // PIXEL: up to 8 per-segment colour blocks (the palette cap) and how many are
+    // active. Only meaningful in `Mode::Pixel`. `pixel_speed` (0..=100) drives the
+    // effect's motion; 0 = as static as effect 1 allows.
+    pub segments: [pixel::Block; 8],
+    pub seg_count: u8,
+    pub pixel_speed: u8,
+    /// Pixel effect id (working over direct BLE on the TL120C): 1 ColorReplacement,
+    /// 3 SingleColorMoving, 4 TwoColorMoving, 5 ThreeColorMoving, 7 Fire.
+    pub pixel_effect: u8,
+    /// Pixel flow direction / fire orientation (0 or 1).
+    pub pixel_dir: u8,
+}
+
+impl LightState {
+    /// The active pixel segments as a `Block` slice (for the pixel encoder).
+    pub fn pixel_blocks(&self) -> &[pixel::Block] {
+        &self.segments[..(self.seg_count as usize).min(8)]
+    }
 }
 
 impl LightState {
@@ -95,14 +122,18 @@ impl LightState {
             Mode::Hsi => {
                 format!("HSI hue={} sat={} @ {}%", self.hue, self.sat, self.brightness)
             }
+            Mode::Xy => format!("XY x={} y={} @ {}%", self.x, self.y, self.brightness),
             Mode::Rgbcw => format!(
                 "RGBCW r={} g={} b={} cw={} ww={} @ {}%",
                 self.r, self.g, self.b, self.cw, self.ww, self.brightness
             ),
-            Mode::Xy => format!("XY x={} y={} @ {}%", self.x, self.y, self.brightness),
             Mode::Fx => format!(
                 "FX #{} speed={} @ {}%",
                 self.fx_id, self.fx_speed, self.brightness
+            ),
+            Mode::Pixel => format!(
+                "PIXEL fx#{} {} seg speed={} @ {}%",
+                self.pixel_effect, self.seg_count, self.pixel_speed, self.brightness
             ),
         }
     }
@@ -118,17 +149,22 @@ impl Default for LightState {
             gm: 0,
             hue: 0,
             sat: 0,
+            x: 0,
+            y: 0,
             r: 0,
             g: 0,
             b: 0,
             cw: 0,
             ww: 0,
-            x: 0,
-            y: 0,
             fx_id: 1,
             fx_speed: 5,
             fx_extra: 0,
             fx_val2: 0,
+            segments: [pixel::Block::Off; 8],
+            seg_count: 0,
+            pixel_speed: 0,
+            pixel_effect: 1,
+            pixel_dir: 1,
         }
     }
 }

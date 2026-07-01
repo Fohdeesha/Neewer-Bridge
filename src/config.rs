@@ -193,7 +193,7 @@ fn default_true() -> bool {
 }
 
 /// Known DMX profiles (kept in sync with NOTES.md §8.1).
-pub const KNOWN_PROFILES: &[&str] = &["cct", "cct_gm", "hsi", "full", "advanced"];
+pub const KNOWN_PROFILES: &[&str] = &["cct", "cct_gm", "hsi", "full", "advanced", "pixel"];
 /// Known driver selectors.
 pub const KNOWN_DRIVERS: &[&str] = &["auto", "classic", "infinity", "home"];
 /// Known failsafe modes (only `hold` is fully implemented in v1).

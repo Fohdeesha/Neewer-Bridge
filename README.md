@@ -9,14 +9,15 @@ protocol. CLI, config-file driven, runs on **Windows and Linux**.
   identical on every boot, independent of power-on or discovery order.
 - Supports classic (`0x78`), Infinity (`0x78`+MAC), and Neewer Home (`0x7A`,
   `NH-*`) lights.
-- Full built-in control: **CCT (+GM), HSI, raw RGBCW, CIE XY, and the 18-effect
-  FX engine** — selectable live from a single DMX mode channel.
+- Full built-in control: **CCT (+GM), HSI, CIE XY, and the 18-effect FX engine**
+  — selectable live from a single DMX mode channel.
 - **141-model capability catalog** so `add` auto-fills a light's driver, profile,
   and CCT range from its Bluetooth name.
 
-> Status: hardware-validated end-to-end on a Neewer TL120C — CCT, HSI, RGBCW, XY,
-> and FX all confirmed over a direct BLE connection. See `NOTES.md` for the full
-> design, protocol reverse-engineering, and reliability notes.
+> Status: hardware-validated end-to-end on a Neewer TL120C — CCT, HSI, XY, RGBCW, FX,
+> and per-segment pixel all confirmed over a direct BLE connection. (XY and RGBCW use
+> MAC-addressed frames; the TL120C ignores their direct forms.) See `NOTES.md` for the
+> full design, protocol reverse-engineering, and reliability notes.
 
 ## Contents
 
@@ -129,7 +130,7 @@ driver / profile / CCT range are filled automatically; any flag overrides.
 | `--universe N` | with `--mac` | ArtNet universe / Port-Address (0–32767). |
 | `--address N` | with `--mac` | 1-based DMX start channel. |
 | `--driver D` | — | `auto`\|`classic`\|`infinity`\|`home` (default: from model). |
-| `--profile P` | — | `cct`\|`cct_gm`\|`hsi`\|`full`\|`advanced` (default: from model). |
+| `--profile P` | — | `cct`\|`cct_gm`\|`hsi`\|`full`\|`advanced`\|`pixel` (default: from model). |
 | `--name X` | — | Label (default: model name). |
 | `--cct-min N` | — | CCT range min, raw ×100K (default: from model). |
 | `--cct-max N` | — | CCT range max, raw ×100K (default: from model). |
@@ -146,11 +147,14 @@ driver / profile / CCT range are filled automatically; any flag overrides.
 | `--driver D` | `auto` | `classic`\|`infinity`\|`home`\|`auto`. |
 | `--seconds N` | `8` | How long to wait to find the light. |
 | `--colors` | off | After CCT, cycle HSI red→green→blue (RGB capability probe). |
-| `--modes` | off | Probe the advanced modes: RGBCW, XY, and a few FX effects. |
+| `--modes` | off | Probe the advanced modes: XY and a few FX effects (MAC-addressed frames). |
+| `--pixel` | off | Probe per-segment PIXEL control (`0xB0`): cycle the 5 working pixel effects (ColorReplacement / Single/Two/Three-ColorMoving / Fire) so distinct bands/animations appear along the tube. TL-series pixel fixtures only (e.g. TL120C). |
+| `--status` | off | Read device status — firmware version, battery, temperature, power/mode — and print the decoded replies. **Non-mutating** (no blink, no colour change), so it's safe to run against a light in use. |
+| `--set SPEC` | — | Send ONE frame and hold it (guided one-at-a-time testing; the light keeps the state after disconnect). `SPEC` = `cct:<K>:<bri>`, `hsi:<hue>:<sat>:<bri>`, `xy:<x>:<y>:<bri>`, `fx:<id>:<bri>`, `pixel:<hue,…>:<eff>:<speed>`, `pixfx:<id>` (raw effect probe 1–10), `rgbcwmac:<r>:<g>:<b>[:<cw>:<ww>:<bri>]` (RGBCW via by-MAC `0xA9` — the production form; `rgbcw:…` = the direct `0xA8`, ignored on the TL120C), or `warmdim` (safe dim-warm end state). |
 
 `test` blinks the light 3× (also a visual identify), sets 5600K @ 50%, then runs
-any requested probes. FX latches the light into effect mode — `test` power-cycles
-to exit and restores white.
+any requested probes. FX and PIXEL latch the light into their mode — `test`
+power-cycles to exit and restores white.
 
 **`artnet-send`** — drive the bridge (or any ArtNet node) without a console.
 | Flag | Default | Meaning |
@@ -227,6 +231,7 @@ externally to turn them off).
 | `hsi`      | 3  | 1 Dimmer · 2 Hue · 3 Saturation |
 | `full`     | 5  | 1 Dimmer · 2 **Mode** · 3 CCT/Hue · 4 GM/Sat · 5 reserved |
 | `advanced` | 10 | 1 **Mode-select** · 2 Dimmer · 3–10 mode-specific (below) |
+| `pixel`    | 20 | 1 Dimmer · 2 Effect-select · 3 Speed · 4 Direction · 5–20 = 8×(Hue, Sat) — 5 animated effects (below) |
 
 For **`full`**, the Mode channel (ch2) selects sub-mode live: `0–127` = CCT
 (ch3=CCT, ch4=GM), `128–255` = HSI (ch3=Hue, ch4=Saturation).
@@ -243,12 +248,43 @@ reinterpreted accordingly:
 | 128–159 | RGBCW | R | G | B | CW | WW | — | — |
 | 192–231 | XY | X | Y | — | — | — | — | — |
 
-(ch2 is always Dimmer. Bands 96–127 / 160–191 / 232–255 are unimplemented and map
-to neutral white.)
+(ch2 is always Dimmer. RGBCW (128–159) drives raw R/G/B + cool-white/warm-white
+channels — independent LED mixing HSI/XY can't do. Bands 96–127, 160–191 and 232–255
+are unimplemented and map to neutral white.)
+
+For **`pixel`** (TL-series pixel fixtures such as the TL120C, **20 channels**), the
+tube is split into **8 addressable segments**. ch1 = master Dimmer, ch2 =
+**Effect-select**, ch3 = Speed/motion, ch4 = Direction, then ch5–ch20 are 8 ×
+(Hue, Sat) pairs (seg1 Hue, seg1 Sat, seg2 Hue, …). The Effect channel picks the
+pixel effect by value band — only the **5 effects that work over direct BLE** on
+the TL120C are exposed (hardware-verified; the app's other 5 pixel effects are
+ignored unless relayed through a 2.4G hub):
+
+| ch2 band | Effect | Segment meaning |
+|---|---|---|
+| `0–51` | ColorReplacement | all 8 segments = a spatial colour palette |
+| `52–102` | SingleColorMoving | seg1 = background, seg2 = moving colour |
+| `103–153` | TwoColorMoving | seg1 = background, seg2–3 = moving colours |
+| `154–204` | ThreeColorMoving | seg1 = background, seg2–4 = moving colours |
+| `205–255` | Fire | seg1 = background, seg2 = fire colour |
+
+⚠️ **The pixel effects are animated** — the palette flows/moves along the tube;
+Speed controls the rate (Speed 0 ≈ near-static). A **truly static** per-segment
+render is **not available over BLE on the TL120C** (every pixel effect animates and
+the firmware ignores the pause command). There is also **no per-segment brightness**
+(one master dimmer). Uses the MAC-addressed `0xB0` pixel opcode; a non-pixel light
+ignores it.
 
 **Scaling:** Dimmer/Sat → 0–100%, Hue → 0–360°, GM → −50…+50, CCT → the model's
-range (`cct_min`/`cct_max`), R/G/B/CW/WW → 0–255 raw, XY → CIE coordinate
-0.0000–0.8000, FX-id → 1–18, Speed → 1–10.
+range (`cct_min`/`cct_max`), XY → CIE coordinate 0.0000–0.8000, RGBCW R/G/B/CW/WW →
+raw 0–255, FX-id → 1–18, Speed → 1–10.
+
+> **Hardware notes (verified on the TL120C, an "Infinity"/2.4G fixture):** the XY and
+> **RGBCW** commands are sent as **MAC-addressed** frames (`0xB7` / `0xA9`) — these
+> fixtures ignore the plain direct forms (`0xB9` / `0xA8`). CCT, HSI, XY, RGBCW, FX, and
+> per-segment pixel all work over the direct BLE connection (RGBCW confirmed 2026-07-01:
+> green→blue tracked). Other/older classic fixtures may behave differently — validate
+> per model.
 
 ## FX effects
 
@@ -275,8 +311,8 @@ FX is only available on models whose catalog entry has `supports_fx` (run
 `infinity` explicitly for newer MAC-addressed lights (auto can't detect those
 reliably), or `home` for `NH-*` devices. Most current panels use `classic` —
 the bridge connects directly over BLE, where the classic `0x78` frames work
-(RGBCW/XY are direct classic frames; FX uses the MAC-embedded effect frame, which
-works over the direct connection).
+(XY uses a MAC-addressed frame; FX uses the MAC-embedded effect frame, both of
+which work over the direct connection).
 
 ## Reliability
 
@@ -288,6 +324,12 @@ coalesced to the light's flush rate (`flush_hz`) to avoid overwhelming the BLE
 link. Validated by a 2-hour soak (zero drops). The failsafe controls behaviour
 when ArtNet stops: `hold` keeps the last state, `blackout` sets brightness 0,
 `poweroff` powers the light off — after `timeout_secs` of silence.
+
+Each supervisor also **reads device status** off the notify characteristic —
+battery %, temperature, firmware version, and power/mode — querying on connect and
+alongside each liveness probe. These are logged (at `info` when a value changes,
+`debug` otherwise), so a running bridge surfaces battery/temperature per light. TL-
+series (Infinity) fixtures only; Home (`NH-*`) lights are skipped.
 
 ## Troubleshooting
 
@@ -301,8 +343,8 @@ when ArtNet stops: `hold` keeps the last state, `blackout` sets brightness 0,
 - **A light doesn't respond to `test`/`run`** — try an explicit `--driver`
   (`infinity` for newer lights, `home` for `NH-*`). Use `-vv` to see BLE writes.
 - **A mode does nothing** — confirm the model supports it (`neewer-bridge
-  models`); bi-colour lights ignore HSI/RGBCW/XY/FX. Check the Mode-select channel
-  is in the right band (see [DMX profiles](#dmx-profiles-channel-layouts)).
+  models`); bi-colour lights ignore HSI/XY/FX. Check the Mode-select channel is in
+  the right band (see [DMX profiles](#dmx-profiles-channel-layouts)).
 - **ArtNet not received** — verify the source targets this host's IP and the
   configured `universe`/`address`; use `neewer-bridge monitor` to watch packets,
   and `neewer-bridge lights` to confirm the expected channel mapping.

@@ -6,7 +6,12 @@
 //! master Dimmer sets brightness only (never cuts power, so mapped `power` is
 //! always `true`), and multi-mode lights carry a live Mode channel.
 
+use crate::protocol::pixel::Block;
 use crate::protocol::{LightState, Mode};
+
+/// Number of independently-addressable segments in the `pixel` profile (the pixel
+/// palette's colour-block cap).
+pub const PIXEL_SEGMENTS: usize = 8;
 
 /// A DMX personality / channel layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +27,11 @@ pub enum Profile {
     /// 10ch unified mode-channel personality (NOTES.md §8.1). ch1 Mode-select
     /// (value bands → CCT/HSI/FX/RGBCW/XY), ch2 Dimmer, ch3-10 mode-specific.
     Advanced,
+    /// 19ch per-segment PIXEL personality (TL-series pixel fixtures). ch1 Dimmer,
+    /// ch2 Effect-select, ch3 Speed, then 8×(Hue, Sat) — one HSI colour per tube
+    /// segment. The effects animate the palette across the tube (no static mode
+    /// exists over BLE on these fixtures).
+    Pixel,
 }
 
 impl Profile {
@@ -32,6 +42,7 @@ impl Profile {
             "hsi" => Some(Profile::Hsi),
             "full" => Some(Profile::Full),
             "advanced" => Some(Profile::Advanced),
+            "pixel" => Some(Profile::Pixel),
             _ => None,
         }
     }
@@ -44,6 +55,7 @@ impl Profile {
             Profile::Hsi => "hsi",
             Profile::Full => "full",
             Profile::Advanced => "advanced",
+            Profile::Pixel => "pixel",
         }
     }
 
@@ -54,6 +66,8 @@ impl Profile {
             Profile::Hsi | Profile::CctGm => 3,
             Profile::Full => 5,
             Profile::Advanced => 10,
+            // 1 Dimmer + 1 Effect + 1 Speed + 1 Direction + PIXEL_SEGMENTS × (Hue, Sat).
+            Profile::Pixel => 4 + PIXEL_SEGMENTS as u16 * 2,
         }
     }
 
@@ -85,6 +99,20 @@ impl Profile {
                 "— / — / FX-2nd-value / — / —",
                 "(reserved)",
             ],
+            Profile::Pixel => &[
+                "Dimmer (master)",
+                "Effect (ColorReplace/Single/Two/Three-Moving/Fire — see bands)",
+                "Speed / motion",
+                "Direction",
+                "Seg1 Hue (moving/fire: background)", "Seg1 Sat",
+                "Seg2 Hue", "Seg2 Sat",
+                "Seg3 Hue", "Seg3 Sat",
+                "Seg4 Hue", "Seg4 Sat",
+                "Seg5 Hue", "Seg5 Sat",
+                "Seg6 Hue", "Seg6 Sat",
+                "Seg7 Hue", "Seg7 Sat",
+                "Seg8 Hue", "Seg8 Sat",
+            ],
         }
     }
 }
@@ -92,6 +120,8 @@ impl Profile {
 /// `advanced` profile mode-channel (ch1) value bands. Mirrors the official Neewer
 /// DMX personality so a console patched for the fixture feels familiar. Bands not
 /// listed (GEL 96-127, Pixel 160-191, 232-255) are unimplemented → neutral white.
+/// RGBCW (128-159) is driven via the **by-MAC** frame (`0xA9`); the direct `0xA8` is
+/// ignored on the TL120C — hardware-confirmed 2026-07-01 (see NOTES.md §3.3).
 pub mod mode_band {
     pub const CCT: std::ops::RangeInclusive<u8> = 0..=31;
     pub const HSI: std::ops::RangeInclusive<u8> = 32..=63;
@@ -165,6 +195,22 @@ fn speed_value(dmx: u8) -> u8 {
 #[inline]
 fn xy_value(dmx: u8) -> u16 {
     scale_to(dmx, 8000) as u16
+}
+
+/// Pixel effect-select channel → effect id, in five value bands. Only the effects
+/// that work over direct BLE on the TL120C are exposed (hardware-verified): 1
+/// ColorReplacement, 3 SingleColorMoving, 4 TwoColorMoving, 5 ThreeColorMoving, 7
+/// Fire. (The app's other 5 pixel effects are ignored over direct BLE — NOTES.md
+/// §3.3.)
+#[inline]
+fn pixel_effect_select(dmx: u8) -> u8 {
+    match dmx {
+        0..=51 => 1,    // ColorReplacement (8-segment palette)
+        52..=102 => 3,  // SingleColorMoving
+        103..=153 => 4, // TwoColorMoving
+        154..=204 => 5, // ThreeColorMoving
+        _ => 7,         // Fire
+    }
 }
 
 /// Map a light's DMX channel slice to a desired `LightState`.
@@ -241,6 +287,9 @@ pub fn map_dmx(profile: Profile, slice: &[u8], cct: CctRange) -> LightState {
                     hue_value(ch(8))
                 };
             } else if mb::RGBCW.contains(&mode_sel) {
+                // RGBCW (128-159): raw R/G/B + cool-white/warm-white channels (per
+                // the official DMX personality). Direct 8-bit values, no scaling —
+                // ch2 Dimmer is the master brightness. Sent via the by-MAC 0xA9 frame.
                 st.mode = Mode::Rgbcw;
                 st.r = ch(2);
                 st.g = ch(3);
@@ -252,9 +301,27 @@ pub fn map_dmx(profile: Profile, slice: &[u8], cct: CctRange) -> LightState {
                 st.x = xy_value(ch(2));
                 st.y = xy_value(ch(3));
             } else {
-                // Unimplemented band (GEL / Pixel / reserved) → safe neutral white.
+                // Unimplemented band (GEL 96-127 / Pixel 160-191 / reserved) →
+                // neutral white. Use HSI/XY/RGBCW for colour.
                 st.mode = Mode::Cct;
                 st.cct = cct_value(128, cct);
+            }
+        }
+        Profile::Pixel => {
+            // ch1 Dimmer, ch2 Effect-select, ch3 Speed, ch4 Direction, then
+            // PIXEL_SEGMENTS × (Hue, Sat). Segment meaning depends on the effect:
+            // ColorReplacement uses all 8 as a spatial palette; the moving/fire
+            // effects use segment 1 as the background and the rest as their colours.
+            st.mode = Mode::Pixel;
+            st.brightness = brightness_value(ch(0));
+            st.pixel_effect = pixel_effect_select(ch(1));
+            st.pixel_speed = brightness_value(ch(2)); // 0..=100 motion speed
+            st.pixel_dir = if ch(3) < 128 { 0 } else { 1 };
+            st.seg_count = PIXEL_SEGMENTS as u8;
+            for i in 0..PIXEL_SEGMENTS {
+                let hue = hue_value(ch(4 + i * 2));
+                let sat = sat_value(ch(5 + i * 2));
+                st.segments[i] = Block::Hsi { hue, sat };
             }
         }
     }
@@ -350,17 +417,62 @@ mod tests {
         assert_eq!(f.mode, Mode::Fx);
         assert_eq!(f.fx_id, 1); // ch3=0 -> effect 1
         assert_eq!(f.fx_speed, 10); // ch4=255 -> 10
-        // RGBCW band (128-159): ch3-7 = R,G,B,CW,WW
-        let rgbcw = m(130, &[10, 20, 30, 40, 50]);
-        assert_eq!(rgbcw.mode, Mode::Rgbcw);
-        assert_eq!((rgbcw.r, rgbcw.g, rgbcw.b, rgbcw.cw, rgbcw.ww), (10, 20, 30, 40, 50));
         // XY band (192-231): ch3=X, ch4=Y
         let xy = m(200, &[255, 0]);
         assert_eq!(xy.mode, Mode::Xy);
         assert_eq!(xy.x, 8000); // ch3=255 -> 0.8000
         assert_eq!(xy.y, 0);
-        // Unimplemented band (GEL 96-127) -> neutral CCT
+        // GEL band (96-127) still unimplemented -> neutral CCT
         assert_eq!(m(100, &[0, 0]).mode, Mode::Cct);
+        // RGBCW band (128-159): ch3-7 = R,G,B,CW,WW (raw 8-bit), ch2 = dimmer.
+        let rgbcw = m(130, &[255, 0, 0, 0, 0]);
+        assert_eq!(rgbcw.mode, Mode::Rgbcw);
+        assert_eq!(rgbcw.brightness, 100);
+        assert_eq!((rgbcw.r, rgbcw.g, rgbcw.b, rgbcw.cw, rgbcw.ww), (255, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn pixel_profile_maps_segments() {
+        assert_eq!(Profile::Pixel.channel_count(), 20);
+        // ch1 Dimmer=255, ch2 Effect=0(→1), ch3 Speed=0, ch4 Dir=255, then 8×(Hue,Sat).
+        let mut dmx = vec![255u8, 0, 0, 255];
+        for _ in 0..PIXEL_SEGMENTS {
+            dmx.push(255); // hue
+            dmx.push(255); // sat
+        }
+        let st = map_dmx(Profile::Pixel, &dmx, CctRange::default());
+        assert_eq!(st.mode, Mode::Pixel);
+        assert!(st.power);
+        assert_eq!(st.brightness, 100);
+        assert_eq!(st.pixel_effect, 1);
+        assert_eq!(st.pixel_speed, 0);
+        assert_eq!(st.pixel_dir, 1); // ch4=255 → dir 1
+        assert_eq!(st.seg_count, 8);
+        assert_eq!(st.segments[0], Block::Hsi { hue: 360, sat: 100 });
+        assert_eq!(st.pixel_blocks().len(), 8);
+
+        // Effect band ch2=128 → effect 4 (TwoColorMoving); dir ch4=0; colours from ch5.
+        let mut dmx2 = vec![200u8, 128, 128, 0];
+        dmx2.extend_from_slice(&[0, 255]); // seg1 hue=0, sat=100
+        dmx2.extend_from_slice(&[170, 255]); // seg2 hue≈240
+        dmx2.resize(20, 0);
+        let st2 = map_dmx(Profile::Pixel, &dmx2, CctRange::default());
+        assert_eq!(st2.pixel_effect, 4);
+        assert_eq!(st2.pixel_dir, 0);
+        assert_eq!(st2.segments[0], Block::Hsi { hue: 0, sat: 100 });
+        assert_eq!(st2.segments[1], Block::Hsi { hue: 240, sat: 100 });
+    }
+
+    #[test]
+    fn pixel_effect_select_bands() {
+        assert_eq!(pixel_effect_select(0), 1);
+        assert_eq!(pixel_effect_select(51), 1);
+        assert_eq!(pixel_effect_select(52), 3);
+        assert_eq!(pixel_effect_select(102), 3);
+        assert_eq!(pixel_effect_select(103), 4);
+        assert_eq!(pixel_effect_select(204), 5);
+        assert_eq!(pixel_effect_select(205), 7);
+        assert_eq!(pixel_effect_select(255), 7);
     }
 
     #[test]

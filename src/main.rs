@@ -133,6 +133,29 @@ enum Command {
         /// the light to confirm each engages). Implies the light supports them.
         #[arg(long)]
         modes: bool,
+        /// Probe per-segment PIXEL control (0xB0): paint the tube with multi-colour
+        /// palettes so distinct bands appear along it. TL-series pixel fixtures only
+        /// (e.g. TL120C); other lights ignore it. Latches pixel mode — the probe
+        /// power-cycles to exit.
+        #[arg(long)]
+        pixel: bool,
+        /// Send ONE specific frame and hold it (for guided one-at-a-time testing).
+        /// The light keeps the state after disconnect. SPEC is one of:
+        ///   cct:<kelvin>:<bri>            e.g. cct:5600:40
+        ///   hsi:<hue>:<sat>:<bri>         e.g. hsi:0:100:80   (hue 0-360)
+        ///   xy:<x>:<y>:<bri>              e.g. xy:6400:3300:80 (x,y ×10000)
+        ///   fx:<id>:<bri>                 e.g. fx:12:80        (effect id 1-18)
+        ///   pixel:<hue,hue,...>:<eff>:<speed>  e.g. pixel:0,240:1:40
+        ///   pixfx:<id>                    per-effect pixel probe (id 1-10, app defaults)
+        ///   rgbcwmac:<r>:<g>:<b>[:cw:ww:bri] RGBCW via by-MAC 0xA9 (production form; rgbcw: = direct 0xA8, ignored)
+        ///   warmdim                       dim warm white (safe end state)
+        /// Non-CCT/pixel specs first send a CCT-white frame to clear any pixel/FX latch.
+        #[arg(long)]
+        set: Option<String>,
+        /// Read device status (firmware version, battery, temperature, power/mode) and
+        /// print the decoded replies. Non-mutating — no blink, no colour change.
+        #[arg(long)]
+        status: bool,
     },
     /// Listen for ArtNet and print received ArtDmx packets (no BLE needed).
     Monitor,
@@ -194,9 +217,9 @@ async fn dispatch(cli: &Cli) -> Result<()> {
         Command::ArtnetSend { target, port, universe, address, channels, hz, seconds } => {
             commands::artnet_send(target, *port, *universe, *address, channels, *hz, *seconds).await
         }
-        Command::Test { mac, driver, seconds, colors, modes } => {
+        Command::Test { mac, driver, seconds, colors, modes, pixel, set, status } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
-            commands::test(&cfg.ble.adapter, mac, driver, *seconds, *colors, *modes).await
+            commands::test(&cfg.ble.adapter, mac, driver, *seconds, *colors, *modes, *pixel, set.as_deref(), *status).await
         }
         Command::Monitor => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
