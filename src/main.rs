@@ -18,7 +18,7 @@ use neewer_bridge::{bridge, commands, logging};
 #[command(name = "neewer-bridge", version, about = "ArtNet → Neewer Bluetooth light bridge")]
 struct Cli {
     /// Path to the TOML config file.
-    #[arg(short, long, global = true, default_value = "neewer-bridge.toml")]
+    #[arg(short, long, global = true, default_value = "config.toml")]
     config: PathBuf,
 
     /// Increase log verbosity (-v debug, -vv trace + BLE wire logs).

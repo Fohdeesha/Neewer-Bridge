@@ -1,5 +1,5 @@
 //! Bridge configuration (TOML). See `NOTES.md` §8.2 for the documented schema
-//! and `config.example.toml` for a worked example.
+//! and the tracked, ready-to-edit `config.toml` for a worked example.
 //!
 //! The binding identity for every light is its **MAC address** — stable across
 //! reboots and independent of power-on/discovery order (NOTES.md §4). On

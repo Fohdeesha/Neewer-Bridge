@@ -47,19 +47,23 @@ Run it directly from `target/release/`, or via `cargo run --release -- <args>`.
 
 ## Quick start
 
+The bridge reads `config.toml` from the working directory by default — it ships
+ready to edit, so there's nothing to copy or rename. (Use `--config PATH` to point
+elsewhere.)
+
 ```sh
 # 1. Confirm your Bluetooth adapter and see what's nearby
 neewer-bridge scan
 
 # 2. Pair a light interactively — it blinks the fixture so you know which is
-#    which, identifies the model, and writes a [[lights]] entry to your config.
-neewer-bridge add --config neewer-bridge.toml
+#    which, identifies the model, and appends a [[lights]] entry to config.toml.
+neewer-bridge add
 
 # 3. Review the DMX channel mapping it produced
-neewer-bridge lights --config neewer-bridge.toml
+neewer-bridge lights
 
 # 4. Run the bridge
-neewer-bridge run --config neewer-bridge.toml
+neewer-bridge run
 ```
 
 Point your lighting console / software (QLC+, etc.) at this host's IP on the
@@ -88,7 +92,7 @@ neewer-bridge [--config PATH] [-v|-vv] <COMMAND>
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--config PATH` | `neewer-bridge.toml` | Config file path. |
+| `--config PATH` | `config.toml` | Config file path. |
 | `-v` | — | Debug logging for this crate (logs BLE writes as hex). |
 | `-vv` | — | Trace + btleplug BLE wire logs. |
 | `--version` | — | Print version. |
@@ -167,8 +171,9 @@ neewer-bridge artnet-send --universe 0 --address 1 --channels 80,255,10
 
 ## Configuration
 
-See `config.example.toml`. Lights are bound by **MAC address** — the stable
-identity that makes the DMX→light mapping deterministic across reboots.
+Edit `config.toml` (shipped ready to go — no copy/rename step). Lights are bound
+by **MAC address** — the stable identity that makes the DMX→light mapping
+deterministic across reboots.
 
 ```toml
 [artnet]

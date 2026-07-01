@@ -11,8 +11,8 @@
 # Large reference artifact
 /artnet_protocol_specs.txt
 
-# Local config holding real MACs (use config.example.toml as the template)
-/config.toml
+# `config.toml` is the tracked, ready-to-edit config shipped with the project —
+# NOT ignored. (Legacy alternate name kept ignored in case it's used locally.)
 /neewer-bridge.toml
 
 # Local scratch / personal notes
