@@ -149,13 +149,31 @@ pub fn lights(cfg: &config::Config) -> Result<()> {
     Ok(())
 }
 
-/// `scan` — discover and list lights. Prints a human table; Neewer lights are
-/// flagged and shown first so you can copy the MAC straight into the config.
-pub async fn scan(adapter_selector: &str, seconds: u64, all: bool, json: bool) -> Result<()> {
-    let adapter = ble::acquire_adapter(adapter_selector).await?;
+/// `scan` — discover and list lights. Prints a human table; only NEW Neewer
+/// lights (not already bound in the config) are shown so you can copy the MAC
+/// straight into the config. `--all` lists everything, marking configured ones.
+pub async fn scan(cfg: &config::Config, seconds: u64, all: bool, json: bool) -> Result<()> {
+    let adapter = ble::acquire_adapter(&cfg.ble.adapter).await?;
     let found = ble::scan(&adapter, seconds).await?;
 
-    let shown: Vec<_> = found.iter().filter(|f| all || f.is_neewer).collect();
+    let is_configured = |addr: &str| cfg.lights.iter().any(|l| config::mac_eq(&l.mac, addr));
+    let mut hidden = 0usize;
+    let shown: Vec<_> = found
+        .iter()
+        .filter(|f| {
+            if all {
+                return true;
+            }
+            if !f.is_neewer {
+                return false;
+            }
+            if is_configured(&f.address) {
+                hidden += 1;
+                return false;
+            }
+            true
+        })
+        .collect();
 
     if json {
         // Machine-readable output (one JSON array) for automated tooling.
@@ -164,11 +182,12 @@ pub async fn scan(adapter_selector: &str, seconds: u64, all: bool, json: bool) -
             .map(|f| {
                 let rssi = f.rssi.map(|r| r.to_string()).unwrap_or_else(|| "null".into());
                 format!(
-                    "{{\"name\":\"{}\",\"mac\":\"{}\",\"rssi\":{},\"neewer\":{}}}",
+                    "{{\"name\":\"{}\",\"mac\":\"{}\",\"rssi\":{},\"neewer\":{},\"configured\":{}}}",
                     json_escape(&f.name),
                     json_escape(&f.address),
                     rssi,
-                    f.is_neewer
+                    f.is_neewer,
+                    is_configured(&f.address)
                 )
             })
             .collect();
@@ -177,8 +196,12 @@ pub async fn scan(adapter_selector: &str, seconds: u64, all: bool, json: bool) -
     }
 
     if shown.is_empty() {
-        println!("\nNo {}lights found. Is the light powered on and in range?", if all { "" } else { "Neewer " });
-        println!("(Try `--all` to list every BLE device, or `--seconds N` for a longer scan.)");
+        if hidden > 0 {
+            println!("\nNo NEW Neewer lights found ({hidden} already in the config, hidden — `--all` shows them).");
+        } else {
+            println!("\nNo {}lights found. Is the light powered on and in range?", if all { "" } else { "Neewer " });
+            println!("(Try `--all` to list every BLE device, or `--seconds N` for a longer scan.)");
+        }
         return Ok(());
     }
 
@@ -186,9 +209,16 @@ pub async fn scan(adapter_selector: &str, seconds: u64, all: bool, json: bool) -
     println!("  {}", "-".repeat(62));
     for (i, f) in shown.iter().enumerate() {
         let rssi = f.rssi.map(|r| format!("{r}")).unwrap_or_else(|| "  ?".into());
-        let kind = if f.is_neewer { "Neewer" } else { "other" };
+        let kind = match (f.is_neewer, is_configured(&f.address)) {
+            (true, true) => "Neewer (configured)",
+            (true, false) => "Neewer",
+            _ => "other",
+        };
         let name = if f.name.is_empty() { "(no name)" } else { &f.name };
         println!("  {:<3} {:<22} {:<18} {:>4}  {}", i + 1, name, f.address, rssi, kind);
+    }
+    if hidden > 0 {
+        println!("\n  ({hidden} already-configured light(s) hidden — `--all` shows them.)");
     }
     println!(
         "\nTo control one: `neewer-bridge test <MAC> --driver <classic|infinity|home>`"
@@ -263,10 +293,11 @@ pub async fn add(config_path: &Path, adapter_selector: &str) -> Result<()> {
         bail!("unknown driver {driver:?}");
     }
 
-    // Blink to identify which physical fixture this is.
+    // Blink to identify which physical fixture this is. (cmd_type only affects
+    // the advanced-mode frames, not the power frames a blink uses.)
     println!("Connecting to blink the light so you can identify it…");
     let mac_bytes = parse_mac(&light.address)?;
-    let drv = Driver::resolve(&driver, Profile::Full, mac_bytes, &light.name);
+    let drv = Driver::resolve(&driver, Profile::Full, mac_bytes, &light.name, 2);
     match ble::connect_and_verify(&light.peripheral).await {
         Ok(chars) => {
             for _ in 0..3 {
@@ -312,6 +343,7 @@ pub async fn add(config_path: &Path, adapter_selector: &str) -> Result<()> {
         power_on_connect: true,
         cct_min: def_cct_min,
         cct_max: def_cct_max,
+        cmd_type: model.map(|m| m.cmd_type).unwrap_or(2),
     };
     config::append_light(config_path, &entry)?;
     println!(
@@ -404,7 +436,7 @@ pub async fn add_noninteractive(
     if blink {
         match &peripheral {
             Some(p) => {
-                let drv = Driver::resolve(&driver, Profile::Full, mac_bytes, &ble_name);
+                let drv = Driver::resolve(&driver, Profile::Full, mac_bytes, &ble_name, 2);
                 match ble::connect_and_verify(p).await {
                     Ok(chars) => {
                         info!("blinking light to identify");
@@ -433,6 +465,7 @@ pub async fn add_noninteractive(
         power_on_connect: true,
         cct_min,
         cct_max,
+        cmd_type: model.map(|m| m.cmd_type).unwrap_or(2),
     };
     config::append_light(config_path, &entry)?;
     println!(
@@ -739,6 +772,19 @@ fn fx_preset(mac: [u8; 6], id: u8, bri: u8) -> Vec<u8> {
     }
 }
 
+/// Same presets as [`fx_preset`] but the DIRECT `0x8B` frame (no MAC wrapper) —
+/// what the app's `setRGBLightValue(EFFECT_MODE_OLD, …)` path sends.
+fn fx_preset_direct(id: u8, bri: u8) -> Vec<u8> {
+    match id {
+        1 => infinity::fx_direct(1, bri, 56, 0, 0, 0, 5, 0, 0), // Lightning
+        9 => infinity::fx_direct(9, bri, 0, 0, 240, 100, 6, 0, 0), // HUE-pulse (blue)
+        10 => infinity::fx_direct(10, bri, 0, 0, 0, 0, 7, 2, 0), // Cop-Car
+        11 => infinity::fx_direct(11, bri, 32, 0, 0, 0, 4, 0, 0), // Candlelight
+        12 => infinity::fx_direct(12, bri, 0, 0, 0, 100, 5, 0, 0), // HUE-loop
+        _ => infinity::fx_direct(id, bri, 56, 0, 0, 100, 5, 0, 0), // generic
+    }
+}
+
 /// Build the exact frames for one pixel effect id (1..=10, the `PixelEffectType`
 /// wire type) using the app's own default parameters from `createPixelEffectData`
 /// plus the Pixel-N-Model defaults (decompiled), with `running=PLAY`. This is the
@@ -864,13 +910,48 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
             let (k, bri) = (num(1, "kelvin")?, num(2, "bri")? as u8);
             (vec![classic::cct2(bri, (k / 100) as u8)], format!("CCT {k}K @ {bri}%"), false)
         }
+        "cctgm" => {
+            // GM CCT probe. Optional 4th part = frame form: 4 (default; the app's
+            // cct4), 3 (GL1-family cct3) or 5 (RGB62-family cct_gm5). gm -50..=50.
+            let (k, bri) = (num(1, "kelvin")?, num(3, "bri")? as u8);
+            let gm: i8 = get(2)
+                .with_context(|| format!("--set {spec}: missing gm"))?
+                .parse()
+                .with_context(|| format!("--set {spec}: gm must be -50..=50"))?;
+            let cct = (k / 100) as u8;
+            let (frame, form) = match get(4) {
+                Some("3") => (classic::cct3(bri, cct, gm), 3),
+                Some("5") => (classic::cct_gm5(bri, cct, gm), 5),
+                _ => (classic::cct4(bri, cct, gm), 4),
+            };
+            (vec![frame], format!("CCT{form} {k}K gm{gm:+} @ {bri}%"), false)
+        }
         "hsi" => {
             let (hue, sat, bri) = (num(1, "hue")? as u16, num(2, "sat")? as u8, num(3, "bri")? as u8);
             (vec![classic::hsi(hue, sat, bri)], format!("HSI hue={hue} sat={sat} @ {bri}%"), true)
         }
         "xy" => {
             let (x, y, bri) = (num(1, "x")? as u16, num(2, "y")? as u16, num(3, "bri")? as u8);
-            (vec![classic::xy_mac(mac, bri, x, y)], format!("XY x={x} y={y} @ {bri}%"), true)
+            (vec![classic::xy_mac(mac, bri, x, y)], format!("XY by-MAC 0xB7 x={x} y={y} @ {bri}%"), true)
+        }
+        "xydirect" => {
+            // Direct 0xB9 — ignored on commandType==2 (Infinity) fixtures like the
+            // TL120C, but the form the app sends to everything else. Probe both.
+            let (x, y, bri) = (num(1, "x")? as u16, num(2, "y")? as u16, num(3, "bri")? as u8);
+            (vec![classic::xy(bri, x, y)], format!("XY direct 0xB9 x={x} y={y} @ {bri}%"), true)
+        }
+        "fxdirect" => {
+            // Direct 0x8B — the 18-effect payload without the MAC wrapper
+            // (`setRGBLightValue(EFFECT_MODE_OLD,…)`, cn.java:3458). For fixtures
+            // that ignore the MAC 0x91 form.
+            let (id, bri) = (num(1, "id")? as u8, num(2, "bri")? as u8);
+            (vec![fx_preset_direct(id, bri)], format!("FX direct 0x8B #{id} @ {bri}%"), true)
+        }
+        "scene" => {
+            // Old 9-scene 0x88 — dropped by TL120C firmware; non-Infinity fixtures
+            // may honour it. reset=true so an ignored frame leaves plain white.
+            let (id, bri) = (num(1, "scene id (1-9)")? as u8, num(2, "bri")? as u8);
+            (vec![classic::scene(bri, id)], format!("SCENE 0x88 #{id} @ {bri}%"), true)
         }
         "fx" => {
             let (id, bri) = (num(1, "id")? as u8, num(2, "bri")? as u8);
@@ -921,7 +1002,7 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
                 true,
             )
         }
-        other => bail!("--set: unknown spec kind '{other}' (cct|hsi|xy|fx|pixel|pixfx|warmdim|rgbcw|rgbcwmac)"),
+        other => bail!("--set: unknown spec kind '{other}' (cct|hsi|xy|xydirect|scene|fx|fxdirect|pixel|pixfx|warmdim|rgbcw|rgbcwmac)"),
     };
 
     if reset {

@@ -71,7 +71,7 @@ impl LightActor {
 
         loop {
             let (peripheral, name) = self.find().await;
-            let driver = Driver::resolve(&self.cfg.driver, profile, mac_bytes, &name);
+            let driver = Driver::resolve(&self.cfg.driver, profile, mac_bytes, &name, self.cfg.cmd_type);
             info!(light = %label, ble_name = %name, driver = driver.label(), "connecting");
 
             match ble::connect_and_verify(&peripheral).await {

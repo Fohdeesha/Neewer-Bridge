@@ -1,7 +1,8 @@
 # Neewer-Bridge configuration.
 #
-# This is the live config the bridge reads by default (`neewer-bridge run` with no
-# --config looks for `config.toml` in the working directory). Edit it in place —
+# This is the live config the bridge reads by default (launching `neewer-bridge`
+# with no --config looks for `config.toml` in the working directory; a bare
+# `neewer-bridge` with no subcommand runs the bridge). Edit it in place —
 # there's nothing to copy or rename. Lights are bound by MAC address, so the
 # DMX-channel -> physical-light mapping is identical on every boot regardless of
 # power-on or discovery order.
@@ -69,6 +70,10 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 # # manual. Default 32..56 (3200..5600K); e.g. the TL120C is 25..100 (2500..10000K).
 # cct_min  = 32
 # cct_max  = 56
+# # Advanced-mode frame family (the app's per-model commandType; `add` fills it
+# # from the catalog). 2 = Infinity fixtures (TL120C): XY/RGBCW/FX sent as the
+# # MAC-embedded frames. 0/1 = direct frames (TL21C). Default 2.
+# cmd_type = 2
 
 # TL120C driven as a native RGBCW fixture from openHAB (color + tunablewhite things).
 # DMX: ch1=R ch2=G ch3=B ch4=CW ch5=WW at universe 0, start address 1.
@@ -82,3 +87,31 @@ address  = 1
 power_on_connect = true
 cct_min  = 25
 cct_max  = 100
+cmd_type = 2
+
+[[lights]]
+mac = "CB:33:5A:EE:5A:7C"
+name = "TL120C"
+driver = "classic"
+profile = "advanced"
+universe = 0
+address = 6
+power_on_connect = true
+cct_min = 25
+cct_max = 100
+cmd_type = 2
+
+# TL21C (HW-tested 2026-07-02): CCT 2500-8500K + HSI + FX (direct 0x8B via
+# cmd_type=1). No XY/RGBCW/pixel, and GM is ignored by the hardware — the
+# advanced profile's XY/RGBCW bands and the CCT band's GM channel are inert.
+[[lights]]
+mac = "FA:F8:A9:B9:41:1C"
+name = "TL21C"
+driver = "classic"
+profile = "advanced"
+universe = 0
+address = 16
+power_on_connect = true
+cct_min = 25
+cct_max = 85
+cmd_type = 1

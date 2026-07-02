@@ -15,7 +15,15 @@
 #   supports_rgb  = supportHSI (colour capable)  -> profile "full"
 #   supports_gm   = haveGM                          (green/magenta tint)
 #   cct_min/max   = min/maxColorTemperature / 100   (raw x100K, 25=2500K)
+#   cmd_type      = commandType: 2 = Infinity - advanced modes (XY/RGBCW/FX) need
+#                   the MAC-embedded frames (0xB7/0xA9/0x91), hardware-verified on
+#                   the TL120C; 0/1 = direct frames (0xB9/0xA8/0x8B), hardware-
+#                   verified on the TL21C (FX via direct 0x8B). Drives the driver's
+#                   frame-form dispatch.
 #   supports_rgbcw/xy/dmx, pixel_classify           (extra modes, for future FX work)
+#
+# Hardware-verified overrides (see HW_OVERRIDES in the script): TL21C fx=true
+# (direct 0x8B works live), gm=false (all GM frame forms ignored on hardware).
 #
 # driver = classic for all: the bridge connects DIRECTLY over BLE, where the
 # classic 0x78 frames (0x81 power / 0x86 HSI / 0x87 CCT) work - verified on the
@@ -34,6 +42,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "A19C(E26)"
@@ -43,6 +52,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "AF200C"
@@ -52,6 +62,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -64,6 +75,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -76,6 +88,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 18
 cct_max = 100
+cmd_type = 2
 supports_rgbcw = true
 supports_xy = true
 pixel_classify = 2
@@ -88,6 +101,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 18
 cct_max = 100
+cmd_type = 2
 supports_rgbcw = true
 supports_xy = true
 pixel_classify = 2
@@ -100,6 +114,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 18
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -112,6 +127,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -125,6 +141,7 @@ supports_rgb = true
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 2
 
 [[model]]
 name = "BH-30S RGB"
@@ -135,6 +152,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -145,6 +163,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_rgbcw = true
 
 [[model]]
@@ -155,6 +174,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "CB100C"
@@ -165,6 +185,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -175,6 +196,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 
@@ -186,6 +208,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 
@@ -198,6 +221,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 
 [[model]]
 name = "CL124 RGB(II)"
@@ -207,6 +231,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "CL124-RGB"
@@ -216,6 +241,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "CT90C"
@@ -225,6 +251,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -238,6 +265,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_rgbcw = true
 supports_xy = true
 
@@ -249,6 +277,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "FS100C"
@@ -258,6 +287,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 18
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 
@@ -269,6 +299,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_rgbcw = true
 
 [[model]]
@@ -279,6 +310,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -291,6 +323,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -303,6 +336,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -315,6 +349,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 18
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 
@@ -326,6 +361,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "GC31C"
@@ -335,6 +371,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "GL1"
@@ -344,6 +381,7 @@ supports_rgb = true
 supports_gm = false
 cct_min = 29
 cct_max = 70
+cmd_type = 1
 
 [[model]]
 name = "GL1C"
@@ -353,6 +391,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 29
 cct_max = 70
+cmd_type = 1
 
 [[model]]
 name = "GL25C"
@@ -362,6 +401,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 29
 cct_max = 70
+cmd_type = 1
 supports_rgbcw = true
 
 [[model]]
@@ -372,6 +412,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 85
+cmd_type = 1
 supports_fx = true
 supports_rgbcw = true
 
@@ -383,6 +424,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -395,6 +437,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -408,6 +451,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -420,6 +464,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 75
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -432,6 +477,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_rgbcw = true
 supports_xy = true
 
@@ -443,6 +489,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 supports_rgbcw = true
 supports_xy = true
 supports_dmx = true
@@ -455,6 +502,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 
@@ -467,6 +515,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 
@@ -479,6 +528,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -492,6 +542,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 85
+cmd_type = 2
 
 [[model]]
 name = "RGB-P200"
@@ -501,6 +552,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB-P280"
@@ -510,6 +562,7 @@ supports_rgb = true
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB1"
@@ -520,6 +573,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 85
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -530,6 +584,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "RGB1200"
@@ -540,6 +595,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 85
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -550,6 +606,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 
 [[model]]
 name = "RGB168"
@@ -559,6 +616,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 85
+cmd_type = 1
 
 [[model]]
 name = "RGB176"
@@ -568,6 +626,7 @@ supports_rgb = true
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB176 A1"
@@ -577,6 +636,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "RGB18"
@@ -586,6 +646,7 @@ supports_rgb = true
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB18(II)"
@@ -595,6 +656,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "RGB190"
@@ -604,6 +666,7 @@ supports_rgb = true
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB2"
@@ -613,6 +676,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -623,6 +687,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB480"
@@ -632,6 +697,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB512"
@@ -641,6 +707,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "RGB530"
@@ -650,6 +717,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB530 PRO"
@@ -659,6 +727,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB62"
@@ -668,6 +737,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 85
+cmd_type = 1
 
 [[model]]
 name = "RGB650"
@@ -677,6 +747,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB660"
@@ -686,6 +757,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB660 PRO"
@@ -695,6 +767,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RGB800"
@@ -704,6 +777,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "RGB960"
@@ -713,6 +787,7 @@ supports_rgb = true
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "RL45C"
@@ -722,6 +797,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 supports_rgbcw = true
 
 [[model]]
@@ -733,6 +809,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "SL70"
@@ -742,6 +819,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 85
+cmd_type = 1
 
 [[model]]
 name = "SL80"
@@ -751,6 +829,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 32
 cct_max = 85
+cmd_type = 1
 
 [[model]]
 name = "SL90"
@@ -761,6 +840,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 
 [[model]]
 name = "SL90 Pro"
@@ -771,6 +851,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -781,6 +862,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 
 [[model]]
 name = "T100C"
@@ -790,6 +872,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "TL120C"
@@ -800,6 +883,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -810,9 +894,11 @@ name = "TL21C"
 name_matches = ["TL21C"]
 driver = "classic"
 supports_rgb = true
-supports_gm = true
+supports_gm = false
 cct_min = 25
 cct_max = 85
+cmd_type = 1
+supports_fx = true
 
 [[model]]
 name = "TL60 RGB"
@@ -823,6 +909,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 pixel_classify = 1
@@ -835,6 +922,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 2
 supports_fx = true
 supports_rgbcw = true
 supports_xy = true
@@ -848,6 +936,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 85
+cmd_type = 1
 
 [[model]]
 name = "TL98C"
@@ -857,6 +946,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 100
+cmd_type = 1
 supports_fx = true
 supports_rgbcw = true
 supports_dmx = true
@@ -869,6 +959,7 @@ supports_rgb = true
 supports_gm = true
 cct_min = 25
 cct_max = 85
+cmd_type = 1
 
 [[model]]
 name = "ZK-RY"
@@ -878,6 +969,7 @@ supports_rgb = true
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "AP100B"
@@ -887,6 +979,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 25
 cct_max = 85
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -897,6 +990,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 25
 cct_max = 85
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -907,6 +1001,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -918,6 +1013,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 
 [[model]]
 name = "BP300S"
@@ -927,6 +1023,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "BP66S"
@@ -936,6 +1033,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "CB120B"
@@ -945,6 +1043,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 
 [[model]]
 name = "CB200"
@@ -954,6 +1053,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 2
 
 [[model]]
 name = "CB200B"
@@ -964,6 +1064,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -974,6 +1075,7 @@ supports_rgb = false
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -984,6 +1086,7 @@ supports_rgb = false
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -994,6 +1097,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 2
 
 [[model]]
 name = "CB300B"
@@ -1004,6 +1108,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1015,6 +1120,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1025,6 +1131,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1036,6 +1143,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 2
 
 [[model]]
 name = "FS150B"
@@ -1046,6 +1154,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 
 [[model]]
 name = "FS230 5600K"
@@ -1056,6 +1165,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 2
 
 [[model]]
 name = "FS230B"
@@ -1066,6 +1176,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 
 [[model]]
 name = "FS300B"
@@ -1075,6 +1186,7 @@ supports_rgb = false
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1085,6 +1197,7 @@ supports_rgb = false
 supports_gm = true
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1095,6 +1208,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1105,6 +1219,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "GC31B"
@@ -1114,6 +1229,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "GL1 PRO"
@@ -1123,6 +1239,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 29
 cct_max = 70
+cmd_type = 0
 
 [[model]]
 name = "HB60B"
@@ -1132,6 +1249,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1142,6 +1260,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1152,6 +1271,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1163,6 +1283,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1173,6 +1294,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 2
 
 [[model]]
 name = "MS150B"
@@ -1183,6 +1305,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1193,6 +1316,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 2
 
 [[model]]
 name = "MS60B"
@@ -1203,6 +1327,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1213,6 +1338,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "NL140"
@@ -1222,6 +1348,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "NL192SAI"
@@ -1231,6 +1358,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "NL480S"
@@ -1240,6 +1368,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "NL660S"
@@ -1249,6 +1378,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "PL60B"
@@ -1258,6 +1388,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 25
 cct_max = 85
+cmd_type = 2
 supports_fx = true
 
 [[model]]
@@ -1268,6 +1399,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 27
 cct_max = 65
+cmd_type = 1
 
 [[model]]
 name = "RB12B"
@@ -1277,6 +1409,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 29
 cct_max = 70
+cmd_type = 1
 
 [[model]]
 name = "RH100B"
@@ -1286,6 +1419,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 29
 cct_max = 70
+cmd_type = 1
 
 [[model]]
 name = "RL45B"
@@ -1295,6 +1429,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 29
 cct_max = 70
+cmd_type = 1
 
 [[model]]
 name = "RP18B PRO"
@@ -1304,6 +1439,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 29
 cct_max = 70
+cmd_type = 1
 
 [[model]]
 name = "SNL1320"
@@ -1313,6 +1449,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "SNL1920"
@@ -1322,6 +1459,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "SNL480"
@@ -1331,6 +1469,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "SNL530"
@@ -1340,6 +1479,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "SNL660"
@@ -1349,6 +1489,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "SNL960"
@@ -1358,6 +1499,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "SRP16"
@@ -1367,6 +1509,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "SRP18"
@@ -1376,6 +1519,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "TL40"
@@ -1385,6 +1529,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 29
 cct_max = 70
+cmd_type = 1
 
 [[model]]
 name = "VL67B"
@@ -1394,6 +1539,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 25
 cct_max = 85
+cmd_type = 1
 
 [[model]]
 name = "WRP18"
@@ -1403,6 +1549,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "X2"
@@ -1412,6 +1559,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 56
 cct_max = 56
+cmd_type = 1
 
 [[model]]
 name = "ZRP"
@@ -1421,6 +1569,7 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 3
 
 [[model]]
 name = "ZRP16"
@@ -1430,3 +1579,4 @@ supports_rgb = false
 supports_gm = false
 cct_min = 32
 cct_max = 56
+cmd_type = 1

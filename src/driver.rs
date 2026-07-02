@@ -10,9 +10,12 @@ use crate::protocol::{classic, home, infinity, pixel, LightState, Mode};
 #[derive(Debug, Clone)]
 pub enum Driver {
     /// Classic `0x78`. `supports_gm` selects the app's 4-byte CCT (with GM,
-    /// `classic::cct4`) vs the universally-accepted 2-byte form. `mac` is carried so
-    /// FX (which only has a MAC-embedded frame) can be sent even on a classic light.
-    Classic { supports_gm: bool, mac: [u8; 6] },
+    /// `classic::cct4`) vs the universally-accepted 2-byte form. `mac` is carried
+    /// for the MAC-embedded frames and status queries. `mac_frames` is the app's
+    /// per-model `commandType == 2` split: advanced modes (XY/RGBCW/FX) use the
+    /// MAC-embedded frames when true (TL120C — the direct forms are ignored) and
+    /// the direct frames when false (TL21C — only direct `0x8B` FX renders).
+    Classic { supports_gm: bool, mac: [u8; 6], mac_frames: bool },
     /// Infinity `0x78` with the MAC embedded in every payload.
     Infinity { mac: [u8; 6] },
     /// Neewer Home `0x7A` (`NH-*`).
@@ -22,18 +25,20 @@ pub enum Driver {
 impl Driver {
     /// Resolve a driver from the config `driver` field. `auto` infers Home from
     /// an `NH-` BLE name, else falls back to Classic (Infinity can't be reliably
-    /// auto-detected, so it must be set explicitly).
-    pub fn resolve(driver_cfg: &str, profile: Profile, mac: [u8; 6], ble_name: &str) -> Driver {
+    /// auto-detected, so it must be set explicitly). `cmd_type` is the config's
+    /// per-light `commandType` (2 ⇒ MAC-embedded advanced-mode frames).
+    pub fn resolve(driver_cfg: &str, profile: Profile, mac: [u8; 6], ble_name: &str, cmd_type: u8) -> Driver {
         let supports_gm = matches!(profile, Profile::CctGm | Profile::Full | Profile::Advanced);
+        let mac_frames = cmd_type == 2;
         match driver_cfg {
-            "classic" => Driver::Classic { supports_gm, mac },
+            "classic" => Driver::Classic { supports_gm, mac, mac_frames },
             "infinity" => Driver::Infinity { mac },
             "home" => Driver::Home,
             _ => {
                 if ble_name.to_lowercase().starts_with("nh-") {
                     Driver::Home
                 } else {
-                    Driver::Classic { supports_gm, mac }
+                    Driver::Classic { supports_gm, mac, mac_frames }
                 }
             }
         }
@@ -73,26 +78,37 @@ impl Driver {
                 Driver::Infinity { mac } => infinity::hsi(*mac, st.hue, st.sat, st.brightness),
                 Driver::Home => home::hsi(st.brightness as u16 * 10, st.hue, st.sat),
             },
-            // XY: MAC-addressed frame (0xB7). Verified on the TL120C, which ignores
-            // the direct 0xB9 form — like its FX and pixel frames, the advanced-mode
-            // commands must embed the MAC. Home degrades to neutral CCT.
+            // XY: the frame form follows the app's commandType split — MAC-addressed
+            // 0xB7 for commandType==2 (TL120C ignores the direct 0xB9), direct 0xB9
+            // otherwise (the form the app sends to everything else). Home degrades
+            // to neutral CCT.
             Mode::Xy => match self {
+                Driver::Classic { mac_frames: false, .. } => classic::xy(st.brightness, st.x, st.y),
                 Driver::Classic { mac, .. } | Driver::Infinity { mac } => {
                     classic::xy_mac(*mac, st.brightness, st.x, st.y)
                 }
                 Driver::Home => home::cct(st.brightness as u16 * 10, st.cct),
             },
-            // RGBCW: MAC-addressed frame (0xA9). Hardware-confirmed on the TL120C
-            // (2026-07-01) — the direct 0xA8 is ignored (like XY's direct 0xB9), but
-            // the by-MAC form renders. Home degrades to neutral CCT.
+            // RGBCW: same commandType split. By-MAC 0xA9 for commandType==2 (HW-
+            // confirmed on the TL120C, whose direct 0xA8 is ignored); direct 0xA8
+            // otherwise. Home degrades to neutral CCT.
             Mode::Rgbcw => match self {
+                Driver::Classic { mac_frames: false, .. } => {
+                    classic::rgbcw(st.brightness, st.r, st.g, st.b, st.cw, st.ww, 0)
+                }
                 Driver::Classic { mac, .. } | Driver::Infinity { mac } => {
                     classic::rgbcw_mac(*mac, st.brightness, st.r, st.g, st.b, st.cw, st.ww, 0)
                 }
                 Driver::Home => home::cct(st.brightness as u16 * 10, st.cct),
             },
-            // FX: MAC-embedded effect frame (we always carry the MAC).
+            // FX: same commandType split — MAC-embedded 0x91 for commandType==2,
+            // direct 0x8B otherwise (HW-confirmed on the TL21C, which ignores 0x91
+            // and renders the identical effect payload via 0x8B).
             Mode::Fx => match self {
+                Driver::Classic { mac_frames: false, .. } => infinity::fx_direct(
+                    st.fx_id, st.brightness, st.cct, st.gm, st.hue, st.sat, st.fx_speed,
+                    st.fx_extra, st.fx_val2,
+                ),
                 Driver::Classic { mac, .. } | Driver::Infinity { mac } => infinity::fx(
                     *mac, st.fx_id, st.brightness, st.cct, st.gm, st.hue, st.sat, st.fx_speed,
                     st.fx_extra, st.fx_val2,
@@ -155,9 +171,9 @@ mod tests {
     #[test]
     fn classic_dispatch() {
         let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        let no_gm = Driver::Classic { supports_gm: false, mac };
+        let no_gm = Driver::Classic { supports_gm: false, mac, mac_frames: true };
         assert_eq!(no_gm.apply(&cct_state(50, 56, 0)), classic::cct2(50, 56));
-        let gm = Driver::Classic { supports_gm: true, mac };
+        let gm = Driver::Classic { supports_gm: true, mac, mac_frames: true };
         assert_eq!(gm.apply(&cct_state(50, 56, -10)), classic::cct4(50, 56, -10));
         assert_eq!(no_gm.apply(&hsi_state(180, 100, 75)), classic::hsi(180, 100, 75));
     }
@@ -165,7 +181,7 @@ mod tests {
     #[test]
     fn advanced_mode_dispatch() {
         let mac = [1, 2, 3, 4, 5, 6];
-        let d = Driver::Classic { supports_gm: true, mac };
+        let d = Driver::Classic { supports_gm: true, mac, mac_frames: true };
         // XY uses the MAC-addressed frame (TL120C ignores the direct form).
         let xy = LightState { mode: Mode::Xy, brightness: 80, x: 3127, y: 3290, ..LightState::default() };
         assert_eq!(d.apply(&xy), classic::xy_mac(mac, 80, 3127, 3290));
@@ -178,9 +194,26 @@ mod tests {
     }
 
     #[test]
+    fn advanced_mode_dispatch_direct_frames() {
+        // cmd_type != 2 (e.g. the TL21C): XY/RGBCW/FX use the DIRECT frame forms
+        // (0xB9 / 0xA8 / 0x8B) — hardware-verified 2026-07-02: the TL21C renders
+        // FX via 0x8B only and ignores every MAC-embedded control frame.
+        let mac = [1, 2, 3, 4, 5, 6];
+        let d = Driver::Classic { supports_gm: false, mac, mac_frames: false };
+        let xy = LightState { mode: Mode::Xy, brightness: 80, x: 3127, y: 3290, ..LightState::default() };
+        assert_eq!(d.apply(&xy), classic::xy(80, 3127, 3290));
+        let fx = LightState { mode: Mode::Fx, brightness: 100, cct: 56, fx_id: 1, fx_speed: 5, ..LightState::default() };
+        assert_eq!(d.apply(&fx), infinity::fx_direct(1, 100, 56, 0, 0, 0, 5, 0, 0));
+        let rgbcw = LightState { mode: Mode::Rgbcw, brightness: 100, r: 255, g: 0, b: 0, ..LightState::default() };
+        assert_eq!(d.apply(&rgbcw), classic::rgbcw(100, 255, 0, 0, 0, 0, 0));
+        // CCT/HSI are unaffected by the split.
+        assert_eq!(d.apply(&cct_state(50, 56, 0)), classic::cct2(50, 56));
+    }
+
+    #[test]
     fn pixel_apply_frames_emits_params_and_palette() {
         let mac = [0xCC, 0x8D, 0xBE, 0xBB, 0x25, 0xB0];
-        let d = Driver::Classic { supports_gm: true, mac };
+        let d = Driver::Classic { supports_gm: true, mac, mac_frames: true };
         let mut st = LightState { mode: Mode::Pixel, brightness: 100, seg_count: 2, pixel_speed: 30, pixel_effect: 1, ..LightState::default() };
         st.segments[0] = pixel::Block::Hsi { hue: 0, sat: 100 };
         st.segments[1] = pixel::Block::Hsi { hue: 240, sat: 100 };
@@ -209,16 +242,16 @@ mod tests {
     fn resolve_auto_detects_home_from_nh_name() {
         let mac = [0u8; 6];
         assert!(matches!(
-            Driver::resolve("auto", Profile::Full, mac, "NH-PD20250030"),
+            Driver::resolve("auto", Profile::Full, mac, "NH-PD20250030", 2),
             Driver::Home
         ));
         assert!(matches!(
-            Driver::resolve("auto", Profile::Cct, mac, "NEEWER-RGB660"),
-            Driver::Classic { supports_gm: false, .. }
+            Driver::resolve("auto", Profile::Cct, mac, "NEEWER-RGB660", 1),
+            Driver::Classic { supports_gm: false, mac_frames: false, .. }
         ));
         assert!(matches!(
-            Driver::resolve("auto", Profile::Full, mac, "NEEWER-RGB660"),
-            Driver::Classic { supports_gm: true, .. }
+            Driver::resolve("auto", Profile::Full, mac, "NEEWER-RGB660", 2),
+            Driver::Classic { supports_gm: true, mac_frames: true, .. }
         ));
     }
 }

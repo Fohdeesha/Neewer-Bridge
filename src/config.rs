@@ -113,6 +113,14 @@ pub struct LightCfg {
     pub cct_min: u8,
     #[serde(default = "default_cct_max")]
     pub cct_max: u8,
+    /// Advanced-mode frame family — the app's per-model `commandType`. **2** =
+    /// Infinity fixtures (TL120C): XY/RGBCW/FX need the MAC-embedded frames
+    /// (`0xB7`/`0xA9`/`0x91`). **0/1** = direct frames (`0xB9`/`0xA8`/`0x8B`;
+    /// HW-verified on the TL21C, whose FX only renders via direct `0x8B`).
+    /// `add` fills this from the model catalog; defaults to 2 (the previous
+    /// always-MAC behaviour) for hand-written entries.
+    #[serde(default = "default_cmd_type")]
+    pub cmd_type: u8,
 }
 
 impl Default for ArtNet {
@@ -171,6 +179,11 @@ fn default_cct_min() -> u8 {
 }
 fn default_cct_max() -> u8 {
     DEFAULT_CCT_MAX
+}
+/// Hand-written entries without `cmd_type` keep the pre-cmd_type behaviour
+/// (MAC-embedded advanced-mode frames, correct for the TL120C).
+fn default_cmd_type() -> u8 {
+    2
 }
 fn default_failsafe_mode() -> String {
     "hold".into()
@@ -262,6 +275,9 @@ impl Config {
                     l.cct_min, l.cct_max
                 );
             }
+            if l.cmd_type > 2 {
+                bail!("{who}: cmd_type {} out of range (0..=2; 2 = MAC-embedded advanced frames)", l.cmd_type);
+            }
         }
         // Detect duplicate MAC bindings — a config mistake that would make the
         // DMX→light mapping ambiguous.
@@ -285,7 +301,7 @@ pub fn append_light(path: &Path, light: &LightCfg) -> Result<()> {
         text.push('\n');
     }
     text.push_str(&format!(
-        "\n[[lights]]\nmac = \"{}\"\nname = \"{}\"\ndriver = \"{}\"\nprofile = \"{}\"\nuniverse = {}\naddress = {}\npower_on_connect = {}\ncct_min = {}\ncct_max = {}\n",
+        "\n[[lights]]\nmac = \"{}\"\nname = \"{}\"\ndriver = \"{}\"\nprofile = \"{}\"\nuniverse = {}\naddress = {}\npower_on_connect = {}\ncct_min = {}\ncct_max = {}\ncmd_type = {}\n",
         normalize_mac(&light.mac),
         light.name.clone().unwrap_or_default(),
         light.driver,
@@ -295,6 +311,7 @@ pub fn append_light(path: &Path, light: &LightCfg) -> Result<()> {
         light.power_on_connect,
         light.cct_min,
         light.cct_max,
+        light.cmd_type,
     ));
 
     // Parse + validate the whole file before committing it to disk.
@@ -383,6 +400,7 @@ mod tests {
             power_on_connect: true,
             cct_min: DEFAULT_CCT_MIN,
             cct_max: DEFAULT_CCT_MAX,
+            cmd_type: 1,
         };
         append_light(&path, &light).unwrap();
         // Append a second one to confirm multiple [[lights]] blocks accumulate.
@@ -394,6 +412,7 @@ mod tests {
         assert_eq!(normalize_mac(&loaded.lights[0].mac), "AA:BB:CC:DD:EE:FF");
         assert_eq!(loaded.lights[0].universe, 2);
         assert_eq!(loaded.lights[1].address, 5);
+        assert_eq!(loaded.lights[0].cmd_type, 1); // round-trips through append
         let _ = std::fs::remove_file(&path);
     }
 
@@ -424,6 +443,7 @@ mod tests {
             power_on_connect: true,
             cct_min: DEFAULT_CCT_MIN,
             cct_max: DEFAULT_CCT_MAX,
+            cmd_type: 2,
         });
         assert!(c.validate().is_err()); // bad profile
 

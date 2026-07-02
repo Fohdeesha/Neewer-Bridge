@@ -37,6 +37,12 @@ pub struct Model {
     /// CCT scaling range, raw ×100K (25 = 2500K, 100 = 10000K).
     pub cct_min: u8,
     pub cct_max: u8,
+    /// The app's `commandType`: **2** = Infinity — advanced modes (XY/RGBCW/FX)
+    /// need the MAC-embedded frames (`0xB7`/`0xA9`/`0x91`), HW-verified on the
+    /// TL120C; **0/1** = the direct frames (`0xB9`/`0xA8`/`0x8B`), HW-verified on
+    /// the TL21C (FX renders via direct `0x8B` only). Drives driver dispatch.
+    #[serde(default = "default_cmd_type")]
+    pub cmd_type: u8,
     // --- Extra capability metadata (from the Android DeviceConfigInfo table).
     //     Recorded for future FX/advanced-mode work; not used by v1 profiles yet.
     /// Direct R/G/B/C/W mixing mode (opcode 0xA8).
@@ -54,6 +60,13 @@ pub struct Model {
     /// Pixel/segment effect class (0 = none; 1/2 = pixel-effect family).
     #[serde(default)]
     pub pixel_classify: u8,
+}
+
+/// Absent in a hand-added `[[model]]` block ⇒ 1 (direct frames): every model the
+/// extractor emits carries an explicit value, so the default only covers
+/// hand-curated legacy entries, which predate the MAC-embedded frame family.
+fn default_cmd_type() -> u8 {
+    1
 }
 
 impl Model {
@@ -188,6 +201,13 @@ mod tests {
         assert!(hs.supports_dmx && hs.supports_xy && hs.supports_rgbcw);
         // A bi-colour studio panel stays bi-colour.
         assert!(!c.identify("NEEWER-SNL660").unwrap().supports_rgb);
+        // cmd_type: TL120C is Infinity (MAC frames); TL21C is direct — and its
+        // hardware-verified overrides hold (FX works via 0x8B; GM is a no-op).
+        assert_eq!(tl.cmd_type, 2);
+        let tl21 = c.identify("NEEWER-TL21C").unwrap();
+        assert_eq!(tl21.cmd_type, 1);
+        assert!(tl21.supports_fx && !tl21.supports_gm && tl21.supports_rgb);
+        assert_eq!((tl21.cct_min, tl21.cct_max), (25, 85));
         // Catalog is now broad (extracted from the Android DeviceConfigInfo table).
         assert!(c.models.len() > 100, "expected the full extracted catalog");
     }

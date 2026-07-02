@@ -16,7 +16,8 @@ neewer-bridge scan --all --seconds 8
 Expected: a table listing BLE devices. The Neewer light shows with `TYPE=Neewer`.
 **Key check:** its MAC column is a real 6-byte address (e.g. `C9:1F:…`), not
 zeros — this confirms btleplug exposes the hardware MAC we bind by. Machine
-form: `neewer-bridge scan --json`.
+form: `neewer-bridge scan --json --all` (keep `--all` in scripts — a plain
+`scan` hides lights already bound in the config).
 
 ## 1. Prove the BLE control path + identify the driver
 

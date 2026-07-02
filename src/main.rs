@@ -1,9 +1,9 @@
 //! Neewer-Bridge CLI entry point.
 //!
-//! Subcommands (milestone 1-2):
-//! - `scan`  — discover Neewer lights, list name / MAC / RSSI.
+//! Key subcommands:
+//! - `scan`  — discover NEW Neewer lights (not in config), list name / MAC / RSSI.
 //! - `test`  — connect to one light by MAC and prove the BLE path (blink + CCT).
-//! - `run`   — run the bridge (not yet implemented; later milestones).
+//! - `run`   — run the full bridge. Also the DEFAULT: no subcommand ⇒ `run`.
 
 use std::path::PathBuf;
 
@@ -25,15 +25,17 @@ struct Cli {
     #[arg(short = 'v', long, global = true, action = ArgAction::Count)]
     verbose: u8,
 
+    /// Subcommand. Omitted ⇒ run the bridge (same as `run`).
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// List BLE adapters (index + name) for the `[ble] adapter` config setting.
     Adapters,
-    /// Scan for Neewer lights and list name / MAC / RSSI.
+    /// Scan for NEW Neewer lights (not already in the config) and list
+    /// name / MAC / RSSI. `--all` shows every device, incl. configured ones.
     Scan {
         /// Scan duration in seconds.
         #[arg(long, default_value_t = 6)]
@@ -141,10 +143,14 @@ enum Command {
         pixel: bool,
         /// Send ONE specific frame and hold it (for guided one-at-a-time testing).
         /// The light keeps the state after disconnect. SPEC is one of:
-        ///   cct:<kelvin>:<bri>            e.g. cct:5600:40
+        ///   cct:<kelvin>:<bri>            e.g. cct:5600:40 (2-byte form)
+        ///   cctgm:<kelvin>:<gm>:<bri>     e.g. cctgm:5600:-50:40 (4-byte GM form, gm -50..50)
         ///   hsi:<hue>:<sat>:<bri>         e.g. hsi:0:100:80   (hue 0-360)
-        ///   xy:<x>:<y>:<bri>              e.g. xy:6400:3300:80 (x,y ×10000)
-        ///   fx:<id>:<bri>                 e.g. fx:12:80        (effect id 1-18)
+        ///   xy:<x>:<y>:<bri>              e.g. xy:6400:3300:80 (x,y ×10000; by-MAC 0xB7)
+        ///   xydirect:<x>:<y>:<bri>        same but the direct 0xB9 form (non-Infinity lights)
+        ///   fx:<id>:<bri>                 e.g. fx:12:80        (effect id 1-18, MAC 0x91)
+        ///   fxdirect:<id>:<bri>           same 18 effects via the direct 0x8B frame
+        ///   scene:<id>:<bri>              old 9-scene 0x88, direct (id 1-9)
         ///   pixel:<hue,hue,...>:<eff>:<speed>  e.g. pixel:0,240:1:40
         ///   pixfx:<id>                    per-effect pixel probe (id 1-10, app defaults)
         ///   rgbcwmac:<r>:<g>:<b>[:cw:ww:bri] RGBCW via by-MAC 0xA9 (production form; rgbcw: = direct 0xA8, ignored)
@@ -159,7 +165,7 @@ enum Command {
     },
     /// Listen for ArtNet and print received ArtDmx packets (no BLE needed).
     Monitor,
-    /// Run the full ArtNet→BLE bridge.
+    /// Run the full ArtNet→BLE bridge (the default when no command is given).
     Run,
 }
 
@@ -181,13 +187,15 @@ async fn main() {
 }
 
 async fn dispatch(cli: &Cli) -> Result<()> {
-    match &cli.command {
+    // No subcommand ⇒ run the bridge (`neewer-bridge` alone just runs).
+    let command = cli.command.as_ref().unwrap_or(&Command::Run);
+    match command {
         // scan/test/monitor don't require a config file — fall back to defaults
         // so the tools work out of the box.
         Command::Adapters => commands::adapters().await,
         Command::Scan { seconds, all, json } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
-            commands::scan(&cfg.ble.adapter, *seconds, *all, *json).await
+            commands::scan(&cfg, *seconds, *all, *json).await
         }
         Command::Add { mac, driver, profile, universe, name, blink, address, cct_min, cct_max } => {
             let cfg = Config::load(&cli.config).unwrap_or_default();

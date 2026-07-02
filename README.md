@@ -63,8 +63,8 @@ neewer-bridge add
 # 3. Review the DMX channel mapping it produced
 neewer-bridge lights
 
-# 4. Run the bridge
-neewer-bridge run
+# 4. Run the bridge (`run` is the default — a bare `neewer-bridge` does the same)
+neewer-bridge
 ```
 
 Point your lighting console / software (QLC+, etc.) at this host's IP on the
@@ -73,21 +73,23 @@ configured ArtNet universe and DMX address.
 ## Commands
 
 ```
-neewer-bridge [--config PATH] [-v|-vv] <COMMAND>
+neewer-bridge [--config PATH] [-v|-vv] [COMMAND]
 ```
+
+No command ⇒ `run` (launching the bare binary starts the bridge).
 
 | Command | What it does |
 |---|---|
 | `adapters` | List BLE adapters (index + name) for the `[ble] adapter` setting. |
 | `models` | List the built-in light-model catalog (what `add` matches against). |
 | `lights` | Show configured lights and their absolute universe + DMX-channel mapping. |
-| `scan` | Discover lights; list name / MAC / RSSI. |
+| `scan` | Discover NEW lights (not already in the config); list name / MAC / RSSI. |
 | `add` | Bind a light to the config (interactive, or non-interactive with `--mac`). |
 | `inspect <MAC>` | Connect and dump a device's full GATT (identify unknown lights). |
 | `test <MAC>` | Connect one light and prove control (blink + CCT, optional colour/mode probes). |
 | `artnet-send` | Send ArtDmx to drive the bridge / a node without a console. |
 | `monitor` | Listen for ArtNet and print received ArtDmx (no BLE needed). |
-| `run` | The full bridge: ArtNet → mapper → per-light BLE actors. |
+| `run` | The full bridge: ArtNet → mapper → per-light BLE actors. **The default** — running `neewer-bridge` with no command does this. |
 
 ### Global flags
 
@@ -113,12 +115,13 @@ valid config.
 
 ### Per-command flags
 
-**`scan`** — discover lights.
+**`scan`** — discover lights. Lights already bound in the config are hidden (a
+note says how many were skipped), so the list only shows what's new to add.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--seconds N` | `6` | Scan duration. |
-| `--all` | off | List every BLE device, not just Neewer lights. |
-| `--json` | off | Machine-readable JSON array (name / mac / rssi / neewer). |
+| `--all` | off | List every BLE device — including already-configured lights (marked) and non-Neewer devices. |
+| `--json` | off | Machine-readable JSON array (name / mac / rssi / neewer / configured). |
 
 **`add`** — bind a light. With **no `--mac`** it runs interactively (scan →
 blink-to-identify → prompts). With **`--mac`** it runs non-interactively
@@ -150,7 +153,7 @@ driver / profile / CCT range are filled automatically; any flag overrides.
 | `--modes` | off | Probe the advanced modes: XY and a few FX effects (MAC-addressed frames). |
 | `--pixel` | off | Probe per-segment PIXEL control (`0xB0`): cycle the 5 working pixel effects (ColorReplacement / Single/Two/Three-ColorMoving / Fire) so distinct bands/animations appear along the tube. TL-series pixel fixtures only (e.g. TL120C). |
 | `--status` | off | Read device status — firmware version, battery, temperature, power/mode — and print the decoded replies. **Non-mutating** (no blink, no colour change), so it's safe to run against a light in use. |
-| `--set SPEC` | — | Send ONE frame and hold it (guided one-at-a-time testing; the light keeps the state after disconnect). `SPEC` = `cct:<K>:<bri>`, `hsi:<hue>:<sat>:<bri>`, `xy:<x>:<y>:<bri>`, `fx:<id>:<bri>`, `pixel:<hue,…>:<eff>:<speed>`, `pixfx:<id>` (raw effect probe 1–10), `rgbcwmac:<r>:<g>:<b>[:<cw>:<ww>:<bri>]` (RGBCW via by-MAC `0xA9` — the production form; `rgbcw:…` = the direct `0xA8`, ignored on the TL120C), or `warmdim` (safe dim-warm end state). |
+| `--set SPEC` | — | Send ONE frame and hold it (guided one-at-a-time testing; the light keeps the state after disconnect). `SPEC` = `cct:<K>:<bri>` (2-byte form), `cctgm:<K>:<gm>:<bri>[:3\|4\|5]` (GM CCT, gm −50..50, optional frame form — default the app's 4-byte), `hsi:<hue>:<sat>:<bri>`, `xy:<x>:<y>:<bri>` (by-MAC `0xB7`), `xydirect:<x>:<y>:<bri>` (direct `0xB9`), `fx:<id>:<bri>` (MAC `0x91`), `fxdirect:<id>:<bri>` (direct `0x8B` — the TL21C's FX path), `scene:<id>:<bri>` (old 9-scene `0x88`), `pixel:<hue,…>:<eff>:<speed>`, `pixfx:<id>` (raw effect probe 1–10), `rgbcwmac:<r>:<g>:<b>[:<cw>:<ww>:<bri>]` (RGBCW via by-MAC `0xA9` — the production form; `rgbcw:…` = the direct `0xA8`, ignored on the TL120C), or `warmdim` (safe dim-warm end state). |
 
 `test` blinks the light 3× (also a visual identify), sets 5600K @ 50%, then runs
 any requested probes. FX and PIXEL latch the light into their mode — `test`
@@ -211,6 +214,11 @@ address  = 1                    # 1-based DMX start channel
 power_on_connect = true         # power the light on when it first connects
 cct_min  = 32                   # CCT range min, raw ×100K (32 = 3200K)
 cct_max  = 56                   # CCT range max, raw ×100K (56 = 5600K; TL120C = 25..100)
+cmd_type = 2                    # advanced-mode frame family (the app's per-model
+                                # commandType): 2 = MAC-embedded XY/RGBCW/FX frames
+                                # (Infinity fixtures like the TL120C); 0/1 = direct
+                                # frames (e.g. TL21C). `add` fills it automatically
+                                # from the model catalog; default 2.
 ```
 
 Add as many `[[lights]]` blocks as you have fixtures. The config is validated on
@@ -313,12 +321,20 @@ ignores it.
 range (`cct_min`/`cct_max`), XY → CIE coordinate 0.0000–0.8000, RGBCW R/G/B/CW/WW →
 raw 0–255, FX-id → 1–18, Speed → 1–10.
 
-> **Hardware notes (verified on the TL120C, an "Infinity"/2.4G fixture):** the XY and
-> **RGBCW** commands are sent as **MAC-addressed** frames (`0xB7` / `0xA9`) — these
-> fixtures ignore the plain direct forms (`0xB9` / `0xA8`). CCT, HSI, XY, RGBCW, FX, and
-> per-segment pixel all work over the direct BLE connection (RGBCW confirmed 2026-07-01:
-> green→blue tracked). Other/older classic fixtures may behave differently — validate
-> per model.
+> **Hardware notes — the frame-form split (`cmd_type`):** whether the advanced-mode
+> commands (XY / RGBCW / FX) are sent as **MAC-embedded** frames (`0xB7`/`0xA9`/`0x91`)
+> or **direct** frames (`0xB9`/`0xA8`/`0x8B`) is per-model — the app's `commandType`,
+> carried in the config's `cmd_type` field (`add` fills it from the catalog).
+> - **TL120C (`cmd_type = 2`, verified 2026-07-01):** needs the MAC forms; ignores the
+>   direct ones. CCT, HSI, XY, RGBCW, FX and per-segment pixel all work direct-BLE.
+> - **TL21C (`cmd_type = 1`, verified 2026-07-02):** the mirror image — ignores every
+>   MAC-embedded control frame; FX renders via the direct `0x8B` only. It has **no
+>   XY/RGBCW/pixel** at all, and its **GM tint is ignored** by the hardware (the
+>   `advanced` profile's XY/RGBCW bands and GM channel are simply inert on it; CCT
+>   2500–8500K, HSI and all 18 FX work).
+>
+> Other fixtures may differ — validate per model (`test --set` probes one frame at a
+> time; see the test flags above).
 
 ## FX effects
 
@@ -374,6 +390,9 @@ series (Infinity) fixtures only; Home (`NH-*`) lights are skipped.
   while a phone app is connected to it**. Close the Neewer app (or disconnect it),
   put the light in Bluetooth/pairing mode, then retry; try `--seconds 12` or
   `--all`.
+- **`scan` doesn't show a light you know is on** — lights already bound in the
+  config are hidden (`scan` lists only new ones); the output notes how many were
+  skipped. Use `--all` to see everything, configured lights marked.
 - **A light doesn't respond to `test`/`run`** — try an explicit `--driver`
   (`infinity` for newer lights, `home` for `NH-*`). Use `-vv` to see BLE writes.
 - **A mode does nothing** — confirm the model supports it (`neewer-bridge

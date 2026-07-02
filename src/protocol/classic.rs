@@ -33,6 +33,10 @@ const TAG_XY_MAC: u8 = 0xB7;
 // the production frame). See [`rgbcw`] / [`rgbcw_mac`].
 const TAG_RGBCW: u8 = 0xA8;
 const TAG_RGBCW_MAC: u8 = 0xA9;
+// Old 9-scene FX (`0x88`) — the classic simple effect family (squad car, ambulance,
+// fire engine, …). Probe-only: dropped by TL120C firmware (§2.1), but non-Infinity
+// (`commandType != 2`) fixtures may honour it where the MAC `0x91` engine is absent.
+const TAG_SCENE: u8 = 0x88;
 
 /// `78 81 01 01 FB`
 pub fn power_on() -> Vec<u8> {
@@ -122,6 +126,14 @@ pub fn xy_mac(mac: [u8; 6], brr: u8, x: u16, y: u16) -> Vec<u8> {
     with_checksum(f)
 }
 
+/// Old 9-scene FX (direct): `78 88 02 <brr> <scene 1..=9> <ck>`
+/// (NeewerLite `Neewer-Light-Protocol.md`; scene ids 1 squad car, 2 ambulance,
+/// 3 fire engine, 4 fireworks, 5 party, 6 candlelight, 7 lightning, 8 paparazzi,
+/// 9 TV screen). Probe-only — see [`TAG_SCENE`].
+pub fn scene(brr: u8, id: u8) -> Vec<u8> {
+    with_checksum(vec![PREFIX, TAG_SCENE, 0x02, brr, id])
+}
+
 /// RGBCW direct (`0xA8`) — the app's `createRGBCWCommand` (cn.java:2728), byte-exact:
 /// `78 A8 07 <brr> <R> <G> <B> <CW> <WW> <decBrr> <ck>` (7 payload bytes, LEN `0x07`).
 /// Args in the app's order: `createRGBCWCommand(brightness, R, G, B, cold, warm,
@@ -198,6 +210,13 @@ mod tests {
     fn hsi_matches_rgb62_capture() {
         // Doc: "7886 040C 0132 3273" -> hue_lo=0C hue_hi=01 (hue=0x010C=268), sat=0x32, brr=0x32
         assert_eq!(hex(&hsi(0x010C, 0x32, 0x32)), "7886040C01323273");
+    }
+
+    #[test]
+    fn scene_frame() {
+        // 78 88 02 <brr> <scene> <ck>; brr=100(0x64), scene 7 (lightning) ->
+        // sum 0x78+0x88+0x02+0x64+0x07 = 0x16D -> ck 0x6D.
+        assert_eq!(hex(&scene(100, 7)), "78880264076D");
     }
 
     #[test]

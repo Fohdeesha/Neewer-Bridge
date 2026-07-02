@@ -100,6 +100,20 @@ pub fn fx(mac: [u8; 6], id: u8, int: u8, cct: u8, gm: i8, hue: u16, sat: u8, spe
     with_checksum(f)
 }
 
+/// Built-in effect (FX), DIRECT form: `78 8B <N> <effId params...> ck` — the same
+/// 18-effect `fx_data` payload without the MAC wrapper. The app sends this via
+/// `setRGBLightValue(EffectType.EFFECT_MODE_OLD=0x8B, len, effectData)`
+/// (cn.java:3458) to devices it writes directly (vs the `0x91`+MAC
+/// `setContinuityRGB1EffectValue` path). TL120C firmware also has an `0x8B`
+/// handler (bengt §2.1). Probe candidate for `commandType != 2` fixtures.
+#[allow(clippy::too_many_arguments)]
+pub fn fx_direct(id: u8, int: u8, cct: u8, gm: i8, hue: u16, sat: u8, speed: u8, extra: u8, val2: u16) -> Vec<u8> {
+    let data = fx_data(id, int, cct, gm, hue, sat, speed, extra, val2);
+    let mut f = vec![PREFIX, SUB_FX, data.len() as u8];
+    f.extend_from_slice(&data);
+    with_checksum(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
