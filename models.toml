@@ -22,8 +22,11 @@
 #                   frame-form dispatch.
 #   supports_rgbcw/xy/dmx, pixel_classify           (extra modes, for future FX work)
 #
-# Hardware-verified overrides (see HW_OVERRIDES in the script): TL21C fx=true
-# (direct 0x8B works live), gm=false (all GM frame forms ignored on hardware).
+# Hardware-verified overrides (see HW_OVERRIDES in the script): TL21C + TL97C
+# fx=true (the 18-effect engine renders via the direct 0x8B frame, live-verified
+# 2026-07-02 / 2026-07-04). NOTE on GM: visual-only "GM dead" verdicts proved
+# unreliable (the shift is subtle) - the TL97C's OLED tracked +/-50 live
+# (2026-07-04), so nj0's haveGM values stand; verify via the fixture's display.
 #
 # driver = classic for all: the bridge connects DIRECTLY over BLE, where the
 # classic 0x78 frames (0x81 power / 0x86 HSI / 0x87 CCT) work - verified on the
@@ -894,7 +897,7 @@ name = "TL21C"
 name_matches = ["TL21C"]
 driver = "classic"
 supports_rgb = true
-supports_gm = false
+supports_gm = true
 cct_min = 25
 cct_max = 85
 cmd_type = 1
@@ -902,7 +905,7 @@ supports_fx = true
 
 [[model]]
 name = "TL60 RGB"
-product_ids = ["20210036", "20230064"]
+product_ids = ["20210036", "20230064", "20240061"]
 name_matches = ["TL60 RGB"]
 driver = "classic"
 supports_rgb = true
@@ -937,6 +940,7 @@ supports_gm = true
 cct_min = 25
 cct_max = 85
 cmd_type = 1
+supports_fx = true
 
 [[model]]
 name = "TL98C"

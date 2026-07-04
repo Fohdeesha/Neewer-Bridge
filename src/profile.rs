@@ -22,6 +22,13 @@ pub enum Profile {
     CctGm,
     /// 3ch: Dimmer, Hue, Sat.
     Hsi,
+    /// 3ch: Red, Green, Blue. Converted to HSI internally (hue/sat from the RGB
+    /// ratio, brightness = the max component), so it works on EVERY colour fixture
+    /// — including models with no native RGBCW mode (e.g. the TL21C). Lays out onto
+    /// an openHAB DMX `color` thing (3ch) with no white channels and no rules.
+    /// White = desaturated HSI rendered through the RGB engine; for dedicated
+    /// CW/WW LED banks use `rgbcw` instead.
+    Rgb,
     /// 5ch: Red, Green, Blue, Cool-White, Warm-White. Standard 8-bit values (0..=255)
     /// passed **straight through** to the light's native RGBCW mode — one DMX channel
     /// per physical LED bank, no colour-space conversion. Lays out exactly onto an
@@ -46,6 +53,7 @@ impl Profile {
             "cct" => Some(Profile::Cct),
             "cct_gm" => Some(Profile::CctGm),
             "hsi" => Some(Profile::Hsi),
+            "rgb" => Some(Profile::Rgb),
             "rgbcw" => Some(Profile::Rgbcw),
             "full" => Some(Profile::Full),
             "advanced" => Some(Profile::Advanced),
@@ -60,6 +68,7 @@ impl Profile {
             Profile::Cct => "cct",
             Profile::CctGm => "cct_gm",
             Profile::Hsi => "hsi",
+            Profile::Rgb => "rgb",
             Profile::Rgbcw => "rgbcw",
             Profile::Full => "full",
             Profile::Advanced => "advanced",
@@ -71,7 +80,7 @@ impl Profile {
     pub fn channel_count(&self) -> u16 {
         match self {
             Profile::Cct => 2,
-            Profile::Hsi | Profile::CctGm => 3,
+            Profile::Hsi | Profile::CctGm | Profile::Rgb => 3,
             Profile::Full | Profile::Rgbcw => 5,
             Profile::Advanced => 10,
             // 1 Dimmer + 1 Effect + 1 Speed + 1 Direction + PIXEL_SEGMENTS × (Hue, Sat).
@@ -88,6 +97,7 @@ impl Profile {
             Profile::Cct => &["Dimmer", "CCT"],
             Profile::CctGm => &["Dimmer", "CCT", "GM"],
             Profile::Hsi => &["Dimmer", "Hue", "Saturation"],
+            Profile::Rgb => &["Red", "Green", "Blue"],
             Profile::Rgbcw => &["Red", "Green", "Blue", "Cool White", "Warm White"],
             Profile::Full => &[
                 "Dimmer",
@@ -188,6 +198,30 @@ fn sat_value(dmx: u8) -> u8 {
     scale_to(dmx, 100) as u8
 }
 
+/// RGB → HSI: hue 0..=359, sat 0..=100, brightness 0..=100. Standard HSV
+/// derivation (value = max component), integer math with rounding.
+fn rgb_to_hsi(r: u8, g: u8, b: u8) -> (u16, u8, u8) {
+    let (r, g, b) = (r as i32, g as i32, b as i32);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let bri = ((max * 100 + 127) / 255) as u8;
+    let sat = if max == 0 { 0 } else { ((delta * 100 + max / 2) / max) as u8 };
+    let hue = if delta == 0 {
+        0
+    } else {
+        let h = if max == r {
+            60 * (g - b) / delta
+        } else if max == g {
+            60 * (b - r) / delta + 120
+        } else {
+            60 * (r - g) / delta + 240
+        };
+        h.rem_euclid(360) as u16
+    };
+    (hue, sat, bri)
+}
+
 /// FX effect-select: DMX 0..=255 → effect id 1..=18.
 #[inline]
 fn fx_select(dmx: u8) -> u8 {
@@ -251,6 +285,17 @@ pub fn map_dmx(profile: Profile, slice: &[u8], cct: CctRange) -> LightState {
             st.brightness = brightness_value(ch(0));
             st.hue = hue_value(ch(1));
             st.sat = sat_value(ch(2));
+        }
+        Profile::Rgb => {
+            // Plain 3ch RGB, converted to HSI — drives the light's HSI mode, which
+            // every colour fixture honours (incl. non-RGBCW models like the TL21C).
+            // Level rides in the channel values (brightness = max component), so an
+            // openHAB `color` thing is the only patch needed.
+            st.mode = Mode::Hsi;
+            let (hue, sat, bri) = rgb_to_hsi(ch(0), ch(1), ch(2));
+            st.hue = hue;
+            st.sat = sat;
+            st.brightness = bri;
         }
         Profile::Rgbcw => {
             // Native RGBCW passthrough: five raw channels straight into the by-MAC
@@ -370,6 +415,7 @@ mod tests {
         assert_eq!(Profile::Cct.channel_count(), 2);
         assert_eq!(Profile::CctGm.channel_count(), 3);
         assert_eq!(Profile::Hsi.channel_count(), 3);
+        assert_eq!(Profile::Rgb.channel_count(), 3);
         assert_eq!(Profile::Rgbcw.channel_count(), 5);
         assert_eq!(Profile::Full.channel_count(), 5);
     }
@@ -390,6 +436,36 @@ mod tests {
         // Short slice is defensive: missing white channels read as 0.
         let s = map_dmx(Profile::Rgbcw, &[255, 0, 0], CctRange::default());
         assert_eq!((s.r, s.g, s.b, s.cw, s.ww), (255, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn rgb_profile_converts_to_hsi() {
+        // Pure red → hue 0, full sat, full brightness.
+        let red = map_dmx(Profile::Rgb, &[255, 0, 0], CctRange::default());
+        assert_eq!(red.mode, Mode::Hsi);
+        assert!(red.power);
+        assert_eq!((red.hue, red.sat, red.brightness), (0, 100, 100));
+
+        // Pure green / blue hit their HSV sector centres.
+        let green = map_dmx(Profile::Rgb, &[0, 255, 0], CctRange::default());
+        assert_eq!((green.hue, green.sat, green.brightness), (120, 100, 100));
+        let blue = map_dmx(Profile::Rgb, &[0, 0, 255], CctRange::default());
+        assert_eq!((blue.hue, blue.sat, blue.brightness), (240, 100, 100));
+
+        // White = desaturated; level rides in the channel values.
+        let white = map_dmx(Profile::Rgb, &[255, 255, 255], CctRange::default());
+        assert_eq!((white.sat, white.brightness), (0, 100));
+        let half = map_dmx(Profile::Rgb, &[128, 128, 128], CctRange::default());
+        assert_eq!((half.sat, half.brightness), (0, 50));
+
+        // Black → brightness 0 (dark, but power stays on per the locked decisions).
+        let black = map_dmx(Profile::Rgb, &[0, 0, 0], CctRange::default());
+        assert_eq!(black.brightness, 0);
+        assert!(black.power);
+
+        // Magenta (max = r, g < b) wraps via rem_euclid instead of going negative.
+        let magenta = map_dmx(Profile::Rgb, &[255, 0, 255], CctRange::default());
+        assert_eq!((magenta.hue, magenta.sat), (300, 100));
     }
 
     #[test]

@@ -142,8 +142,8 @@ pub fn lights(cfg: &config::Config) -> Result<()> {
             "\n  `advanced` Mode-select (ch1) value bands — selects how ch3+ are read:\n   \
              0-31 CCT (ch3 CCT, ch4 GM) · 32-63 HSI (ch3 Hue, ch4 Sat) ·\n   \
              64-95 FX (ch3 FX-id 1-18, ch4 Speed, ch5 CCT, ch6 Hue, ch7 Sat/GM, ch8 Extra, ch9 2nd-val) ·\n   \
-             192-231 XY (ch3 X, ch4 Y).\n   \
-             Other bands (incl. RGBCW 128-159, ignored over direct BLE) → neutral white."
+             128-159 RGBCW (ch3-7 R,G,B,CW,WW; needs an RGBCW fixture) · 192-231 XY (ch3 X, ch4 Y).\n   \
+             Other bands (GEL 96-127, Pixel 160-191, 232-255) → neutral white."
         );
     }
     Ok(())

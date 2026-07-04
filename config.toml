@@ -57,7 +57,9 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 # mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)
 # name     = "Key light"          # optional label
 # driver   = "auto"               # auto | classic | infinity | home
-# profile  = "advanced"           # cct | cct_gm | hsi | rgbcw | full | advanced | pixel (NOTES.md §8.1)
+# profile  = "advanced"           # cct | cct_gm | hsi | rgb | rgbcw | full | advanced | pixel (NOTES.md §8.1)
+#                                 # `rgb` (3ch) = plain R,G,B converted to HSI — works on EVERY
+#                                 #   colour light (one openHAB 3ch color thing, no rules)
 #                                 # `rgbcw` (5ch) = direct R,G,B,CW,WW passthrough — maps onto
 #                                 #   openHAB's DMX color (3ch) + tunablewhite (2ch) things
 #                                 # `advanced` (10ch) = mode-channel: CCT/HSI/FX/RGBCW/XY
@@ -111,6 +113,40 @@ driver = "classic"
 profile = "advanced"
 universe = 0
 address = 16
+power_on_connect = true
+cct_min = 25
+cct_max = 85
+cmd_type = 1
+
+# TL60 RGB (unit "RGB-3" revision, fw 3.0.5; HW-tested 2026-07-03): CCT 2500-10000K
+# + GM (works over BLE — first fixture confirmed!) + HSI + RGBCW (by-MAC 0xA9, incl.
+# CW/WW banks) + FX (both 0x91 MAC and direct 0x8B render) + pixel effects 1/3/4/5/7
+# (same 5 as the TL120C; it's a 7-effect classify-1 model). No XY — that advanced-
+# profile band is inert. `pixel` profile also works if preferred.
+[[lights]]
+mac = "F9:B8:B6:15:F9:8D"
+name = "TL60"
+driver = "classic"
+profile = "advanced"
+universe = 0
+address = 26
+power_on_connect = true
+cct_min = 25
+cct_max = 100
+cmd_type = 2
+
+# TL97C (HW-tested 2026-07-04): CCT 2500-8500K + GM (works — subtle render, the
+# OLED tracks it) + HSI + FX (direct 0x8B via cmd_type=1; MAC 0x91 ignored) — a
+# TL21C capability twin. No XY/RGBCW/pixel (all ignored), and NO status-read
+# replies (not even battery). `rgb` = 3ch R,G,B -> HSI for openHAB; switch to
+# `advanced` if CCT/GM/FX are ever wanted over DMX.
+[[lights]]
+mac = "F2:43:CF:E2:23:D2"
+name = "TL97C"
+driver = "classic"
+profile = "rgb"
+universe = 0
+address = 36
 power_on_connect = true
 cct_min = 25
 cct_max = 85

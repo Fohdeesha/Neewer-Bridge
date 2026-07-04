@@ -14,10 +14,11 @@ protocol. CLI, config-file driven, runs on **Windows and Linux**.
 - **141-model capability catalog** so `add` auto-fills a light's driver, profile,
   and CCT range from its Bluetooth name.
 
-> Status: hardware-validated end-to-end on a Neewer TL120C — CCT, HSI, XY, RGBCW, FX,
-> and per-segment pixel all confirmed over a direct BLE connection. (XY and RGBCW use
-> MAC-addressed frames; the TL120C ignores their direct forms.) See `NOTES.md` for the
-> full design, protocol reverse-engineering, and reliability notes.
+> Status: hardware-validated end-to-end on a Neewer TL120C, TL21C and TL60 RGB —
+> CCT, HSI, XY, RGBCW, GM, FX, and per-segment pixel all confirmed over a direct BLE
+> connection (per-model: each fixture supports a different subset — see the
+> hardware notes below). See `NOTES.md` for the full design, protocol
+> reverse-engineering, and reliability notes.
 
 ## Contents
 
@@ -133,7 +134,7 @@ driver / profile / CCT range are filled automatically; any flag overrides.
 | `--universe N` | with `--mac` | ArtNet universe / Port-Address (0–32767). |
 | `--address N` | with `--mac` | 1-based DMX start channel. |
 | `--driver D` | — | `auto`\|`classic`\|`infinity`\|`home` (default: from model). |
-| `--profile P` | — | `cct`\|`cct_gm`\|`hsi`\|`rgbcw`\|`full`\|`advanced`\|`pixel` (default: from model). |
+| `--profile P` | — | `cct`\|`cct_gm`\|`hsi`\|`rgb`\|`rgbcw`\|`full`\|`advanced`\|`pixel` (default: from model). |
 | `--name X` | — | Label (default: model name). |
 | `--cct-min N` | — | CCT range min, raw ×100K (default: from model). |
 | `--cct-max N` | — | CCT range max, raw ×100K (default: from model). |
@@ -208,7 +209,7 @@ max_files     = 5       # rotated files to keep
 mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)
 name     = "Key light"          # optional label
 driver   = "auto"               # auto | classic | infinity | home
-profile  = "advanced"           # cct | cct_gm | hsi | rgbcw | full | advanced | pixel
+profile  = "advanced"           # cct | cct_gm | hsi | rgb | rgbcw | full | advanced | pixel
 universe = 0                    # ArtNet 15-bit Port-Address (Net/Sub-Net/Universe)
 address  = 1                    # 1-based DMX start channel
 power_on_connect = true         # power the light on when it first connects
@@ -237,6 +238,7 @@ externally to turn them off).
 | `cct`      | 2  | 1 Dimmer · 2 CCT |
 | `cct_gm`   | 3  | 1 Dimmer · 2 CCT · 3 GM |
 | `hsi`      | 3  | 1 Dimmer · 2 Hue · 3 Saturation |
+| `rgb`      | 3  | 1 Red · 2 Green · 3 Blue — converted to HSI internally (below) |
 | `rgbcw`    | 5  | 1 Red · 2 Green · 3 Blue · 4 Cool White · 5 Warm White — direct (below) |
 | `full`     | 5  | 1 Dimmer · 2 **Mode** · 3 CCT/Hue · 4 GM/Sat · 5 reserved |
 | `advanced` | 10 | 1 **Mode-select** · 2 Dimmer · 3–10 mode-specific (below) |
@@ -244,6 +246,21 @@ externally to turn them off).
 
 For **`full`**, the Mode channel (ch2) selects sub-mode live: `0–127` = CCT
 (ch3=CCT, ch4=GM), `128–255` = HSI (ch3=Hue, ch4=Saturation).
+
+For **`rgb`** (opt-in; any colour-capable model), three channels carry plain
+R, G, B and the bridge converts them to HSI internally (hue/sat from the RGB
+ratio, brightness = the max component). Because it drives the light's ordinary
+HSI mode, it works on **every** colour fixture — including models with no native
+RGBCW mode, such as the TL21C. In openHAB each light is a single 3-channel DMX
+`color` thing, no white channels and no rules; white renders as desaturated HSI
+through the RGB engine (for the dedicated CW/WW LED banks use `rgbcw` instead):
+
+```
+// things — one 3ch color thing per light
+color tl60_rgb [ dmxid="21/3", fadetime=0 ]
+// items
+Color TL60_Colour "TL60 Colour" { channel="dmx:color:neewer:tl60_rgb:color" }
+```
 
 For **`rgbcw`** (opt-in; RGBCW-capable models such as the TL120C), five channels are
 passed **straight through** to the light's native RGBCW mode — Red, Green, Blue,
@@ -298,9 +315,9 @@ For **`pixel`** (TL-series pixel fixtures such as the TL120C, **20 channels**), 
 tube is split into **8 addressable segments**. ch1 = master Dimmer, ch2 =
 **Effect-select**, ch3 = Speed/motion, ch4 = Direction, then ch5–ch20 are 8 ×
 (Hue, Sat) pairs (seg1 Hue, seg1 Sat, seg2 Hue, …). The Effect channel picks the
-pixel effect by value band — only the **5 effects that work over direct BLE** on
-the TL120C are exposed (hardware-verified; the app's other 5 pixel effects are
-ignored unless relayed through a 2.4G hub):
+pixel effect by value band — only the **5 effects that work over direct BLE** are
+exposed (hardware-verified on the TL120C and TL60; of the 7 effect types these
+models have, the other 2 are ignored unless relayed through a 2.4G hub):
 
 | ch2 band | Effect | Segment meaning |
 |---|---|---|
@@ -329,12 +346,22 @@ raw 0–255, FX-id → 1–18, Speed → 1–10.
 >   direct ones. CCT, HSI, XY, RGBCW, FX and per-segment pixel all work direct-BLE.
 > - **TL21C (`cmd_type = 1`, verified 2026-07-02):** the mirror image — ignores every
 >   MAC-embedded control frame; FX renders via the direct `0x8B` only. It has **no
->   XY/RGBCW/pixel** at all, and its **GM tint is ignored** by the hardware (the
->   `advanced` profile's XY/RGBCW bands and GM channel are simply inert on it; CCT
->   2500–8500K, HSI and all 18 FX work).
+>   XY/RGBCW/pixel** at all (those `advanced` bands are simply inert on it; CCT
+>   2500–8500K, GM, HSI and all 18 FX work). Its GM was first mis-recorded as
+>   "ignored" — the ±50 tint shift is just visually subtle (see the TL97C note).
+> - **TL60 RGB (`cmd_type = 2`, verified 2026-07-03):** CCT 2500–10000K, **GM works**
+>   (green/magenta tint renders over BLE), HSI, RGBCW (`0xA9`, incl. the CW/WW white
+>   banks), all 18 FX (honours **both** the MAC `0x91` and direct `0x8B` forms), and
+>   the same 5 pixel effects as the TL120C. **No XY** (both frame forms ignored; that
+>   `advanced` band is inert on it).
+> - **TL97C (`cmd_type = 1`, verified 2026-07-04):** a TL21C capability twin — CCT
+>   2500–8500K, GM, HSI and all 18 FX work (FX via the direct `0x8B` only); no
+>   XY/RGBCW/pixel, and it answers **no status reads at all** (not even battery).
 >
 > Other fixtures may differ — validate per model (`test --set` probes one frame at a
-> time; see the test flags above).
+> time; see the test flags above). **GM caution:** the ±50 tint swing renders subtly —
+> confirm GM on the fixture's display, not by eye (an eyeball-only probe once
+> mis-labelled the TL21C "no GM").
 
 ## FX effects
 

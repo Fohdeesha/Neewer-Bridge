@@ -202,11 +202,13 @@ mod tests {
         // A bi-colour studio panel stays bi-colour.
         assert!(!c.identify("NEEWER-SNL660").unwrap().supports_rgb);
         // cmd_type: TL120C is Infinity (MAC frames); TL21C is direct — and its
-        // hardware-verified overrides hold (FX works via 0x8B; GM is a no-op).
+        // hardware-verified override holds (FX works via 0x8B). GM stays true:
+        // the 2026-07-02 "GM no-op" verdict was retracted 2026-07-04 (subtle
+        // render; the TL97C's OLED tracked ±50 — nj0's haveGM is right).
         assert_eq!(tl.cmd_type, 2);
         let tl21 = c.identify("NEEWER-TL21C").unwrap();
         assert_eq!(tl21.cmd_type, 1);
-        assert!(tl21.supports_fx && !tl21.supports_gm && tl21.supports_rgb);
+        assert!(tl21.supports_fx && tl21.supports_gm && tl21.supports_rgb);
         assert_eq!((tl21.cct_min, tl21.cct_max), (25, 85));
         // Catalog is now broad (extracted from the Android DeviceConfigInfo table).
         assert!(c.models.len() > 100, "expected the full extracted catalog");
