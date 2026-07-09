@@ -46,6 +46,20 @@ pub fn state(mac: [u8; 6]) -> Vec<u8> {
     with_checksum(f)
 }
 
+/// Streamer-support query (`0xC4`) → reply `0x17` (`78 17 07 <MAC6> <supported>`).
+///
+/// **TL60-specific**: the TL60 answers this live (`streamer_support_query`, bengt/
+/// verygeeky `frames.py`; reply decoded there as `R_STREAMER_SUPPORT`), while the
+/// TL120C ignores it. The bridge doesn't act on the *value* — it's here purely so a
+/// TL60, which does **not** answer the battery/version/state reads the other models
+/// do, still produces a notify. That notify is what the per-light actor's liveness
+/// probe needs to prove the command path is alive (see `light.rs`).
+pub fn streamer_support(mac: [u8; 6]) -> Vec<u8> {
+    let mut f = vec![PREFIX, 0xC4, 0x06];
+    f.extend_from_slice(&mac);
+    with_checksum(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +98,12 @@ mod tests {
         // trailing 0x85 before the checksum.
         assert_mac_frame(&state(MAC), 0x8E, 0x07, &[0x85]);
         assert_eq!(state(MAC).len(), 11);
+    }
+
+    #[test]
+    fn streamer_support_frame() {
+        // 78 C4 06 <MAC6> ck — same shape as the other MAC reads (bengt/verygeeky).
+        assert_mac_frame(&streamer_support(MAC), 0xC4, 0x06, &[]);
+        assert_eq!(streamer_support(MAC).len(), 10);
     }
 }

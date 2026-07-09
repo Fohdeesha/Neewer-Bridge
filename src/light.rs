@@ -5,15 +5,27 @@
 //! - power on (if configured),
 //! - **coalescing flush:** at `flush_hz`, send the latest desired `LightState`
 //!   only if it changed (handles the ArtNet-44Hz → BLE rate mismatch),
-//! - **stale-session detection (NOTES.md §5):** periodic non-mutating read
-//!   probe; after repeated failures, recycle the connection,
+//! - **stale-session detection (NOTES.md §5):** these are two-chip lights — a
+//!   BLE-UART radio module in front of the LED-MCU that runs the `0x78` parser —
+//!   so a successful `write-without-response` (no ACK) or a generic GATT read
+//!   only proves the *radio* is up; the command path can be wedged while the
+//!   light sits at its last colour ignoring everything (observed on the TL60 a
+//!   few hours in). So for a fixture that answers status queries we require a
+//!   **notify reply to a periodic canary** (proves the LED-MCU, not just the
+//!   radio); after repeated misses, recycle. The canary asks several ways
+//!   (battery `0x95` for the TL120C/TL21C, streamer-support `0xC4` for the TL60)
+//!   so most models produce *some* reply. A fixture that answers *nothing* is
+//!   genuinely deaf (e.g. the TL97C) — it falls back to the GATT read (deaf ≠
+//!   dead, don't drop-cycle it) **plus a periodic forced reconnect**
+//!   (`[ble] refresh_secs`), the only thing that can clear a wedge on a light we
+//!   can't verify.
 //! - reconnect with backoff, indefinitely.
 //!
 //! Because binding is by MAC and the actor exists for the whole process
 //! lifetime, the DMX→light mapping is stable regardless of power-on/discovery
 //! order — a light that's currently absent simply keeps retrying.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use btleplug::api::Characteristic;
@@ -45,6 +57,7 @@ pub struct LightActor {
     rx: watch::Receiver<LightState>,
     flush_hz: u32,
     probe_secs: u64,
+    refresh_secs: u64,
 }
 
 impl LightActor {
@@ -54,8 +67,9 @@ impl LightActor {
         rx: watch::Receiver<LightState>,
         flush_hz: u32,
         probe_secs: u64,
+        refresh_secs: u64,
     ) -> Self {
-        Self { cfg, adapter, rx, flush_hz, probe_secs }
+        Self { cfg, adapter, rx, flush_hz, probe_secs, refresh_secs }
     }
 
     fn label(&self) -> String {
@@ -126,13 +140,26 @@ impl LightActor {
         // we don't probe before the link has settled.
         probe.tick().await;
 
+        // Fallback liveness signal, used ONLY for a fixture that never notifies
+        // (the notify reply is a strictly stronger signal — it proves the LED-MCU,
+        // not just the radio that answers this read). See the probe arm.
         let read_char = ble::find_readable_char(p);
         if read_char.is_none() {
-            warn!(light = %label, "no readable characteristic; stale-session detection degraded to is_connected() only");
+            debug!(light = %label, "no readable characteristic; a fixture that also never notifies falls back to is_connected() only");
         }
 
         let mut last_sent: Option<LightState> = None;
         let mut failures: u32 = 0;
+        // Liveness signal (see the module docs + the probe arm below). `ever_replied`
+        // latches once the light sends any notify — until then it's treated as
+        // "deaf, maybe alive" and probed via the GATT read. `last_reply_at` is the
+        // monotonic time of the most recent notify; `probe_query_at` is when we last
+        // issued the canary. A reply newer than the last canary proves the link.
+        let mut ever_replied = false;
+        let mut last_reply_at: Option<Instant> = None;
+        let mut probe_query_at: Option<Instant> = None;
+        // When this session connected — drives the deaf-fixture periodic refresh.
+        let session_start = Instant::now();
         let rssi0 = ble::rssi(p).await;
         info!(
             light = %label,
@@ -159,7 +186,11 @@ impl LightActor {
         };
         let mut status = StatusCache::default();
         if let Some(mac) = query_mac {
-            send_status_queries(p, &chars.write, mac, true).await;
+            // The initial full query doubles as the first canary; a reply to it
+            // (landing on the notify arm) is what proves the link on the first probe.
+            if send_status_queries(p, &chars.write, mac, true).await {
+                probe_query_at = Some(Instant::now());
+            }
         }
 
         loop {
@@ -211,27 +242,59 @@ impl LightActor {
                     if !ble::is_connected(p).await {
                         bail!("peripheral reports disconnected");
                     }
-                    if let Some(rc) = &read_char {
-                        if ble::probe_read(p, rc, PROBE_TIMEOUT).await {
-                            if failures > 0 {
-                                debug!(light = %label, "liveness restored");
-                            }
-                            failures = 0;
-                            debug!(light = %label, rssi = ?rssi, "liveness ok");
-                        } else {
-                            failures += 1;
-                            warn!(light = %label, failures, rssi = ?rssi, "liveness probe failed");
-                            if failures >= MAX_PROBE_FAILURES {
-                                bail!("stale session: {failures} consecutive probe failures");
-                            }
-                        }
-                    } else {
-                        debug!(light = %label, rssi = ?rssi, "alive (is_connected; no readable char)");
+
+                    // Deaf-fixture safety net (the TL60 case): a fixture that never
+                    // sends a notify can't be actively verified, yet it can wedge while
+                    // still "connected" — writes succeed into it and the radio keeps
+                    // answering the GATT read, so NO passive probe sees the stall. Bound
+                    // it by forcing a clean reconnect every `refresh_secs`. Only applies
+                    // while `ever_replied` is false; a fixture that answers is verified
+                    // by the reply-gate below and never force-refreshed.
+                    if !ever_replied
+                        && self.refresh_secs > 0
+                        && session_start.elapsed().as_secs() >= self.refresh_secs
+                    {
+                        info!(light = %label, refresh_secs = self.refresh_secs,
+                              "refreshing unverifiable (never-replied) link to clear any wedged-but-connected state");
+                        bail!("periodic refresh of a deaf fixture");
                     }
-                    // Refresh battery + temperature alongside the liveness probe; the
-                    // replies arrive on the notify stream and are logged there.
+
+                    // Liveness. For a fixture that answers status queries, require a
+                    // notify reply newer than our last canary — that proves the LED-MCU
+                    // command path, which a `write-without-response` or a radio-answered
+                    // GATT read can NOT (the wedged-command-path / half-open-link case).
+                    // A fixture that has never notified can't be told apart from one
+                    // that's simply deaf, so it falls back to the GATT read.
+                    let satisfied = if ever_replied {
+                        liveness_by_reply(last_reply_at, probe_query_at)
+                    } else {
+                        match &read_char {
+                            Some(rc) => ble::probe_read(p, rc, PROBE_TIMEOUT).await,
+                            None => true, // nothing readable + never notified: is_connected() only
+                        }
+                    };
+
+                    if satisfied {
+                        if failures > 0 {
+                            debug!(light = %label, "liveness restored");
+                        }
+                        failures = 0;
+                        debug!(light = %label, rssi = ?rssi, ever_replied, "liveness ok");
+                    } else {
+                        failures += 1;
+                        warn!(light = %label, failures, rssi = ?rssi, ever_replied, "liveness probe failed");
+                        if failures >= MAX_PROBE_FAILURES {
+                            bail!("stale session: {failures} consecutive liveness misses (no reply to canary)");
+                        }
+                    }
+
+                    // Issue this cycle's canary (battery + temperature). Replies land on
+                    // the notify arm and advance `last_reply_at`; a reply-capable light
+                    // that stops answering these is exactly the half-open case above.
                     if let Some(mac) = query_mac {
-                        send_status_queries(p, &chars.write, mac, false).await;
+                        if send_status_queries(p, &chars.write, mac, false).await {
+                            probe_query_at = Some(Instant::now());
+                        }
                     }
                 }
                 // Status replies (battery/temp/version/state) pushed on the notify
@@ -244,9 +307,23 @@ impl LightActor {
                     }
                 } => {
                     match notification {
-                        Some(n) => log_status(label, &n.value, &mut status),
+                        Some(n) => {
+                            // Any frame on the notify char is the LED-MCU (through the
+                            // radio) proving the command path is alive — the liveness
+                            // signal a reply-capable fixture is judged by.
+                            ever_replied = true;
+                            last_reply_at = Some(Instant::now());
+                            log_status(label, &n.value, &mut status);
+                        }
                         None => {
-                            debug!(light = %label, "notify stream ended");
+                            // Stream closed (normally = disconnect). Stop polling it and
+                            // let the two existing signals recover us rather than bailing
+                            // straight away — a hair-trigger reconnect here risks a tight
+                            // loop if the backend ever closes a stream on a live link. On a
+                            // reply-capable fixture the replies now stop, so the probe arm's
+                            // reply-gate recycles the session within a few probe cycles; a
+                            // real disconnect is caught by `is_connected()` on the next tick.
+                            debug!(light = %label, ever_replied, "notify stream ended; relying on liveness probe to recover");
                             notif = None;
                         }
                     }
@@ -304,12 +381,26 @@ fn log_status(label: &str, data: &[u8], cache: &mut StatusCache) {
     }
 }
 
-/// Best-effort MAC-addressed status queries. Replies land on the notify stream (see
-/// [`log_status`]). `full` adds the version + state reads (used once per session);
-/// otherwise just battery + temperature (polled). Failures are non-fatal — the
-/// liveness probe owns link health, not these reads.
-async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6], full: bool) {
-    let mut frames = vec![queries::battery(mac), queries::temperature(mac)];
+/// Best-effort MAC-addressed status queries, doubling as the liveness canary.
+/// Replies land on the notify stream (see [`log_status`]) and advance the actor's
+/// `last_reply_at`. `full` adds the version + state reads (used once per session);
+/// otherwise just battery + temperature (polled). **Battery (`0x95`) is the
+/// universal canary** — the only read every reply-capable model answers (it's the
+/// sole reply the TL21C gives; the TL60/TL120C answer it too). Returns `true` if
+/// every frame was written (so the caller can time the canary), `false` if a write
+/// failed. A write failure is itself non-fatal here — link health is decided by the
+/// probe arm, which will see the missing reply.
+async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6], full: bool) -> bool {
+    // Battery (0x95) is the canary for the TL120C/TL21C; streamer-support (0xC4) is
+    // the canary for the TL60 (which answers neither battery nor version/state — see
+    // queries::streamer_support). Sending both makes the canary model-agnostic: a
+    // reply to *either* proves the link. Temperature is telemetry (these models don't
+    // answer it, so it isn't a canary).
+    let mut frames = vec![
+        queries::battery(mac),
+        queries::streamer_support(mac),
+        queries::temperature(mac),
+    ];
     if full {
         frames.push(queries::version(mac));
         frames.push(queries::state(mac));
@@ -317,8 +408,64 @@ async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6
     for f in &frames {
         if ble::write_command(p, write, f).await.is_err() {
             debug!("status query write failed (non-fatal)");
-            return;
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    true
+}
+
+/// Whether a reply-capable fixture's link is proven live this probe cycle: it has
+/// sent a notify (`last_reply_at`) at least as recent as the canary we last issued
+/// (`probe_query_at`). Pure so it can be unit-tested without a radio.
+///
+/// - No canary issued yet (`probe_query_at == None`) ⇒ satisfied (nothing to answer).
+/// - A reply at/after the last canary ⇒ satisfied (link proven).
+/// - The canary went unanswered (reply older than it, or none) ⇒ not satisfied.
+fn liveness_by_reply(last_reply_at: Option<Instant>, probe_query_at: Option<Instant>) -> bool {
+    match probe_query_at {
+        Some(queried) => last_reply_at.is_some_and(|reply| reply >= queried),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::liveness_by_reply;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn no_canary_issued_yet_is_satisfied() {
+        // Before the first canary there is nothing to answer, so never a miss —
+        // regardless of whether a reply has been seen.
+        assert!(liveness_by_reply(None, None));
+        assert!(liveness_by_reply(Some(Instant::now()), None));
+    }
+
+    #[test]
+    fn reply_after_canary_is_satisfied() {
+        let queried = Instant::now();
+        let reply = queried + Duration::from_millis(200); // healthy: answered ~200 ms later
+        assert!(liveness_by_reply(Some(reply), Some(queried)));
+    }
+
+    #[test]
+    fn reply_at_same_instant_is_satisfied() {
+        let t = Instant::now(); // `reply >= queried` is inclusive
+        assert!(liveness_by_reply(Some(t), Some(t)));
+    }
+
+    #[test]
+    fn stale_reply_before_canary_is_a_miss() {
+        // The wedge case: the light answered earlier but the latest canary got no
+        // reply, so the newest reply predates it.
+        let reply = Instant::now();
+        let queried = reply + Duration::from_secs(20);
+        assert!(!liveness_by_reply(Some(reply), Some(queried)));
+    }
+
+    #[test]
+    fn canary_with_no_reply_is_a_miss() {
+        assert!(!liveness_by_reply(None, Some(Instant::now())));
     }
 }

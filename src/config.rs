@@ -45,6 +45,15 @@ pub struct Ble {
     /// Liveness RSSI-probe interval, seconds (stale-session detection).
     #[serde(default = "default_probe_secs")]
     pub probe_secs: u64,
+    /// Force-reconnect interval (seconds) for a fixture that can't be liveness-
+    /// verified — one that never answers a status query, so it sends no notify the
+    /// probe can check (e.g. the TL60). Such a light can wedge while still
+    /// "connected" (writes keep succeeding into it and the radio still answers the
+    /// GATT read), which no passive probe can detect; a periodic clean reconnect
+    /// bounds that. `0` disables it. A fixture that *does* reply is covered by the
+    /// notify-reply liveness probe and is never force-refreshed.
+    #[serde(default = "default_refresh_secs")]
+    pub refresh_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -134,6 +143,7 @@ impl Default for Ble {
             adapter: default_adapter(),
             flush_hz: default_flush_hz(),
             probe_secs: default_probe_secs(),
+            refresh_secs: default_refresh_secs(),
         }
     }
 }
@@ -170,6 +180,9 @@ fn default_flush_hz() -> u32 {
 }
 fn default_probe_secs() -> u64 {
     20
+}
+fn default_refresh_secs() -> u64 {
+    900
 }
 /// Default CCT scaling range (raw ×100K): 3200K..5600K, the common bi-color span.
 pub const DEFAULT_CCT_MIN: u8 = 32;

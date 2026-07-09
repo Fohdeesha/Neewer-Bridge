@@ -60,8 +60,14 @@ pub async fn run(cfg: Config) -> Result<()> {
         universe_map.entry(light.universe).or_default().push(sink.clone());
         all_sinks.push(sink);
 
-        let actor =
-            LightActor::new(light.clone(), adapter.clone(), rx, cfg.ble.flush_hz, cfg.ble.probe_secs);
+        let actor = LightActor::new(
+            light.clone(),
+            adapter.clone(),
+            rx,
+            cfg.ble.flush_hz,
+            cfg.ble.probe_secs,
+            cfg.ble.refresh_secs,
+        );
         tokio::spawn(actor.run());
     }
 

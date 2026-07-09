@@ -190,9 +190,11 @@ bind_ip = "0.0.0.0"   # interface to receive ArtNet on (0.0.0.0 = all)
 port    = 6454        # standard ArtNet port (configurable)
 
 [ble]
-adapter    = "default"  # "default", an index ("0"), or a name substring
-flush_hz   = 15         # max BLE state updates per light per second (coalescing cap)
-probe_secs = 20         # liveness GATT-probe interval (stale-session detection)
+adapter     = "default" # "default", an index ("0"), or a name substring
+flush_hz    = 15        # max BLE state updates per light per second (coalescing cap)
+probe_secs  = 20        # liveness-probe / status-query interval (stale-session detection)
+refresh_secs = 900      # force-reconnect a fixture that never replies (e.g. TL60) every
+                        # N s so a wedged-but-connected light self-heals; 0 disables
 
 [failsafe]              # what to do when ArtNet data stops arriving
 mode         = "hold"   # hold | blackout | poweroff
@@ -394,14 +396,26 @@ which work over the direct connection).
 
 ## Reliability
 
-Each light runs an independent supervisor that connects, keeps the connection
-alive with a periodic GATT read probe (`probe_secs`), and reconnects
-automatically — so a light that's powered off, out of range, or briefly drops
-simply rejoins, still bound to its configured DMX channels. Fast ArtNet input is
-coalesced to the light's flush rate (`flush_hz`) to avoid overwhelming the BLE
-link. Validated by a 2-hour soak (zero drops). The failsafe controls behaviour
-when ArtNet stops: `hold` keeps the last state, `blackout` sets brightness 0,
-`poweroff` powers the light off — after `timeout_secs` of silence.
+Each light runs an independent supervisor that connects, verifies the link stays
+alive (every `probe_secs`), and reconnects automatically — so a light that's
+powered off, out of range, or briefly drops simply rejoins, still bound to its
+configured DMX channels. Fast ArtNet input is coalesced to the light's flush rate
+(`flush_hz`) to avoid overwhelming the BLE link. Validated by a 2-hour soak (zero
+drops). The failsafe controls behaviour when ArtNet stops: `hold` keeps the last
+state, `blackout` sets brightness 0, `poweroff` powers the light off — after
+`timeout_secs` of silence.
+
+**Detecting a wedged-but-connected light.** These are two-chip fixtures (a BLE
+radio module in front of the LED MCU that runs the command parser), so a
+`write-without-response` "succeeding" — or a generic GATT read completing — only
+proves the *radio* answered; the command path can stall while the light sits at
+its last colour, still showing "connected". The supervisor therefore verifies
+liveness by a **reply**, not a successful write: it periodically sends a cheap
+status query and requires a notify back; several silent probes recycle the link.
+Some fixtures (e.g. this rig's TL60) answer no query at all — for those there is no
+passive signal, so they get a **periodic forced reconnect** (`refresh_secs`), the
+only thing that can clear such a stall on a light that can't be verified. Set
+`refresh_secs = 0` to disable it; fixtures that reply are never force-refreshed.
 
 Each supervisor also **reads device status** off the notify characteristic —
 battery %, temperature, firmware version, and power/mode — querying on connect and

@@ -17,9 +17,16 @@ port = 6454
 # Which Bluetooth adapter to use. "default" = first adapter. You can also give an
 # index ("0", "1", ...) or a substring of the adapter name. Run `neewer-bridge
 # adapters` to list what's available on this machine.
-adapter    = "default"
-flush_hz   = 15          # max BLE state updates per light per second (coalescing cap)
-probe_secs = 20          # liveness GATT-probe interval, seconds (stale-session detection)
+adapter     = "default"
+flush_hz    = 15         # max BLE state updates per light per second (coalescing cap)
+probe_secs  = 20         # liveness-probe / status-query interval, seconds (stale-session detection)
+# Force-reconnect interval for a fixture that never answers a status query, so it
+# sends no notify the liveness probe can verify (e.g. the TL60). Such a light can
+# wedge while still "connected" (writes keep landing, the radio still answers the
+# GATT read) with no way to detect it passively — a periodic clean reconnect is the
+# only cure. 0 = disabled. Fixtures that DO reply (TL120C/TL21C) are verified by the
+# notify-reply probe and are never force-refreshed.
+refresh_secs = 900       # 15 min; raise to reduce reconnect churn, lower for faster recovery
 
 [failsafe]
 # What lights do when ArtNet data stops arriving.
