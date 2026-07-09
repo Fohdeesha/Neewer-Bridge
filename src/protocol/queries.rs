@@ -46,20 +46,12 @@ pub fn state(mac: [u8; 6]) -> Vec<u8> {
     with_checksum(f)
 }
 
-/// Streamer-support query (`0xC4`) → reply `0x17` (`78 17 07 <MAC6> <supported>`).
-///
-/// **Streamer-capable fixtures** (the TL60 family) answer this (`streamer_support_query`,
-/// bengt/verygeeky `frames.py`; reply decoded there as `R_STREAMER_SUPPORT`); the TL120C
-/// ignores it. The bridge doesn't act on the *value* — it's a spare canary in the
-/// liveness probe: any notify it elicits proves the command path is alive (see
-/// `light.rs`). Note our HW TL60 answers battery/version/state too (when healthy), so
-/// `0x95` already covers it; `0xC4` is belt-and-suspenders for units/firmwares that
-/// only answer the streamer read.
-pub fn streamer_support(mac: [u8; 6]) -> Vec<u8> {
-    let mut f = vec![PREFIX, 0xC4, 0x06];
-    f.extend_from_slice(&mac);
-    with_checksum(f)
-}
+// NOTE: a streamer-support query (`0xC4`) builder lived here briefly (2026-07-09) as a
+// "spare canary" for the TL60. It was REMOVED: polling `0xC4` — a streamer-family
+// opcode that drives the LED display — engaged a white/streamer state on the fixtures
+// and killed all colour. Battery (`0x95`) already covers every reply-capable model
+// (incl. a healthy TL60), so the canary never needed it. Do not re-add streamer
+// opcodes to the status/liveness path.
 
 #[cfg(test)]
 mod tests {
@@ -101,10 +93,4 @@ mod tests {
         assert_eq!(state(MAC).len(), 11);
     }
 
-    #[test]
-    fn streamer_support_frame() {
-        // 78 C4 06 <MAC6> ck — same shape as the other MAC reads (bengt/verygeeky).
-        assert_mac_frame(&streamer_support(MAC), 0xC4, 0x06, &[]);
-        assert_eq!(streamer_support(MAC).len(), 10);
-    }
 }
