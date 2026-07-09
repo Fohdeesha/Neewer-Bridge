@@ -20,12 +20,12 @@ port = 6454
 adapter     = "default"
 flush_hz    = 15         # max BLE state updates per light per second (coalescing cap)
 probe_secs  = 20         # liveness-probe / status-query interval, seconds (stale-session detection)
-# Force-reconnect interval for a fixture that never answers a status query, so it
-# sends no notify the liveness probe can verify (e.g. the TL60). Such a light can
-# wedge while still "connected" (writes keep landing, the radio still answers the
-# GATT read) with no way to detect it passively — a periodic clean reconnect is the
-# only cure. 0 = disabled. Fixtures that DO reply (TL120C/TL21C) are verified by the
-# notify-reply probe and are never force-refreshed.
+# Backstop reconnect for a link we can't verify by reply — fires only while a fixture
+# has sent NO notify: a genuinely deaf one (the TL97C answers nothing even when
+# healthy) or a wedged fixture not yet re-replying. A wedged light can sit
+# "connected" (writes land, the radio still answers the GATT read) with no passive
+# signal — a periodic clean reconnect bounds that. 0 = disabled. Fixtures that reply
+# (TL120C/TL21C, and a healthy TL60) are verified by the notify-reply probe instead.
 refresh_secs = 900       # 15 min; raise to reduce reconnect churn, lower for faster recovery
 
 [failsafe]

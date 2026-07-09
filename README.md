@@ -412,10 +412,11 @@ proves the *radio* answered; the command path can stall while the light sits at
 its last colour, still showing "connected". The supervisor therefore verifies
 liveness by a **reply**, not a successful write: it periodically sends a cheap
 status query and requires a notify back; several silent probes recycle the link.
-Some fixtures (e.g. this rig's TL60) answer no query at all — for those there is no
-passive signal, so they get a **periodic forced reconnect** (`refresh_secs`), the
-only thing that can clear such a stall on a light that can't be verified. Set
-`refresh_secs = 0` to disable it; fixtures that reply are never force-refreshed.
+A healthy light replies (a wedged one goes silent — exactly what this catches). A
+fixture that answers *nothing even when healthy* (e.g. a TL97C) can't be verified
+this way, so it gets a **periodic forced reconnect** (`refresh_secs`) as a backstop —
+which also covers a wedged light that hasn't recovered yet. Set `refresh_secs = 0`
+to disable it; fixtures that reply are never force-refreshed.
 
 Each supervisor also **reads device status** off the notify characteristic —
 battery %, temperature, firmware version, and power/mode — querying on connect and

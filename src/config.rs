@@ -45,13 +45,14 @@ pub struct Ble {
     /// Liveness RSSI-probe interval, seconds (stale-session detection).
     #[serde(default = "default_probe_secs")]
     pub probe_secs: u64,
-    /// Force-reconnect interval (seconds) for a fixture that can't be liveness-
-    /// verified — one that never answers a status query, so it sends no notify the
-    /// probe can check (e.g. the TL60). Such a light can wedge while still
-    /// "connected" (writes keep succeeding into it and the radio still answers the
-    /// GATT read), which no passive probe can detect; a periodic clean reconnect
-    /// bounds that. `0` disables it. A fixture that *does* reply is covered by the
-    /// notify-reply liveness probe and is never force-refreshed.
+    /// Force-reconnect interval (seconds) — a backstop for a link we can't verify by
+    /// reply. It fires only while a fixture has sent NO notify: a genuinely deaf one
+    /// (the TL97C answers nothing even when healthy), or a wedged fixture that hasn't
+    /// re-replied yet. Such a light can sit wedged-but-"connected" (writes keep
+    /// landing, the radio still answers the GATT read) with no passive signal; a
+    /// periodic clean reconnect bounds that. `0` disables it. A fixture that replies
+    /// (TL120C/TL21C, and a healthy TL60) is verified by the notify-reply probe and
+    /// is never force-refreshed.
     #[serde(default = "default_refresh_secs")]
     pub refresh_secs: u64,
 }

@@ -12,13 +12,14 @@
 //!   light sits at its last colour ignoring everything (observed on the TL60 a
 //!   few hours in). So for a fixture that answers status queries we require a
 //!   **notify reply to a periodic canary** (proves the LED-MCU, not just the
-//!   radio); after repeated misses, recycle. The canary asks several ways
-//!   (battery `0x95` for the TL120C/TL21C, streamer-support `0xC4` for the TL60)
-//!   so most models produce *some* reply. A fixture that answers *nothing* is
-//!   genuinely deaf (e.g. the TL97C) — it falls back to the GATT read (deaf ≠
-//!   dead, don't drop-cycle it) **plus a periodic forced reconnect**
-//!   (`[ble] refresh_secs`), the only thing that can clear a wedge on a light we
-//!   can't verify.
+//!   radio); after repeated misses, recycle. A healthy TL60 DOES reply (battery/
+//!   version/state) and only goes silent once wedged — so the reply-gate is its
+//!   detector. The canary asks several ways (battery `0x95` for TL120C/TL21C/TL60,
+//!   streamer `0xC4` as a spare) so most models produce *some* reply. A fixture
+//!   that answers *nothing even when healthy* is genuinely deaf (e.g. the TL97C) —
+//!   it falls back to the GATT read (deaf ≠ dead, don't drop-cycle it) **plus a
+//!   periodic forced reconnect** (`[ble] refresh_secs`) as a backstop for a link we
+//!   can't verify (also catches a wedged TL60 that hasn't re-replied yet).
 //! - reconnect with backoff, indefinitely.
 //!
 //! Because binding is by MAC and the actor exists for the whole process
@@ -391,9 +392,11 @@ fn log_status(label: &str, data: &[u8], cache: &mut StatusCache) {
 /// failed. A write failure is itself non-fatal here — link health is decided by the
 /// probe arm, which will see the missing reply.
 async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6], full: bool) -> bool {
-    // Battery (0x95) is the canary for the TL120C/TL21C; streamer-support (0xC4) is
-    // the canary for the TL60 (which answers neither battery nor version/state — see
-    // queries::streamer_support). Sending both makes the canary model-agnostic: a
+    // Battery (0x95) is the canary every reply-capable model answers when healthy —
+    // TL120C/TL21C AND the TL60 (HW-confirmed: a healthy TL60 replies battery/version/
+    // state; it only goes silent once WEDGED, which is exactly what we detect).
+    // Streamer-support (0xC4) is a spare for streamer-capable fixtures (some TL60
+    // units answer only it — bengt). Sending both makes the canary model-agnostic: a
     // reply to *either* proves the link. Temperature is telemetry (these models don't
     // answer it, so it isn't a canary).
     let mut frames = vec![

@@ -48,12 +48,13 @@ pub fn state(mac: [u8; 6]) -> Vec<u8> {
 
 /// Streamer-support query (`0xC4`) → reply `0x17` (`78 17 07 <MAC6> <supported>`).
 ///
-/// **TL60-specific**: the TL60 answers this live (`streamer_support_query`, bengt/
-/// verygeeky `frames.py`; reply decoded there as `R_STREAMER_SUPPORT`), while the
-/// TL120C ignores it. The bridge doesn't act on the *value* — it's here purely so a
-/// TL60, which does **not** answer the battery/version/state reads the other models
-/// do, still produces a notify. That notify is what the per-light actor's liveness
-/// probe needs to prove the command path is alive (see `light.rs`).
+/// **Streamer-capable fixtures** (the TL60 family) answer this (`streamer_support_query`,
+/// bengt/verygeeky `frames.py`; reply decoded there as `R_STREAMER_SUPPORT`); the TL120C
+/// ignores it. The bridge doesn't act on the *value* — it's a spare canary in the
+/// liveness probe: any notify it elicits proves the command path is alive (see
+/// `light.rs`). Note our HW TL60 answers battery/version/state too (when healthy), so
+/// `0x95` already covers it; `0xC4` is belt-and-suspenders for units/firmwares that
+/// only answer the streamer read.
 pub fn streamer_support(mac: [u8; 6]) -> Vec<u8> {
     let mut f = vec![PREFIX, 0xC4, 0x06];
     f.extend_from_slice(&mac);
