@@ -1,14 +1,14 @@
 # Rust build output
 /target
 
-# Reference projects (kept on disk for research, not part of this repo)
-/NeewerLite
-/NeewerLite-Python
-# Decompiled NEEWER Studio APK (APK/) + the mature bengt/verygeeky daemon project
-# (bengt-neewerd/, has its own git). Large research material; our derived findings
-# live in protocol-analysis.md and models.toml, which ARE tracked.
-/APK
-/bengt-neewerd
+# External references & other projects (kept on disk for research, NOT part of
+# this repo). This folder holds several upstream projects that have their OWN git
+# repos — NeewerLite/, NeewerLite-Python/, bengt-neewerd/ (verygeeky/neewer-lights),
+# neewer-python/ — plus the decompiled NEEWER Studio APK/, Reference Docs/, and
+# protocol-analysis.md. Ignoring the whole folder keeps those nested repos entirely
+# untracked (never add/commit/push to them from here). Our own derived findings live
+# in tracked files (NOTES.md, models.toml, README.md), not in here.
+/Analysis-Sources/
 
 # Large reference artifact
 /artnet_protocol_specs.txt

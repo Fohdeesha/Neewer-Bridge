@@ -49,9 +49,10 @@ Run it directly from `target/release/`, or via `cargo run --release -- <args>`.
 
 ## Quick start
 
-The bridge reads `config.toml` from the working directory by default — it ships
-ready to edit, so there's nothing to copy or rename. (Use `--config PATH` to point
-elsewhere.)
+The bridge looks for `config.toml` **next to the binary first**, then in the
+working directory — it ships ready to edit, so there's nothing to copy or
+rename, and you can run the binary from anywhere once the config sits beside it.
+(Use `--config PATH` to point elsewhere.)
 
 ```sh
 # 1. Confirm your Bluetooth adapter and see what's nearby
@@ -96,7 +97,7 @@ No command ⇒ `run` (launching the bare binary starts the bridge).
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--config PATH` | `config.toml` | Config file path. |
+| `--config PATH` | see right | Config file path. Default: `config.toml` next to the executable if present, else `config.toml` in the working directory. |
 | `-v` | — | Debug logging for this crate (logs BLE writes as hex). |
 | `-vv` | — | Trace + btleplug BLE wire logs. |
 | `--version` | — | Print version. |

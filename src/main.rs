@@ -5,7 +5,7 @@
 //! - `test`  — connect to one light by MAC and prove the BLE path (blink + CCT).
 //! - `run`   — run the full bridge. Also the DEFAULT: no subcommand ⇒ `run`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
@@ -17,9 +17,10 @@ use neewer_bridge::{bridge, commands, logging};
 #[derive(Parser)]
 #[command(name = "neewer-bridge", version, about = "ArtNet → Neewer Bluetooth light bridge")]
 struct Cli {
-    /// Path to the TOML config file.
-    #[arg(short, long, global = true, default_value = "config.toml")]
-    config: PathBuf,
+    /// Path to the TOML config file. Default: `config.toml` next to the
+    /// executable if present, else `config.toml` in the working directory.
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
 
     /// Increase log verbosity (-v debug, -vv trace + BLE wire logs).
     #[arg(short = 'v', long, global = true, action = ArgAction::Count)]
@@ -169,24 +170,43 @@ enum Command {
     Run,
 }
 
+/// Resolve the config path. An explicit `--config` is used as-is; otherwise
+/// prefer `config.toml` next to the executable, falling back to `config.toml`
+/// in the working directory (the historical default).
+fn resolve_config_path(explicit: Option<&PathBuf>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.clone();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join("config.toml");
+            if beside.is_file() {
+                return beside;
+            }
+        }
+    }
+    PathBuf::from("config.toml")
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let config_path = resolve_config_path(cli.config.as_ref());
     // Initialise logging from the config's [logging] section (falling back to
     // defaults if the config is missing/invalid — logging must never fail to come
     // up). The returned guards must live for the whole run to keep the
     // non-blocking file writer flushing.
-    let log_cfg = Config::load(&cli.config).map(|c| c.logging).unwrap_or_default();
+    let log_cfg = Config::load(&config_path).map(|c| c.logging).unwrap_or_default();
     let _log_guards = logging::init(&log_cfg, cli.verbose);
 
-    if let Err(e) = dispatch(&cli).await {
+    if let Err(e) = dispatch(&cli, &config_path).await {
         // Print the full error chain for debuggability.
         error!("{:#}", e);
         std::process::exit(1);
     }
 }
 
-async fn dispatch(cli: &Cli) -> Result<()> {
+async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
     // No subcommand ⇒ run the bridge (`neewer-bridge` alone just runs).
     let command = cli.command.as_ref().unwrap_or(&Command::Run);
     match command {
@@ -194,49 +214,49 @@ async fn dispatch(cli: &Cli) -> Result<()> {
         // so the tools work out of the box.
         Command::Adapters => commands::adapters().await,
         Command::Scan { seconds, all, json } => {
-            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let cfg = Config::load(config_path).unwrap_or_default();
             commands::scan(&cfg, *seconds, *all, *json).await
         }
         Command::Add { mac, driver, profile, universe, name, blink, address, cct_min, cct_max } => {
-            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let cfg = Config::load(config_path).unwrap_or_default();
             match mac {
                 Some(mac) => {
                     let universe = universe.context("--universe is required with --mac")?;
                     let address = address.context("--address is required with --mac")?;
                     commands::add_noninteractive(
-                        &cli.config, &cfg.ble.adapter, mac, driver.as_deref(), profile.as_deref(),
+                        config_path, &cfg.ble.adapter, mac, driver.as_deref(), profile.as_deref(),
                         universe, address, name.as_deref(), *cct_min, *cct_max, *blink,
                     )
                     .await
                 }
-                None => commands::add(&cli.config, &cfg.ble.adapter).await,
+                None => commands::add(config_path, &cfg.ble.adapter).await,
             }
         }
         Command::Models => commands::models(),
         Command::Lights => {
-            let cfg = Config::load(&cli.config)
-                .with_context(|| format!("loading config {} (required for `lights`)", cli.config.display()))?;
+            let cfg = Config::load(config_path)
+                .with_context(|| format!("loading config {} (required for `lights`)", config_path.display()))?;
             commands::lights(&cfg)
         }
         Command::Inspect { mac, seconds } => {
-            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let cfg = Config::load(config_path).unwrap_or_default();
             commands::inspect(&cfg.ble.adapter, mac, *seconds).await
         }
         Command::ArtnetSend { target, port, universe, address, channels, hz, seconds } => {
             commands::artnet_send(target, *port, *universe, *address, channels, *hz, *seconds).await
         }
         Command::Test { mac, driver, seconds, colors, modes, pixel, set, status } => {
-            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let cfg = Config::load(config_path).unwrap_or_default();
             commands::test(&cfg.ble.adapter, mac, driver, *seconds, *colors, *modes, *pixel, set.as_deref(), *status).await
         }
         Command::Monitor => {
-            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let cfg = Config::load(config_path).unwrap_or_default();
             commands::monitor(&cfg.artnet.bind_ip, cfg.artnet.port).await
         }
         // `run` requires a valid config (it defines the light bindings).
         Command::Run => {
-            let cfg = Config::load(&cli.config)
-                .with_context(|| format!("loading config {} (required for `run`)", cli.config.display()))?;
+            let cfg = Config::load(config_path)
+                .with_context(|| format!("loading config {} (required for `run`)", config_path.display()))?;
             bridge::run(cfg).await
         }
     }
