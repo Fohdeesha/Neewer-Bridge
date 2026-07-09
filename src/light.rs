@@ -437,9 +437,11 @@ async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6
     // healthy: TL120C/TL21C AND the TL60 (HW-confirmed: a healthy TL60 replies
     // battery/version/state; it only goes silent once WEDGED, which is what we
     // detect). Temperature is telemetry (these models don't answer it, so it isn't a
-    // canary). NOTE: do NOT add streamer-support (0xC4) or any other streamer-family
-    // opcode here — polling 0xC4 engaged a white/streamer state on the fixtures and
-    // killed all colour (regression 2026-07-09); battery already covers every model.
+    // canary). Keep the canary to plain reads (0x95/0x9E/0xB3/0x8E). A streamer-support
+    // read (0xC4 = getIsSupportStreamer) was trialed here as a TL60 spare and removed —
+    // NOT because it's harmful (the all-white first blamed on it was really a wrong
+    // config, not this frame; see NOTES.md) but because battery already covers every
+    // model, so it's redundant.
     let mut frames = vec![queries::battery(mac), queries::temperature(mac)];
     if full {
         frames.push(queries::version(mac));

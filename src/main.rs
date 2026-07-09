@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
-use tracing::error;
+use tracing::{error, info, warn};
 
 use neewer_bridge::config::Config;
 use neewer_bridge::{bridge, commands, logging};
@@ -198,6 +198,20 @@ async fn main() {
     // non-blocking file writer flushing.
     let log_cfg = Config::load(&config_path).map(|c| c.logging).unwrap_or_default();
     let _log_guards = logging::init(&log_cfg, cli.verbose);
+
+    // Announce which config file actually won. The resolver prefers `config.toml`
+    // beside the executable over the working directory, so a stale copy there can
+    // silently shadow the intended one — and a wrong config (e.g. lights on the
+    // `advanced` profile instead of `rgb`) then looks like a broken bridge (all
+    // white, colour ignored) with nothing in the log to explain it. Print the
+    // absolute path so it's unambiguous which file on disk was loaded.
+    let shown = std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
+    if config_path.is_file() {
+        info!(config = %shown.display(), "loaded config");
+    } else {
+        warn!(config = %config_path.display(),
+              "config file not found — using built-in defaults (no lights will be driven)");
+    }
 
     if let Err(e) = dispatch(&cli, &config_path).await {
         // Print the full error chain for debuggability.

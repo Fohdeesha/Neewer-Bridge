@@ -51,6 +51,20 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut all_sinks: Vec<Arc<Sink>> = Vec::new();
     for light in &cfg.lights {
         let profile = Profile::parse(&light.profile).expect("validated profile");
+        // Log the resolved personality per light at startup so the run log alone
+        // shows what's driving each fixture — a light silently on the wrong profile
+        // (e.g. `advanced`/`cct` instead of `rgb`) renders white and ignores colour,
+        // and this line makes that obvious without a separate `lights` command.
+        let last_ch = light.address + profile.channel_count() - 1;
+        let channels = format!("{}-{}", light.address, last_ch);
+        info!(
+            name = light.name.as_deref().unwrap_or("(unnamed)"),
+            mac = %light.mac,
+            profile = %light.profile,
+            universe = light.universe,
+            channels = %channels,
+            "configuring light"
+        );
         // Seed initial power from power_on_connect: the actor sends this as soon
         // as it connects, before any ArtNet arrives.
         let initial = LightState { power: light.power_on_connect, ..LightState::default() };

@@ -46,12 +46,15 @@ pub fn state(mac: [u8; 6]) -> Vec<u8> {
     with_checksum(f)
 }
 
-// NOTE: a streamer-support query (`0xC4`) builder lived here briefly (2026-07-09) as a
-// "spare canary" for the TL60. It was REMOVED: polling `0xC4` — a streamer-family
-// opcode that drives the LED display — engaged a white/streamer state on the fixtures
-// and killed all colour. Battery (`0x95`) already covers every reply-capable model
-// (incl. a healthy TL60), so the canary never needed it. Do not re-add streamer
-// opcodes to the status/liveness path.
+// NOTE: a streamer-support query (`0xC4` = `getIsSupportStreamer`, a MAC-addressed
+// read like the ones above — `78 C4 06 <MAC6> ck`, reply `0x14`) lived here briefly
+// (2026-07-09) as a "spare canary" for the TL60, then was removed. The all-white/
+// no-colour it was first blamed for turned out to be a WRONG CONFIG (lights on the
+// `advanced` profile, not `rgb`) — the SAME symptom, root-caused later the same day;
+// the `0xC4` blame was a misattribution (NOTES.md top banner). `0xC4` is almost
+// certainly harmless, but there's no reason to re-add it: battery (`0x95`) already
+// elicits a reply from every reply-capable model (incl. a healthy TL60), so the canary
+// doesn't need a second capability probe. Keep the liveness path to plain reads.
 
 #[cfg(test)]
 mod tests {

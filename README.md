@@ -426,6 +426,18 @@ series (Infinity) fixtures only; Home (`NH-*`) lights are skipped.
 
 ## Troubleshooting
 
+- **All lights show white and colour is ignored (changing RGB only changes the
+  brightness)** — the lights are almost certainly on the wrong **profile**:
+  `advanced`/`cct` map a 3-channel RGB patch onto mode-select + dimmer (i.e. white +
+  level), not R/G/B. Usually this means the bridge loaded the **wrong config file**:
+  with no `--config` it prefers `config.toml` **next to the executable** over the one
+  in your working directory (see [Configuration](#configuration)), so a stale copy
+  beside the binary can silently shadow the intended one. Run `neewer-bridge lights`
+  (same config resolution as `run`) to see the profile each light loaded — an `rgb`
+  light shows `ch → Red/Green/Blue`, an `advanced` one a 10-channel span. `run` also
+  logs `loaded config <path>` and a `configuring light … profile=… channels=…` line
+  per fixture at startup. Fix by pointing at the right file (`--config`), correcting
+  the beside-the-exe copy, or deleting it so the working-dir config is used.
 - **"no Bluetooth adapter found"** — the host has no Bluetooth radio enabled. Plug
   in a USB BLE adapter or run on a Bluetooth-equipped machine. `neewer-bridge
   adapters` lists what's available.
