@@ -52,6 +52,19 @@ const FIND_POLL: Duration = Duration::from_secs(2);
 /// Backoff after a failed/ended session before reconnecting.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(4);
 
+/// Cross-reconnect wedge bookkeeping, so the actor can log wedge-detection and
+/// recovery at a glance during a long soak. Owned by [`LightActor::run`] and passed
+/// `&mut` into each session (the state has to outlive a single session — a wedge is
+/// detected in one session and cleared when replies resume in a *later* one).
+#[derive(Default)]
+struct WedgeTracker {
+    /// How many wedges (healthy→silent-while-connected) we've caught on this light.
+    count: u32,
+    /// When the current wedge was detected (`None` = the light is not wedged). Set
+    /// when the reply-gate gives up; taken (and logged) when replies resume.
+    wedged_at: Option<Instant>,
+}
+
 pub struct LightActor {
     cfg: LightCfg,
     adapter: Adapter,
@@ -83,6 +96,10 @@ impl LightActor {
         // These were validated at config load; unwrap is safe.
         let mac_bytes = parse_mac(&self.cfg.mac).expect("validated mac");
         let profile = Profile::parse(&self.cfg.profile).expect("validated profile");
+        // Persists across reconnects: counts wedges and tracks an in-progress one so
+        // "⚠ WEDGE" / "✔ RECOVERED" read cleanly even though detection and recovery
+        // land in different sessions.
+        let mut wedge = WedgeTracker::default();
 
         loop {
             let (peripheral, name) = self.find().await;
@@ -95,7 +112,7 @@ impl LightActor {
                     // Power is driven entirely by the flushed LightState (the
                     // bridge seeds the initial state's power from
                     // `power_on_connect`), so there's no separate power-on here.
-                    if let Err(e) = self.session(&label, &peripheral, &chars, &driver).await {
+                    if let Err(e) = self.session(&label, &peripheral, &chars, &driver, &mut wedge).await {
                         warn!(light = %label, error = %e, "session ended; will reconnect");
                     }
                 }
@@ -130,6 +147,7 @@ impl LightActor {
         p: &Peripheral,
         chars: &NeewerChars,
         driver: &Driver,
+        wedge: &mut WedgeTracker,
     ) -> Result<()> {
         let flush_ms = (1000 / self.flush_hz.max(1)).max(1) as u64;
         let mut flush = interval(Duration::from_millis(flush_ms));
@@ -166,6 +184,7 @@ impl LightActor {
             light = %label,
             flush_hz = self.flush_hz,
             probe_secs = self.probe_secs,
+            refresh_secs = self.refresh_secs,
             rssi = ?rssi0,
             "session active"
         );
@@ -285,6 +304,17 @@ impl LightActor {
                         failures += 1;
                         warn!(light = %label, failures, rssi = ?rssi, ever_replied, "liveness probe failed");
                         if failures >= MAX_PROBE_FAILURES {
+                            // A reply-capable light that has gone silent while still
+                            // "connected" is wedged. Record it and log a headline line
+                            // (cleared by "✔ RECOVERED" when it answers again) so a soak
+                            // shows the wedge/recovery cycle at a glance.
+                            if ever_replied {
+                                wedge.count += 1;
+                                wedge.wedged_at = Some(Instant::now());
+                                warn!(light = %label, wedge = wedge.count,
+                                      healthy_secs = session_start.elapsed().as_secs(),
+                                      "⚠ WEDGE — light stopped answering the canary while still connected; recycling link");
+                            }
                             bail!("stale session: {failures} consecutive liveness misses (no reply to canary)");
                         }
                     }
@@ -312,8 +342,19 @@ impl LightActor {
                             // Any frame on the notify char is the LED-MCU (through the
                             // radio) proving the command path is alive — the liveness
                             // signal a reply-capable fixture is judged by.
+                            let first_reply = !ever_replied;
                             ever_replied = true;
                             last_reply_at = Some(Instant::now());
+                            // If this is the first reply since a wedge, the light is
+                            // answering again — the headline "did the reconnect clear
+                            // it?" signal for the soak.
+                            if first_reply {
+                                if let Some(since) = wedge.wedged_at.take() {
+                                    info!(light = %label, wedge = wedge.count,
+                                          down_secs = since.elapsed().as_secs(),
+                                          "✔ RECOVERED — light is answering again after a wedge");
+                                }
+                            }
                             log_status(label, &n.value, &mut status);
                         }
                         None => {
