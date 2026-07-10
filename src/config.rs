@@ -43,27 +43,10 @@ pub struct Ble {
     #[serde(default = "default_flush_hz")]
     pub flush_hz: u32,
     /// Liveness/status-probe interval, seconds. Each tick does a cheap GATT read
-    /// (connection health) and sends a status canary; it does NOT itself force a
-    /// reconnect on a missed reply — see `wedge_secs`.
+    /// (connection health — 3 consecutive misses recycle the link) and sends a
+    /// best-effort status query for telemetry.
     #[serde(default = "default_probe_secs")]
     pub probe_secs: u64,
-    /// How long a reply-capable fixture may go SILENT (no notify) before we treat it
-    /// as wedged and force a clean reconnect — the LED-MCU hard-wedge detector (the
-    /// TL60 case). Generous by design: connection health is a separate cheap GATT
-    /// read, so this only needs to catch the genuine multi-minute stall, never
-    /// transient notify loss or brief shared-adapter contention (which caused a
-    /// reconnect storm when this was 60 s). Only armed once a fixture has actually
-    /// answered several canaries; deaf fixtures (never reply) use `refresh_secs`
-    /// instead. `0` disables the wedge detector.
-    #[serde(default = "default_wedge_secs")]
-    pub wedge_secs: u64,
-    /// Force-reconnect interval (seconds) — a backstop ONLY for a fixture that never
-    /// answers a canary (a genuinely deaf one, e.g. the TL97C). Such a light can sit
-    /// wedged-but-"connected" with no passive signal to detect it, so a periodic clean
-    /// reconnect bounds that. `0` disables it. Reply-capable fixtures are covered by
-    /// `wedge_secs` and are never force-refreshed.
-    #[serde(default = "default_refresh_secs")]
-    pub refresh_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -153,8 +136,6 @@ impl Default for Ble {
             adapter: default_adapter(),
             flush_hz: default_flush_hz(),
             probe_secs: default_probe_secs(),
-            wedge_secs: default_wedge_secs(),
-            refresh_secs: default_refresh_secs(),
         }
     }
 }
@@ -191,12 +172,6 @@ fn default_flush_hz() -> u32 {
 }
 fn default_probe_secs() -> u64 {
     20
-}
-fn default_wedge_secs() -> u64 {
-    300
-}
-fn default_refresh_secs() -> u64 {
-    900
 }
 /// Default CCT scaling range (raw ×100K): 3200K..5600K, the common bi-color span.
 pub const DEFAULT_CCT_MIN: u8 = 32;

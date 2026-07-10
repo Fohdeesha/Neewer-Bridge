@@ -19,25 +19,12 @@ port = 6454
 # adapters` to list what's available on this machine.
 adapter     = "default"
 flush_hz    = 15         # max BLE state updates per light per second (coalescing cap)
-probe_secs  = 20         # how often (s) to run the cheap GATT-read connection check +
-                         # send a status canary. A missed canary does NOT recycle the
-                         # link on its own — see wedge_secs.
-# Hard-wedge detector: recycle a reply-capable fixture only after it has gone SILENT (no
-# notify) for this many seconds — the LED-MCU-wedge case (the TL60). Generous on purpose:
-# connection health is the separate cheap GATT read above, so this only needs to catch a
-# genuine multi-minute stall, never transient notify loss / brief shared-adapter
-# contention. (An earlier 60 s version turned transient loss into full recycles and
-# caused a fleet-wide reconnect STORM.) Only armed once a fixture has answered several
-# canaries; deaf fixtures use refresh_secs instead. 0 = disable the wedge detector.
-wedge_secs   = 300       # 5 min
-# Backstop reconnect for a fixture we can't verify by reply — fires ONLY for a genuinely
-# deaf one (e.g. the TL97C answers nothing even when healthy). Reply-capable fixtures use
-# wedge_secs instead and are never force-refreshed. 0 = disabled.
-refresh_secs = 900       # 15 min
-# NB: a TL60-style HARD wedge (LED-MCU hung: stuck on a colour, ignoring everything,
-# barely connectable) is a firmware bug with no BLE recovery — the bridge detects/flags
-# it, but only a power-cycle clears it (and the TL60 has an internal battery, so that's a
-# manual button press, not a smart plug).
+probe_secs  = 20         # how often (s) to run the cheap GATT-read connection check
+                         # (3 consecutive misses recycle the link) + read status telemetry
+# NB: a light stuck on its last colour and ignoring commands is almost always a WEAK RX
+# LINK — the bridge can't currently reach it. It reconnects and resumes on its own once
+# the signal is good again, so keep a flaky unit within decent range of the adapter. (No
+# power-cycle or special "recovery" is needed; that was an earlier mis-diagnosis.)
 
 [failsafe]
 # What lights do when ArtNet data stops arriving.

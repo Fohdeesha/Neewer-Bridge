@@ -163,14 +163,6 @@ enum Command {
         /// print the decoded replies. Non-mutating — no blink, no colour change.
         #[arg(long)]
         status: bool,
-        /// Try to WAKE a wedged light (connected/advertising but ignoring commands and
-        /// sending no notify): persistently connect, then fire a menu of non-destructive
-        /// pokes (status reads, read-request 0x84, OTA-type probe 0xD0, a power off/on
-        /// cycle, a CCT frame, factory-test toggles 0xF0/0xF5) and finally drive bright
-        /// green so you can see whether it came back. Give a long --seconds — a wedged
-        /// unit advertises only intermittently.
-        #[arg(long)]
-        recover: bool,
     },
     /// Listen for ArtNet and print received ArtDmx packets (no BLE needed).
     Monitor,
@@ -267,9 +259,9 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
         Command::ArtnetSend { target, port, universe, address, channels, hz, seconds } => {
             commands::artnet_send(target, *port, *universe, *address, channels, *hz, *seconds).await
         }
-        Command::Test { mac, driver, seconds, colors, modes, pixel, set, status, recover } => {
+        Command::Test { mac, driver, seconds, colors, modes, pixel, set, status } => {
             let cfg = Config::load(config_path).unwrap_or_default();
-            commands::test(&cfg.ble.adapter, mac, driver, *seconds, *colors, *modes, *pixel, set.as_deref(), *status, *recover).await
+            commands::test(&cfg.ble.adapter, mac, driver, *seconds, *colors, *modes, *pixel, set.as_deref(), *status).await
         }
         Command::Monitor => {
             let cfg = Config::load(config_path).unwrap_or_default();
