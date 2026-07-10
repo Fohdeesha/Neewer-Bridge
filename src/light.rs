@@ -5,22 +5,27 @@
 //! - power on (if configured),
 //! - **coalescing flush:** at `flush_hz`, send the latest desired `LightState`
 //!   only if it changed (handles the ArtNet-44Hz → BLE rate mismatch),
-//! - **stale-session detection (NOTES.md §5):** these are two-chip lights — a
-//!   BLE-UART radio module in front of the LED-MCU that runs the `0x78` parser —
-//!   so a successful `write-without-response` (no ACK) or a generic GATT read
-//!   only proves the *radio* is up; the command path can be wedged while the
-//!   light sits at its last colour ignoring everything (observed on the TL60 a
-//!   few hours in). So for a fixture that answers status queries we require a
-//!   **notify reply to a periodic canary** (proves the LED-MCU, not just the
-//!   radio); after repeated misses, recycle. A healthy TL60 DOES reply (battery/
-//!   version/state) and only goes silent once wedged — so the reply-gate is its
-//!   detector. The canary is the battery read `0x95`, which every reply-capable
-//!   model answers when healthy. A fixture that answers *nothing even when healthy*
-//!   is genuinely deaf (e.g. the TL97C) —
-//!   it falls back to the GATT read (deaf ≠ dead, don't drop-cycle it) **plus a
-//!   periodic forced reconnect** (`[ble] refresh_secs`) as a backstop for a link we
-//!   can't verify (also catches a wedged TL60 that hasn't re-replied yet).
-//! - reconnect with backoff, indefinitely.
+//! - **liveness — a LAYERED design (NOTES.md §5), tuned after a reconnect-storm.**
+//!   These are two-chip lights — a BLE-UART radio in front of the LED-MCU that runs
+//!   the `0x78` parser — so a generic GATT read only proves the *radio* is up; the
+//!   command path can wedge while the light sits at its last colour ignoring
+//!   everything (the TL60, hours in). Two independent checks:
+//!   1. **Connection health = a cheap GATT read every `probe_secs`, for EVERY
+//!      fixture.** The radio answers it, so it's stable and keeps a healthy light
+//!      connected with zero churn; 3 consecutive misses = a genuinely dead link.
+//!   2. **Hard-wedge detector = notify silence, but only for a PROVEN reply-capable
+//!      fixture and only after `wedge_secs` (minutes).** We send a status canary each
+//!      probe; a fixture that has answered `MIN_CANARY_REPLIES` of them is judged by
+//!      its notify stream — if it then goes silent for `wedge_secs`, recycle. A
+//!      *missed* canary is NOT itself a trigger. This tolerance is deliberate: an
+//!      earlier "3 missed canaries = 60 s ⇒ recycle" gate turned transient notify
+//!      loss into a full recycle, and on a shared adapter one flapping light's
+//!      reconnects starved the others' canaries until the whole fleet "wedged" — a
+//!      thundering-herd storm. Minutes-long silence is the real wedge; seconds is noise.
+//!   3. A fixture that never answers a canary is genuinely deaf (e.g. the TL97C): it
+//!      never arms (2), and relies on (1) plus a periodic forced reconnect
+//!      (`[ble] refresh_secs`) to clear any wedged-but-connected state.
+//! - reconnect with jittered backoff (de-syncs the fleet), indefinitely.
 //!
 //! Because binding is by MAC and the actor exists for the whole process
 //! lifetime, the DMX→light mapping is stable regardless of power-on/discovery
@@ -45,8 +50,15 @@ use crate::protocol::{queries, LightState};
 
 /// How long a liveness probe may take before it counts as a failure (§5).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
-/// Consecutive probe failures before we declare the session stale and recycle.
+/// Consecutive GATT-read failures before we declare the *link* dead and recycle.
+/// This is the cheap connection-health check (the radio answers it), so it can't
+/// false-wedge — a real dead link fails it, a wedged-but-connected one does not.
 const MAX_PROBE_FAILURES: u32 = 3;
+/// Canary replies a fixture must produce before the notify-based wedge detector arms
+/// for it. Below this it's treated as deaf (GATT-read health + `refresh_secs`), so a
+/// mostly-silent fixture that emits the odd unsolicited notify (e.g. the TL97C) never
+/// gets trapped on a reply signal it can't sustain.
+const MIN_CANARY_REPLIES: u32 = 3;
 /// How often to poll the shared scan while waiting for the light to appear.
 const FIND_POLL: Duration = Duration::from_secs(2);
 /// Backoff after a failed/ended session before reconnecting.
@@ -71,6 +83,7 @@ pub struct LightActor {
     rx: watch::Receiver<LightState>,
     flush_hz: u32,
     probe_secs: u64,
+    wedge_secs: u64,
     refresh_secs: u64,
 }
 
@@ -81,9 +94,10 @@ impl LightActor {
         rx: watch::Receiver<LightState>,
         flush_hz: u32,
         probe_secs: u64,
+        wedge_secs: u64,
         refresh_secs: u64,
     ) -> Self {
-        Self { cfg, adapter, rx, flush_hz, probe_secs, refresh_secs }
+        Self { cfg, adapter, rx, flush_hz, probe_secs, wedge_secs, refresh_secs }
     }
 
     fn label(&self) -> String {
@@ -100,6 +114,7 @@ impl LightActor {
         // "⚠ WEDGE" / "✔ RECOVERED" read cleanly even though detection and recovery
         // land in different sessions.
         let mut wedge = WedgeTracker::default();
+        let mut reconnect_count: u64 = 0;
 
         loop {
             let (peripheral, name) = self.find().await;
@@ -121,8 +136,19 @@ impl LightActor {
 
             // Best-effort disconnect so the OS doesn't keep a half-open handle.
             let _ = ble::disconnect(&peripheral).await;
-            info!(light = %label, backoff_secs = RECONNECT_BACKOFF.as_secs(), "disconnected; reconnecting after backoff");
-            tokio::time::sleep(RECONNECT_BACKOFF).await;
+            // De-sync the herd: on a shared adapter, several actors reconnecting in
+            // lockstep saturate it (scan + connect + disconnect) and starve each
+            // other's canaries — which is how one flapping light cascaded into all of
+            // them "wedging". Spread reconnects with per-light + per-attempt jitter on
+            // top of the base backoff (deterministic, so no rng dependency).
+            reconnect_count = reconnect_count.wrapping_add(1);
+            let jitter_ms = (mac_bytes[5] as u64)
+                .wrapping_mul(97)
+                .wrapping_add(reconnect_count.wrapping_mul(211))
+                % 3000;
+            let backoff = RECONNECT_BACKOFF + Duration::from_millis(jitter_ms);
+            info!(light = %label, backoff_secs = backoff.as_secs_f32(), "disconnected; reconnecting after backoff");
+            tokio::time::sleep(backoff).await;
         }
     }
 
@@ -159,24 +185,27 @@ impl LightActor {
         // we don't probe before the link has settled.
         probe.tick().await;
 
-        // Fallback liveness signal, used ONLY for a fixture that never notifies
-        // (the notify reply is a strictly stronger signal — it proves the LED-MCU,
-        // not just the radio that answers this read). See the probe arm.
+        // Connection-health probe target: a readable characteristic (usually Generic
+        // Access Device Name). The GATT read against it is the base liveness check for
+        // EVERY fixture (the radio answers it — stable, no churn). See the probe arm.
         let read_char = ble::find_readable_char(p);
         if read_char.is_none() {
-            debug!(light = %label, "no readable characteristic; a fixture that also never notifies falls back to is_connected() only");
+            debug!(light = %label, "no readable characteristic; connection health falls back to is_connected() only");
         }
 
         let mut last_sent: Option<LightState> = None;
+        // Connection-health failures (consecutive GATT-read misses); reset on success.
         let mut failures: u32 = 0;
-        // Liveness signal (see the module docs + the probe arm below). `ever_replied`
-        // latches once the light sends any notify — until then it's treated as
-        // "deaf, maybe alive" and probed via the GATT read. `last_reply_at` is the
-        // monotonic time of the most recent notify; `probe_query_at` is when we last
-        // issued the canary. A reply newer than the last canary proves the link.
-        let mut ever_replied = false;
+        // Notify-based hard-wedge signal (see the module docs + the probe arm).
+        // `last_reply_at` = time of the most recent notify. `canary_replies` counts
+        // canaries the fixture actually ANSWERED (a notify seen while a canary was
+        // outstanding); the wedge detector arms only once this reaches
+        // `MIN_CANARY_REPLIES` (proven reply-capable) and then fires only after
+        // `wedge_secs` of silence — so it can't thrash on transient loss, and a deaf
+        // fixture that never answers never arms it.
         let mut last_reply_at: Option<Instant> = None;
-        let mut probe_query_at: Option<Instant> = None;
+        let mut canary_replies: u32 = 0;
+        let mut canary_outstanding = false;
         // When this session connected — drives the deaf-fixture periodic refresh.
         let session_start = Instant::now();
         let rssi0 = ble::rssi(p).await;
@@ -184,6 +213,7 @@ impl LightActor {
             light = %label,
             flush_hz = self.flush_hz,
             probe_secs = self.probe_secs,
+            wedge_secs = self.wedge_secs,
             refresh_secs = self.refresh_secs,
             rssi = ?rssi0,
             "session active"
@@ -207,9 +237,9 @@ impl LightActor {
         let mut status = StatusCache::default();
         if let Some(mac) = query_mac {
             // The initial full query doubles as the first canary; a reply to it
-            // (landing on the notify arm) is what proves the link on the first probe.
+            // (landing on the notify arm) starts proving the link is reply-capable.
             if send_status_queries(p, &chars.write, mac, true).await {
-                probe_query_at = Some(Instant::now());
+                canary_outstanding = true;
             }
         }
 
@@ -257,74 +287,82 @@ impl LightActor {
                     }
                 }
                 _ = probe.tick() => {
-                    // Advertisement RSSI (diagnostics only — not the liveness signal).
+                    // Advertisement RSSI (diagnostics only — not a liveness signal).
                     let rssi = ble::rssi(p).await;
                     if !ble::is_connected(p).await {
                         bail!("peripheral reports disconnected");
                     }
 
-                    // Deaf-fixture safety net (the TL60 case): a fixture that never
-                    // sends a notify can't be actively verified, yet it can wedge while
-                    // still "connected" — writes succeed into it and the radio keeps
-                    // answering the GATT read, so NO passive probe sees the stall. Bound
-                    // it by forcing a clean reconnect every `refresh_secs`. Only applies
-                    // while `ever_replied` is false; a fixture that answers is verified
-                    // by the reply-gate below and never force-refreshed.
-                    if !ever_replied
+                    // If the notify stream dropped (a transient backend hiccup on a live
+                    // link, or a prior disconnect), try to restore it — here, paced at
+                    // the probe interval, so there's no tight re-subscribe loop. Losing
+                    // notify only costs the wedge detector below; GATT-read health is
+                    // unaffected, so this is best-effort.
+                    if notif.is_none() {
+                        if let Some(nc) = &chars.notify {
+                            if let Ok(stream) = ble::subscribe_notify(p, nc).await {
+                                debug!(light = %label, "notify stream re-subscribed");
+                                notif = Some(stream);
+                            }
+                        }
+                    }
+
+                    // (1) CONNECTION HEALTH — a cheap GATT read for EVERY fixture. The
+                    // radio answers it, so it's stable and can't false-wedge; it's what
+                    // keeps a healthy light connected with no churn. Three consecutive
+                    // misses = a genuinely dead link. No readable char ⇒ is_connected()
+                    // only (checked above).
+                    let conn_ok = match &read_char {
+                        Some(rc) => ble::probe_read(p, rc, PROBE_TIMEOUT).await,
+                        None => true,
+                    };
+                    if conn_ok {
+                        if failures > 0 {
+                            debug!(light = %label, "connection restored");
+                        }
+                        failures = 0;
+                    } else {
+                        failures += 1;
+                        warn!(light = %label, failures, rssi = ?rssi, "connection probe failed (GATT read)");
+                        if failures >= MAX_PROBE_FAILURES {
+                            bail!("dead link: {failures} consecutive GATT-read failures");
+                        }
+                    }
+
+                    // (2) HARD-WEDGE DETECTOR — notify-based, tolerant, and ONLY for a
+                    // fixture that has proven it answers canaries. It catches the LED-MCU
+                    // wedge (the TL60 case) that the radio-answered GATT read above can't
+                    // see: the light stays "connected" but stops answering. Firing only
+                    // after `wedge_secs` of silence separates that genuine multi-minute
+                    // stall from transient notify loss / brief shared-adapter contention
+                    // (the old 60 s reply-gate caused a reconnect storm across the fleet).
+                    let reply_capable = canary_replies >= MIN_CANARY_REPLIES;
+                    if is_wedged(canary_replies, last_reply_at.map(|t| t.elapsed()), self.wedge_secs) {
+                        let silent = last_reply_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                        wedge.count += 1;
+                        wedge.wedged_at = Some(Instant::now());
+                        warn!(light = %label, wedge = wedge.count, silent_secs = silent,
+                              "⚠ WEDGE — reply-capable light went silent while still connected; recycling link");
+                        bail!("wedge: no notify for {silent}s despite answering earlier");
+                    } else if !reply_capable
                         && self.refresh_secs > 0
                         && session_start.elapsed().as_secs() >= self.refresh_secs
                     {
+                        // (3) DEAF-FIXTURE BACKSTOP — a fixture that never answers a
+                        // canary can't be wedge-detected passively (e.g. the TL97C), so
+                        // bound any wedged-but-connected state with a periodic clean
+                        // reconnect. Reply-capable fixtures use (2) instead of this.
                         info!(light = %label, refresh_secs = self.refresh_secs,
-                              "refreshing unverifiable (never-replied) link to clear any wedged-but-connected state");
+                              "refreshing unverifiable (deaf) link to clear any wedged-but-connected state");
                         bail!("periodic refresh of a deaf fixture");
                     }
 
-                    // Liveness. For a fixture that answers status queries, require a
-                    // notify reply newer than our last canary — that proves the LED-MCU
-                    // command path, which a `write-without-response` or a radio-answered
-                    // GATT read can NOT (the wedged-command-path / half-open-link case).
-                    // A fixture that has never notified can't be told apart from one
-                    // that's simply deaf, so it falls back to the GATT read.
-                    let satisfied = if ever_replied {
-                        liveness_by_reply(last_reply_at, probe_query_at)
-                    } else {
-                        match &read_char {
-                            Some(rc) => ble::probe_read(p, rc, PROBE_TIMEOUT).await,
-                            None => true, // nothing readable + never notified: is_connected() only
-                        }
-                    };
-
-                    if satisfied {
-                        if failures > 0 {
-                            debug!(light = %label, "liveness restored");
-                        }
-                        failures = 0;
-                        debug!(light = %label, rssi = ?rssi, ever_replied, "liveness ok");
-                    } else {
-                        failures += 1;
-                        warn!(light = %label, failures, rssi = ?rssi, ever_replied, "liveness probe failed");
-                        if failures >= MAX_PROBE_FAILURES {
-                            // A reply-capable light that has gone silent while still
-                            // "connected" is wedged. Record it and log a headline line
-                            // (cleared by "✔ RECOVERED" when it answers again) so a soak
-                            // shows the wedge/recovery cycle at a glance.
-                            if ever_replied {
-                                wedge.count += 1;
-                                wedge.wedged_at = Some(Instant::now());
-                                warn!(light = %label, wedge = wedge.count,
-                                      healthy_secs = session_start.elapsed().as_secs(),
-                                      "⚠ WEDGE — light stopped answering the canary while still connected; recycling link");
-                            }
-                            bail!("stale session: {failures} consecutive liveness misses (no reply to canary)");
-                        }
-                    }
-
-                    // Issue this cycle's canary (battery + temperature). Replies land on
-                    // the notify arm and advance `last_reply_at`; a reply-capable light
-                    // that stops answering these is exactly the half-open case above.
+                    // (4) Send this cycle's canary (battery + temperature): status
+                    // telemetry, and it elicits the notify the wedge detector watches.
+                    // A missed reply is NOT itself a recycle trigger — only (2) is.
                     if let Some(mac) = query_mac {
                         if send_status_queries(p, &chars.write, mac, false).await {
-                            probe_query_at = Some(Instant::now());
+                            canary_outstanding = true;
                         }
                     }
                 }
@@ -339,33 +377,31 @@ impl LightActor {
                 } => {
                     match notification {
                         Some(n) => {
-                            // Any frame on the notify char is the LED-MCU (through the
-                            // radio) proving the command path is alive — the liveness
-                            // signal a reply-capable fixture is judged by.
-                            let first_reply = !ever_replied;
-                            ever_replied = true;
+                            // Any notify frame is the LED-MCU (through the radio) proving
+                            // the command path is alive. Record the time; if it answers a
+                            // canary we issued, count it toward "reply-capable" (a stray
+                            // unsolicited notify with no canary outstanding doesn't count,
+                            // so a mostly-deaf fixture never arms the wedge detector).
                             last_reply_at = Some(Instant::now());
-                            // If this is the first reply since a wedge, the light is
-                            // answering again — the headline "did the reconnect clear
-                            // it?" signal for the soak.
-                            if first_reply {
-                                if let Some(since) = wedge.wedged_at.take() {
-                                    info!(light = %label, wedge = wedge.count,
-                                          down_secs = since.elapsed().as_secs(),
-                                          "✔ RECOVERED — light is answering again after a wedge");
-                                }
+                            if canary_outstanding {
+                                canary_replies = canary_replies.saturating_add(1);
+                                canary_outstanding = false;
+                            }
+                            // First reply after a detected wedge ⇒ the reconnect cleared
+                            // it — the headline "did it recover?" signal for the soak.
+                            if let Some(since) = wedge.wedged_at.take() {
+                                info!(light = %label, wedge = wedge.count,
+                                      down_secs = since.elapsed().as_secs(),
+                                      "✔ RECOVERED — light is answering again after a wedge");
                             }
                             log_status(label, &n.value, &mut status);
                         }
                         None => {
-                            // Stream closed (normally = disconnect). Stop polling it and
-                            // let the two existing signals recover us rather than bailing
-                            // straight away — a hair-trigger reconnect here risks a tight
-                            // loop if the backend ever closes a stream on a live link. On a
-                            // reply-capable fixture the replies now stop, so the probe arm's
-                            // reply-gate recycles the session within a few probe cycles; a
-                            // real disconnect is caught by `is_connected()` on the next tick.
-                            debug!(light = %label, ever_replied, "notify stream ended; relying on liveness probe to recover");
+                            // Stream closed (usually a disconnect, occasionally a backend
+                            // hiccup on a live link). Mark it gone; the probe arm re-subscribes
+                            // (paced) if the link is still up, and a real disconnect is caught
+                            // by is_connected() on the next tick. No hair-trigger reconnect.
+                            debug!(light = %label, "notify stream ended; will re-subscribe on next probe tick");
                             notif = None;
                         }
                     }
@@ -457,57 +493,55 @@ async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6
     true
 }
 
-/// Whether a reply-capable fixture's link is proven live this probe cycle: it has
-/// sent a notify (`last_reply_at`) at least as recent as the canary we last issued
-/// (`probe_query_at`). Pure so it can be unit-tested without a radio.
-///
-/// - No canary issued yet (`probe_query_at == None`) ⇒ satisfied (nothing to answer).
-/// - A reply at/after the last canary ⇒ satisfied (link proven).
-/// - The canary went unanswered (reply older than it, or none) ⇒ not satisfied.
-fn liveness_by_reply(last_reply_at: Option<Instant>, probe_query_at: Option<Instant>) -> bool {
-    match probe_query_at {
-        Some(queried) => last_reply_at.is_some_and(|reply| reply >= queried),
-        None => true,
-    }
+/// Whether a fixture should be treated as WEDGED (LED-MCU stopped answering while
+/// the link is still up), so the session recycles. Pure, so it's unit-tested without
+/// a radio. Three gates, all required:
+/// - `wedge_secs > 0` — the detector is enabled.
+/// - `canary_replies >= MIN_CANARY_REPLIES` — the fixture has PROVEN it answers
+///   canaries, so silence is meaningful (a deaf fixture never arms this; it uses the
+///   `refresh_secs` backstop instead).
+/// - `silent >= wedge_secs` — it's now been quiet that long. Generous by design, so
+///   transient notify loss / brief shared-adapter contention never trips it.
+fn is_wedged(canary_replies: u32, silent: Option<Duration>, wedge_secs: u64) -> bool {
+    wedge_secs > 0
+        && canary_replies >= MIN_CANARY_REPLIES
+        && silent.is_some_and(|d| d.as_secs() >= wedge_secs)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::liveness_by_reply;
-    use std::time::{Duration, Instant};
+    use super::{is_wedged, MIN_CANARY_REPLIES};
+    use std::time::Duration;
 
     #[test]
-    fn no_canary_issued_yet_is_satisfied() {
-        // Before the first canary there is nothing to answer, so never a miss —
-        // regardless of whether a reply has been seen.
-        assert!(liveness_by_reply(None, None));
-        assert!(liveness_by_reply(Some(Instant::now()), None));
+    fn not_wedged_before_arming() {
+        // Below MIN_CANARY_REPLIES the detector is not armed, no matter how long the
+        // silence — a deaf / barely-replying fixture (e.g. TL97C) never trips it.
+        assert!(!is_wedged(MIN_CANARY_REPLIES - 1, Some(Duration::from_secs(9999)), 300));
     }
 
     #[test]
-    fn reply_after_canary_is_satisfied() {
-        let queried = Instant::now();
-        let reply = queried + Duration::from_millis(200); // healthy: answered ~200 ms later
-        assert!(liveness_by_reply(Some(reply), Some(queried)));
+    fn not_wedged_when_recently_heard() {
+        // Armed, but answered within the window ⇒ healthy, no recycle.
+        assert!(!is_wedged(MIN_CANARY_REPLIES, Some(Duration::from_secs(30)), 300));
+        assert!(!is_wedged(MIN_CANARY_REPLIES, Some(Duration::from_secs(299)), 300));
     }
 
     #[test]
-    fn reply_at_same_instant_is_satisfied() {
-        let t = Instant::now(); // `reply >= queried` is inclusive
-        assert!(liveness_by_reply(Some(t), Some(t)));
+    fn not_wedged_with_no_reply_timestamp() {
+        // Armed count but nothing to time against ⇒ not wedged.
+        assert!(!is_wedged(MIN_CANARY_REPLIES, None, 300));
     }
 
     #[test]
-    fn stale_reply_before_canary_is_a_miss() {
-        // The wedge case: the light answered earlier but the latest canary got no
-        // reply, so the newest reply predates it.
-        let reply = Instant::now();
-        let queried = reply + Duration::from_secs(20);
-        assert!(!liveness_by_reply(Some(reply), Some(queried)));
+    fn wedged_when_armed_and_silent_past_window() {
+        assert!(is_wedged(MIN_CANARY_REPLIES, Some(Duration::from_secs(300)), 300));
+        assert!(is_wedged(MIN_CANARY_REPLIES + 5, Some(Duration::from_secs(600)), 300));
     }
 
     #[test]
-    fn canary_with_no_reply_is_a_miss() {
-        assert!(!liveness_by_reply(None, Some(Instant::now())));
+    fn disabled_when_wedge_secs_zero() {
+        // wedge_secs = 0 turns the detector off entirely.
+        assert!(!is_wedged(MIN_CANARY_REPLIES, Some(Duration::from_secs(9999)), 0));
     }
 }

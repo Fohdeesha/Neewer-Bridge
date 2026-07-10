@@ -155,6 +155,7 @@ driver / profile / CCT range are filled automatically; any flag overrides.
 | `--modes` | off | Probe the advanced modes: XY and a few FX effects (MAC-addressed frames). |
 | `--pixel` | off | Probe per-segment PIXEL control (`0xB0`): cycle the 5 working pixel effects (ColorReplacement / Single/Two/Three-ColorMoving / Fire) so distinct bands/animations appear along the tube. TL-series pixel fixtures only (e.g. TL120C). |
 | `--status` | off | Read device status — firmware version, battery, temperature, power/mode — and print the decoded replies. **Non-mutating** (no blink, no colour change), so it's safe to run against a light in use. |
+| `--recover` | off | Try to **wake a wedged light** (connected/advertising but ignoring commands, no notify): persistently find + retry-connect, then fire a menu of non-destructive pokes (status reads, read-request `0x84`, OTA-type probe `0xD0`, a power off/on cycle, a CCT frame, factory-test `0xF0`/`0xF5`) and finally drive **bright green** so you can see if it woke. Give a long `--seconds` (a wedged unit advertises only rarely). **Note:** a TL60-style *hard* wedge (LED-MCU hung) has no BLE escape — no poke, and no reconnect, clears it; only a power-cycle does. |
 | `--set SPEC` | — | Send ONE frame and hold it (guided one-at-a-time testing; the light keeps the state after disconnect). `SPEC` = `cct:<K>:<bri>` (2-byte form), `cctgm:<K>:<gm>:<bri>[:3\|4\|5]` (GM CCT, gm −50..50, optional frame form — default the app's 4-byte), `hsi:<hue>:<sat>:<bri>`, `xy:<x>:<y>:<bri>` (by-MAC `0xB7`), `xydirect:<x>:<y>:<bri>` (direct `0xB9`), `fx:<id>:<bri>` (MAC `0x91`), `fxdirect:<id>:<bri>` (direct `0x8B` — the TL21C's FX path), `scene:<id>:<bri>` (old 9-scene `0x88`), `pixel:<hue,…>:<eff>:<speed>`, `pixfx:<id>` (raw effect probe 1–10), `rgbcwmac:<r>:<g>:<b>[:<cw>:<ww>:<bri>]` (RGBCW via by-MAC `0xA9` — the production form; `rgbcw:…` = the direct `0xA8`, ignored on the TL120C), or `warmdim` (safe dim-warm end state). |
 
 `test` blinks the light 3× (also a visual identify), sets 5600K @ 50%, then runs
@@ -192,9 +193,13 @@ port    = 6454        # standard ArtNet port (configurable)
 [ble]
 adapter     = "default" # "default", an index ("0"), or a name substring
 flush_hz    = 15        # max BLE state updates per light per second (coalescing cap)
-probe_secs  = 20        # liveness-probe / status-query interval (stale-session detection)
-refresh_secs = 900      # force-reconnect a fixture that never replies (e.g. TL60) every
-                        # N s so a wedged-but-connected light self-heals; 0 disables
+probe_secs  = 20        # GATT-read connection check + status-canary interval (a missed
+                        # canary does NOT recycle the link on its own — see wedge_secs)
+wedge_secs  = 300       # recycle a proven reply-capable fixture only after this many
+                        # seconds of notify silence (LED-MCU hard-wedge); generous so it
+                        # never fires on transient loss; 0 disables. Deaf → refresh_secs
+refresh_secs = 900      # backstop reconnect for a fixture that never answers a canary
+                        # (a genuinely deaf one, e.g. TL97C); 0 disables
 
 [failsafe]              # what to do when ArtNet data stops arriving
 mode         = "hold"   # hold | blackout | poweroff
@@ -405,18 +410,33 @@ drops). The failsafe controls behaviour when ArtNet stops: `hold` keeps the last
 state, `blackout` sets brightness 0, `poweroff` powers the light off — after
 `timeout_secs` of silence.
 
-**Detecting a wedged-but-connected light.** These are two-chip fixtures (a BLE
-radio module in front of the LED MCU that runs the command parser), so a
+**Detecting a wedged / stale link — a layered check.** These are two-chip fixtures
+(a BLE radio module in front of the LED MCU that runs the command parser), so a
 `write-without-response` "succeeding" — or a generic GATT read completing — only
-proves the *radio* answered; the command path can stall while the light sits at
-its last colour, still showing "connected". The supervisor therefore verifies
-liveness by a **reply**, not a successful write: it periodically sends a cheap
-status query and requires a notify back; several silent probes recycle the link.
-A healthy light replies (a wedged one goes silent — exactly what this catches). A
-fixture that answers *nothing even when healthy* (e.g. a TL97C) can't be verified
-this way, so it gets a **periodic forced reconnect** (`refresh_secs`) as a backstop —
-which also covers a wedged light that hasn't recovered yet. Set `refresh_secs = 0`
-to disable it; fixtures that reply are never force-refreshed.
+proves the *radio* answered; the command path can stall while the light sits at its
+last colour, still showing "connected". So the supervisor uses two independent checks:
+
+- **Connection health:** a cheap GATT read every `probe_secs`. The radio answers it, so
+  it's stable and keeps a healthy light connected with no churn; several consecutive
+  misses mean a genuinely dead link → reconnect.
+- **Hard-wedge detection:** it also sends a cheap status *canary* each probe and, for a
+  fixture that has **proven it answers canaries**, requires a notify at least every
+  `wedge_secs` (default 5 min). Minutes of silence from a light that used to reply is
+  the LED-MCU-wedge signature → recycle. Deliberately tolerant: a *missed* canary isn't
+  a trigger, so transient loss or brief shared-adapter contention never recycles the
+  link (an earlier hair-trigger version caused a fleet-wide reconnect storm). A fixture
+  that answers *nothing even when healthy* (e.g. a TL97C) is treated as deaf — GATT-read
+  health plus a periodic forced reconnect (`refresh_secs`) as a backstop. Reconnects are
+  jittered so a fleet doesn't reconnect in lockstep.
+
+⚠️ **A *hard* wedge isn't always recoverable.** One tube here (a battery TL60) hits a
+firmware wedge where the LED MCU hangs — stuck on a colour, ignoring every command, its
+radio barely able to hold a connection. There is **no BLE reset** for this (confirmed
+against the protocol and the mature reference projects), so **only a power-cycle clears
+it** — and on a battery light that's a manual button press, not a smart plug. The check
+above can't revive that unit, but it does keep one wedged tube from dragging the rest of
+the fleet into a reconnect storm. `neewer-bridge test <MAC> --recover` fires every
+non-destructive wake-up poke we could find, as a last-ditch attempt (see the `test` flags).
 
 Each supervisor also **reads device status** off the notify characteristic —
 battery %, temperature, firmware version, and power/mode — querying on connect and

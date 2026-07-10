@@ -80,6 +80,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             rx,
             cfg.ble.flush_hz,
             cfg.ble.probe_secs,
+            cfg.ble.wedge_secs,
             cfg.ble.refresh_secs,
         );
         tokio::spawn(actor.run());

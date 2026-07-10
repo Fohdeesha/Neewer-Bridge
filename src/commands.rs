@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use btleplug::api::Characteristic;
-use btleplug::platform::Peripheral;
+use btleplug::platform::{Adapter, Peripheral};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
@@ -16,7 +16,7 @@ use crate::driver::Driver;
 use crate::models::Catalog;
 use crate::profile::Profile;
 use crate::protocol::pixel::{self, Block};
-use crate::protocol::{classic, home, infinity, queries};
+use crate::protocol::{classic, home, infinity, queries, with_checksum};
 
 /// Minimal JSON string escaping (quotes + backslashes) for `scan --json`.
 fn json_escape(s: &str) -> String {
@@ -565,9 +565,18 @@ pub async fn test(
     pixel: bool,
     set: Option<&str>,
     status: bool,
+    recover: bool,
 ) -> Result<()> {
     let mac_bytes = parse_mac(mac)?;
     let adapter = ble::acquire_adapter(adapter_selector).await?;
+
+    // Wedge recovery (`--recover`) is self-contained: a wedged unit advertises only
+    // intermittently AND its connect often fails, so it needs a persistent find+connect
+    // RETRY loop, not the one-shot find + single connect the other modes use.
+    if recover {
+        return recover_wedged(&adapter, mac, mac_bytes, seconds.max(120)).await;
+    }
+
     let peripheral = ble::find_by_mac(&adapter, mac, Duration::from_secs(seconds)).await?;
     let chars = ble::connect_and_verify(&peripheral).await?;
 
@@ -860,6 +869,93 @@ fn build_pixel_effect_test(mac: [u8; 6], id: u8) -> (Vec<Vec<u8>>, String) {
         vec![pixel::raw_frame(mac, &params), pixel::raw_frame(mac, &palette)],
         format!("effect {id} ({name})"),
     )
+}
+
+/// Persistent find + connect RETRY loop for a wedged/weak light, then fire the wake-up
+/// pokes. A wedged unit advertises only sporadically (so we ride a continuous scan, like
+/// the bridge) AND its connect frequently fails "Not connected" (a half-open radio / weak
+/// link), so we retry the whole find→connect until it takes or `timeout_secs` elapses.
+async fn recover_wedged(adapter: &Adapter, mac: &str, mac_bytes: [u8; 6], timeout_secs: u64) -> Result<()> {
+    ble::start_scan(adapter).await?;
+    info!(mac, timeout_secs, "recover: persistently scanning + retrying connect to the wedged light…");
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut attempt = 0u32;
+    loop {
+        // Wait for it to appear in the (accumulating) scan set.
+        let found = loop {
+            match ble::find_scanned(adapter, mac).await? {
+                Some(f) => break Some(f),
+                None if Instant::now() >= deadline => break None,
+                None => tokio::time::sleep(Duration::from_secs(2)).await,
+            }
+        };
+        let (peripheral, name) = match found {
+            Some(f) => f,
+            None => bail!("recover: {mac} never advertised within {timeout_secs}s — a deep wedge (radio silent) isn't BLE-reachable; power-cycle it"),
+        };
+        attempt += 1;
+        info!(mac, name = %name, attempt, "recover: found; connecting");
+        match ble::connect_and_verify(&peripheral).await {
+            Ok(chars) => {
+                if let Some(notify) = &chars.notify {
+                    let _ = ble::spawn_notify_logger(&peripheral, notify).await;
+                }
+                return test_recover(&peripheral, &chars.write, mac_bytes).await;
+            }
+            Err(e) => {
+                warn!(mac, attempt, error = %e, "recover: connect failed; will retry");
+                let _ = ble::disconnect(&peripheral).await;
+                if Instant::now() >= deadline {
+                    bail!("recover: could not connect within {timeout_secs}s after {attempt} tries — connect keeps failing (half-open/wedged radio); power-cycle it");
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
+/// Fire a menu of non-destructive "wake up" pokes at a wedged light (safest first),
+/// pausing after each so any notify reply lands in the logger; then drive bright green
+/// so a human can confirm. NONE of these reflash firmware — they're the plausible
+/// LED-MCU nudges we could find (status reads, the generic read-request `0x84`, the OTA
+/// -type probe `0xD0`, a BLE power off/on cycle, a plain CCT frame that's known to clear
+/// an FX/pixel latch, and the factory-test toggles `0xF0`/`0xF5`). If none wake it, the
+/// wedge is not BLE-clearable and only a power-cycle will (see `--recover`).
+async fn test_recover(p: &Peripheral, write: &Characteristic, mac: [u8; 6]) -> Result<()> {
+    let pause = Duration::from_millis(1500);
+    let attempts: Vec<(&str, Vec<u8>)> = vec![
+        ("status: version 0x9E", queries::version(mac)),
+        ("status: battery 0x95", queries::battery(mac)),
+        ("status: state 0x8E", queries::state(mac)),
+        ("read-request 0x84", with_checksum(vec![0x78, 0x84, 0x00])),
+        ("OTA-type probe 0xD0", with_checksum(vec![0x78, 0xD0, 0x00])),
+        ("power OFF 0x81", classic::power(false)),
+        ("power ON 0x81", classic::power(true)),
+        ("power OFF 0x81 #2", classic::power(false)),
+        ("power ON 0x81 #2", classic::power(true)),
+        ("CCT 3200K (clears FX/pixel latch)", classic::cct2(50, 32)),
+        ("factory-test 0xF0=AA", with_checksum(vec![0x78, 0xF0, 0x01, 0xAA])),
+        ("factory-test 0xF5=CC", with_checksum(vec![0x78, 0xF5, 0x01, 0xCC])),
+    ];
+    info!(
+        "recover: firing {} wake-up pokes at the wedged light — watch it + the notify log for any reply",
+        attempts.len()
+    );
+    for (label, frame) in &attempts {
+        info!(step = %label, bytes = %ble::hexstr(frame), "recover →");
+        if let Err(e) = ble::write_command(p, write, frame).await {
+            warn!(step = %label, error = %e, "recover: write failed (link flaky)");
+        }
+        tokio::time::sleep(pause).await;
+    }
+    // Finally, a bright, distinct colour and hold — visual proof of life.
+    info!("recover: driving BRIGHT GREEN now — LOOK at the light (green = it woke; unchanged = the wedge is not BLE-clearable)");
+    if let Err(e) = ble::write_command(p, write, &classic::hsi(120, 100, 100)).await {
+        warn!(error = %e, "recover: final green write failed");
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    info!("recover: done — tell me what the light did.");
+    Ok(())
 }
 
 /// Read device status: send the MAC-addressed version / battery / temperature /
