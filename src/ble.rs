@@ -313,6 +313,38 @@ pub async fn write_command_chunked(p: &Peripheral, write: &Characteristic, data:
     Ok(())
 }
 
+/// Write one OTA logical frame (`0x96` header or `0x97`/`0xCF` block), fragmenting
+/// it into ≤[`MAX_ATT_WRITE`]-byte GATT writes exactly as the device expects (it
+/// reassembles by the frame's header length byte).
+///
+/// Unlike [`write_command_chunked`] this prefers **write-WITH-response** per chunk
+/// when the characteristic supports it, so every fragment is ATT-acknowledged
+/// before the next — the reliability that a firmware flash wants. It falls back to
+/// write-without-response for chars that only advertise that. The block-level
+/// device ACK (`0x06`) is the primary flow-control; this just makes each block's
+/// bytes land intact. `chunk_delay` spaces fragments (small, e.g. 4–8 ms).
+pub async fn write_ota_frame(
+    p: &Peripheral,
+    write: &Characteristic,
+    data: &[u8],
+    chunk_delay: Duration,
+) -> Result<()> {
+    let wt = if write.properties.contains(CharPropFlags::WRITE) {
+        WriteType::WithResponse
+    } else {
+        WriteType::WithoutResponse
+    };
+    for chunk in data.chunks(MAX_ATT_WRITE) {
+        p.write(write, chunk, wt)
+            .await
+            .with_context(|| format!("writing OTA fragment of {}", hexstr(data)))?;
+        if !chunk_delay.is_zero() {
+            tokio::time::sleep(chunk_delay).await;
+        }
+    }
+    Ok(())
+}
+
 /// A stream of inbound notification frames from a peripheral.
 pub type NotifyStream = std::pin::Pin<Box<dyn futures::Stream<Item = btleplug::api::ValueNotification> + Send>>;
 

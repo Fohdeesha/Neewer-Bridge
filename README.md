@@ -89,6 +89,7 @@ No command ⇒ `run` (launching the bare binary starts the bridge).
 | `add` | Bind a light to the config (interactive, or non-interactive with `--mac`). |
 | `inspect <MAC>` | Connect and dump a device's full GATT (identify unknown lights). |
 | `test <MAC>` | Connect one light and prove control (blink + CCT, optional colour/mode probes). |
+| `ota <MAC>` | Flash a firmware `.bin` to a light over the custom `0x78` OTA block protocol (`--check` to dry-run, `--confirm` to write). |
 | `artnet-send` | Send ArtDmx to drive the bridge / a node without a console. |
 | `monitor` | Listen for ArtNet and print received ArtDmx (no BLE needed). |
 | `run` | The full bridge: ArtNet → mapper → per-light BLE actors. **The default** — running `neewer-bridge` with no command does this. |
@@ -111,9 +112,9 @@ failsafe — logs at `info`; every BLE command sent to a light logs at `debug`, 
 setting `file_level = "debug"` keeps a full on-disk record while the console stays
 clean at `info`.
 
-`scan`, `add`, `test`, `inspect`, `monitor`, `adapters`, and `artnet-send` work
-without a config file (they fall back to defaults); `lights` and `run` require a
-valid config.
+`scan`, `add`, `test`, `ota`, `inspect`, `monitor`, `adapters`, and `artnet-send`
+work without a config file (they fall back to defaults); `lights` and `run` require
+a valid config.
 
 ### Per-command flags
 
@@ -160,6 +161,30 @@ driver / profile / CCT range are filled automatically; any flag overrides.
 `test` blinks the light 3× (also a visual identify), sets 5600K @ 50%, then runs
 any requested probes. FX and PIXEL latch the light into their mode — `test`
 power-cycles to exit and restores white.
+
+**`ota <MAC>`** — flash a firmware image over the custom `0x78` OTA block protocol
+(the transport the NEEWER app uses for "OTA"-mode fixtures, e.g. the TL60 RGB-3 —
+rides the normal control service, not Nordic DFU). Get the `.bin` + its version
+from Neewer's OTA server (`support.neewer.com/bluetoothlight/app/v1/home/devices/version?deviceModel=<model>&updateType=OTA&departmentType=1`).
+| Flag | Default | Meaning |
+|---|---|---|
+| `--file PATH` | **required** | The firmware `.bin` to flash. Sanity-checked (size + ARM vector table) before anything is sent. |
+| `--version M.M.P` | `3.0.5` | Version being flashed (goes in the header; should match the `.bin`). |
+| `--name NAME` | `TL60 RGB-3` | Cosmetic model name in the header (the device ignores it). |
+| `--check` | off | Dry-run: connect, run the link-stability check, resolve the block type — **never writes firmware**. Run this first. |
+| `--confirm` | off | Actually flash. Required for the real write. |
+| `--settle-secs N` | `20` | Seconds the link must stay connected in the pre-flash stability check (aborts if it drops). |
+| `--seconds N` | `20` | How long to wait to find the light. |
+| `--chunk-delay-ms N` | `15` | Delay between the 20-byte GATT fragments of each frame. On a marginal link, raise it (20–40) to stop the device's UART reassembler being overrun (silent chunk drops → device resends). |
+
+**Safety:** `--check` never writes firmware; the flash needs `--confirm`; the
+pre-flash link check aborts before any firmware byte if the connection won't hold;
+and the device drives the transfer via ACKs and validates an additive check-code
+before committing — a dropped block fails cleanly (retryable), it doesn't brick,
+and nothing is committed until the final ACK (an interrupted flash leaves the old
+firmware intact). **Stop the main bridge first** — it fights this tool for the
+adapter/MAC — and for a weak-signal fixture, put the BLE adapter right next to the
+light (a USB extension) so the link can sustain the transfer.
 
 **`artnet-send`** — drive the bridge (or any ArtNet node) without a console.
 | Flag | Default | Meaning |

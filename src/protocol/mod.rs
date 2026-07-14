@@ -24,6 +24,7 @@
 pub mod classic;
 pub mod home;
 pub mod infinity;
+pub mod ota;
 pub mod pixel;
 pub mod queries;
 pub mod replies;

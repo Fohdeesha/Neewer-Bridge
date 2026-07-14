@@ -164,10 +164,65 @@ enum Command {
         #[arg(long)]
         status: bool,
     },
+    /// Flash a firmware image to a light over the custom 0x78 OTA block protocol.
+    ///
+    /// SAFETY: `--check` only probes (link + OTA type) and never writes firmware;
+    /// the real flash requires `--confirm`. A link-stability precheck aborts before
+    /// any firmware byte is sent if the connection will not hold, so a marginal link
+    /// fails safe. The device drives the transfer via ACKs and validates a check-code
+    /// before committing — a dropped block fails cleanly and is retryable, not a brick.
+    /// STOP THE MAIN BRIDGE FIRST (it fights this tool for the same adapter/MAC).
+    Ota {
+        /// Target light MAC, e.g. F9:B8:B6:15:F9:8D.
+        mac: String,
+        /// Path to the firmware .bin (e.g. the TL60-3_V3.0.5_*.bin from Neewer's OTA server).
+        #[arg(long)]
+        file: PathBuf,
+        /// Firmware version being flashed, "MAJOR.MINOR.PATCH" (display metadata in the
+        /// 0x96 header — should match the .bin, e.g. 3.0.5 for the TL60 RGB-3).
+        #[arg(long, default_value = "3.0.5")]
+        version: String,
+        /// Cosmetic device/model name written into the header (device ignores it).
+        #[arg(long, default_value = "TL60 RGB-3")]
+        name: String,
+        /// Probe only: connect, run the link-stability check, resolve the OTA block
+        /// type — but do NOT write firmware. Use this first to confirm the link holds.
+        #[arg(long)]
+        check: bool,
+        /// Actually flash. Required for the real write (guards against accidents).
+        #[arg(long)]
+        confirm: bool,
+        /// Seconds the link must stay connected in the pre-flash stability check.
+        #[arg(long, default_value_t = 20)]
+        settle_secs: u64,
+        /// How long to wait to find the light, seconds.
+        #[arg(long, default_value_t = 20)]
+        seconds: u64,
+        /// Delay between the 20-byte GATT fragments of each OTA frame, milliseconds.
+        /// On a marginal link, raising this (e.g. 20-40) gives the device's UART
+        /// reassembler more time and cuts silent chunk drops / device resends.
+        #[arg(long, default_value_t = 15)]
+        chunk_delay_ms: u64,
+    },
     /// Listen for ArtNet and print received ArtDmx packets (no BLE needed).
     Monitor,
     /// Run the full ArtNet→BLE bridge (the default when no command is given).
     Run,
+}
+
+/// Parse a "MAJOR.MINOR.PATCH" version string into 3 bytes for the OTA header.
+fn parse_version_triplet(s: &str) -> anyhow::Result<[u8; 3]> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("version must be MAJOR.MINOR.PATCH (e.g. 3.0.5), got {s:?}");
+    }
+    let mut v = [0u8; 3];
+    for (i, p) in parts.iter().enumerate() {
+        v[i] = p
+            .parse::<u8>()
+            .map_err(|_| anyhow::anyhow!("version component {p:?} is not a 0-255 number"))?;
+    }
+    Ok(v)
 }
 
 /// Resolve the config path. An explicit `--config` is used as-is; otherwise
@@ -262,6 +317,15 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
         Command::Test { mac, driver, seconds, colors, modes, pixel, set, status } => {
             let cfg = Config::load(config_path).unwrap_or_default();
             commands::test(&cfg.ble.adapter, mac, driver, *seconds, *colors, *modes, *pixel, set.as_deref(), *status).await
+        }
+        Command::Ota { mac, file, version, name, check, confirm, settle_secs, seconds, chunk_delay_ms } => {
+            let cfg = Config::load(config_path).unwrap_or_default();
+            let ver = parse_version_triplet(version)?;
+            commands::ota(
+                &cfg.ble.adapter, mac, file, ver, name, *confirm, *check, *settle_secs, *seconds,
+                *chunk_delay_ms,
+            )
+            .await
         }
         Command::Monitor => {
             let cfg = Config::load(config_path).unwrap_or_default();

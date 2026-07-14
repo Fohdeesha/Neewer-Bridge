@@ -1003,7 +1003,24 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
                 true,
             )
         }
-        other => bail!("--set: unknown spec kind '{other}' (cct|hsi|xy|xydirect|scene|fx|fxdirect|pixel|pixfx|warmdim|rgbcw|rgbcwmac)"),
+        "raw" => {
+            // Send an arbitrary frame VERBATIM (the whole frame incl. its checksum is
+            // supplied) — protocol spelunking, e.g. the OTA-type probe `raw:78D00048`
+            // (78 D0 00 48). No CCT-clear first: exactly these bytes and nothing else.
+            // Any notify reply is decoded/logged by the notify logger (raw hex at -v).
+            let hex: String =
+                parts[1..].join("").chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            if hex.is_empty() || !hex.len().is_multiple_of(2) {
+                bail!("--set raw: give an even-length hex frame, e.g. raw:78D00048");
+            }
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex validated"))
+                .collect();
+            let shown = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+            (vec![bytes], format!("raw frame [{shown}]"), false)
+        }
+        other => bail!("--set: unknown spec kind '{other}' (cct|hsi|xy|xydirect|scene|fx|fxdirect|pixel|pixfx|warmdim|rgbcw|rgbcwmac|raw)"),
     };
 
     if reset {
@@ -1026,4 +1043,330 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
     }
     info!("held; light retains this state after disconnect");
     Ok(())
+}
+
+// ── Firmware OTA (custom 0x78 block protocol) ─────────────────────────────────
+
+/// Read the next inbound notify frame, or `None` on timeout.
+async fn ota_next_frame(stream: &mut ble::NotifyStream, timeout: Duration) -> Option<Vec<u8>> {
+    use futures::StreamExt;
+    match tokio::time::timeout(timeout, stream.next()).await {
+        Ok(Some(n)) => Some(n.value),
+        _ => None,
+    }
+}
+
+/// Hold the live connection for `settle` and confirm it stays up, issuing a cheap
+/// GATT read each second. Returns an error if the link drops — the go/no-go gate
+/// before committing to a multi-minute firmware transfer over a marginal link.
+async fn ota_link_precheck(
+    p: &Peripheral,
+    write: &Characteristic,
+    mac: [u8; 6],
+    settle: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut ticks = 0u32;
+    while start.elapsed() < settle {
+        if !ble::is_connected(p).await {
+            bail!(
+                "link dropped after {:.1}s of the {:.0}s stability check — move the light \
+                 (or the adapter) closer and retry; NOT flashing over a flaky link",
+                start.elapsed().as_secs_f32(),
+                settle.as_secs_f32()
+            );
+        }
+        // A non-mutating version read as a keepalive / liveness poke.
+        ble::write_command(p, write, &queries::version(mac)).await.ok();
+        ticks += 1;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    info!(held_secs = ticks, "link held steady — OK to proceed");
+    Ok(())
+}
+
+/// Flash a firmware image to a light over the custom `0x78` OTA block protocol.
+///
+/// Safe by construction: `--check` only probes (never writes firmware), the real
+/// flash requires `--confirm`, and a link-stability precheck aborts before any
+/// firmware byte is sent if the connection will not hold. The device drives the
+/// whole transfer via `0x06` ACKs and validates an additive check-code before
+/// committing, so a dropped/garbled block fails cleanly (retryable), it does not
+/// brick — the device stays in its bootloader and can be re-flashed.
+///
+/// Stop the main bridge first — it will fight this tool for the same adapter/MAC.
+#[allow(clippy::too_many_arguments)]
+pub async fn ota(
+    adapter_selector: &str,
+    mac: &str,
+    file: &Path,
+    version: [u8; 3],
+    name: &str,
+    confirm: bool,
+    check_only: bool,
+    settle_secs: u64,
+    seconds: u64,
+    chunk_delay_ms: u64,
+) -> Result<()> {
+    use crate::protocol::{ota, replies};
+    let mac_bytes = parse_mac(mac)?;
+    let chunk_delay = Duration::from_millis(chunk_delay_ms);
+
+    // 1. Load + sanity-check the image (before touching BLE).
+    let image = std::fs::read(file)
+        .with_context(|| format!("reading firmware image {}", file.display()))?;
+    if image.len() < 1024 {
+        bail!("firmware image is only {} bytes — that is not a real image", image.len());
+    }
+    let size = image.len() as u32;
+    let cc = ota::check_code(&image);
+    // ARM Cortex-M images start with the initial stack pointer (a RAM address,
+    // 0x2000_xxxx). If this word does not look like that, the file is probably a
+    // truncated download or an HTML error page — refuse.
+    let sp = u32::from_le_bytes([image[0], image[1], image[2], image[3]]);
+    let looks_arm = (0x2000_0000..0x2008_0000).contains(&sp);
+    info!(
+        image = %file.display(),
+        bytes = size,
+        check_code = %format!("0x{cc:08X}"),
+        initial_sp = %format!("0x{sp:08X}"),
+        looks_arm,
+        version = %format!("{}.{}.{}", version[0], version[1], version[2]),
+        "firmware image loaded"
+    );
+    if !looks_arm {
+        bail!(
+            "image does not begin with an ARM Cortex-M stack pointer (got 0x{sp:08X}, \
+             expected 0x2000_xxxx) — this does not look like a Neewer LED-MCU .bin; refusing"
+        );
+    }
+
+    // 2. Connect + verify. OTA needs the notify characteristic for the ACK stream.
+    let adapter = ble::acquire_adapter(adapter_selector).await?;
+    let peripheral = ble::find_by_mac(&adapter, mac, Duration::from_secs(seconds)).await?;
+    let adv_name = ble::peripheral_name(&peripheral).await;
+    let rssi = ble::rssi(&peripheral).await;
+    info!(ble_name = %adv_name, ?rssi, "found; connecting");
+    let chars = ble::connect_and_verify(&peripheral).await?;
+    let write = chars.write.clone();
+    // Which write mode we get matters a lot on a marginal link: write-WITH-response
+    // ATT-acks every fragment (dropped chunks surface as errors we can act on),
+    // write-WITHOUT-response is fire-and-forget (drops are silent → device resends).
+    info!(
+        props = ?write.properties,
+        with_response = write.properties.contains(btleplug::api::CharPropFlags::WRITE),
+        chunk_delay_ms,
+        "write characteristic"
+    );
+    let notify = chars
+        .notify
+        .clone()
+        .context("OTA needs the notify characteristic (69400003-…); not found on this light")?;
+    let mut stream = ble::subscribe_notify(&peripheral, &notify).await?;
+
+    // 3. Read current firmware version (best-effort, for the record).
+    ble::write_command(&peripheral, &write, &queries::version(mac_bytes)).await.ok();
+    if let Some(frame) = ota_next_frame(&mut stream, Duration::from_secs(2)).await {
+        if let Some(reply) = replies::parse(&frame) {
+            info!(current = %reply.summary(), "device reports");
+        }
+    }
+
+    // 4. Link-stability precheck — the go/no-go gate for a marginal link.
+    info!(secs = settle_secs, "checking link stability before flashing…");
+    ota_link_precheck(&peripheral, &write, mac_bytes, Duration::from_secs(settle_secs)).await?;
+
+    // 5. Probe the OTA block type (0xD0 → 0x1A). Default to 128-byte if silent.
+    ble::write_command(&peripheral, &write, &ota::probe_frame(ota::HEADER_STD)).await?;
+    let mut kind = ota::BlockKind::Std128;
+    for _ in 0..4 {
+        match ota_next_frame(&mut stream, Duration::from_millis(600)).await {
+            Some(f) => {
+                if let Some(k) = ota::parse_type_reply(&f) {
+                    kind = k;
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    let total_blocks = ota::block_count(image.len(), kind);
+    info!(ota_type = ?kind, block_size = kind.block_size(), total_blocks, "OTA type resolved");
+
+    if check_only {
+        info!("--check only: NOT flashing. Link + OTA type verified above.");
+        let _ = ble::disconnect(&peripheral).await;
+        return Ok(());
+    }
+    if !confirm {
+        let _ = ble::disconnect(&peripheral).await;
+        bail!(
+            "refusing to flash without --confirm (this rewrites the LED-MCU firmware). \
+             The link held and the device is ready — re-run with --confirm to proceed."
+        );
+    }
+
+    // 6. Run the header + block transfer. Whatever the outcome, disconnect cleanly
+    //    first — a failed flash must not leave a half-open link that keeps the radio
+    //    from re-advertising (mirror of the "always release the light" cleanup rule).
+    let header = ota::Header {
+        version,
+        size,
+        check_code: cc,
+        name: name.to_string(),
+        header_byte: ota::HEADER_STD,
+    };
+    let result = ota_transfer(
+        &peripheral, &write, &mut stream, &image, kind, chunk_delay, total_blocks, size, &header,
+    )
+    .await;
+    let _ = ble::disconnect(&peripheral).await;
+    result?;
+
+    // 7. Let the device reboot, then reconnect and read back the version.
+    info!("waiting 12s for the light to reboot on the new firmware…");
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    match ble::find_by_mac(&adapter, mac, Duration::from_secs(20)).await {
+        Ok(p2) => match ble::connect_and_verify(&p2).await {
+            Ok(c2) => {
+                if let Some(n2) = &c2.notify {
+                    let mut s2 = ble::subscribe_notify(&p2, n2).await?;
+                    ble::write_command(&p2, &c2.write, &queries::version(mac_bytes)).await.ok();
+                    if let Some(f) = ota_next_frame(&mut s2, Duration::from_secs(3)).await {
+                        if let Some(reply) = replies::parse(&f) {
+                            info!(post_flash = %reply.summary(), "reconnected — device reports");
+                        }
+                    }
+                }
+                let _ = ble::disconnect(&p2).await;
+            }
+            Err(e) => warn!(error = %e, "reconnected scan found the light but verify failed"),
+        },
+        Err(e) => warn!(error = %e, "could not find the light after reboot (it may still be booting)"),
+    }
+    info!("OTA finished.");
+    Ok(())
+}
+
+/// The header + ACK-driven block transfer. Split out from [`ota`] so the caller
+/// can disconnect the link cleanly whatever the outcome (a mid-flash abort must
+/// not leave a half-open connection that stops the radio re-advertising).
+///
+/// Returns `Ok(())` only when the device sends the `Done` ACK (image committed).
+#[allow(clippy::too_many_arguments)]
+async fn ota_transfer(
+    peripheral: &Peripheral,
+    write: &Characteristic,
+    stream: &mut ble::NotifyStream,
+    image: &[u8],
+    kind: crate::protocol::ota::BlockKind,
+    chunk_delay: Duration,
+    total_blocks: usize,
+    size: u32,
+    header: &crate::protocol::ota::Header,
+) -> Result<()> {
+    use crate::protocol::{ota, replies};
+
+    let header_frame = header.frame();
+    info!(frame = %ble::hexstr(&header_frame), "sending OTA header (0x96)");
+
+    let mut idx: i64 = -1; // block index; the first `Next` advances it to 0
+    let mut started = false; // have we seen the first ACK yet?
+    let mut header_attempts = 0u32;
+    let mut resends = 0u64; // diagnostic: total resend requests over the transfer
+    let mut last_pct = -1i32;
+    let flash_start = Instant::now();
+
+    ble::write_ota_frame(peripheral, write, &header_frame, chunk_delay).await?;
+
+    loop {
+        let Some(frame) = ota_next_frame(stream, Duration::from_secs(12)).await else {
+            // Timeout.
+            if !started {
+                header_attempts += 1;
+                if header_attempts >= 5 {
+                    bail!("device never acknowledged the OTA header after 5 attempts — aborting");
+                }
+                warn!(attempt = header_attempts, "no ACK for header; resending");
+                ble::write_ota_frame(peripheral, write, &header_frame, chunk_delay).await?;
+                continue;
+            }
+            bail!(
+                "device went silent mid-transfer at block {}/{} after {} resends — aborting \
+                 (retry the flash; nothing was committed, the old firmware is intact)",
+                idx.max(0),
+                total_blocks,
+                resends
+            );
+        };
+
+        let Some(ack) = ota::parse_ack(&frame) else {
+            // Not an ACK (a stray status reply); log and keep waiting.
+            if let Some(reply) = replies::parse(&frame) {
+                info!(notify = %reply.summary(), "non-ACK notify during OTA (ignored)");
+            }
+            continue;
+        };
+        started = true;
+
+        match ack {
+            ota::Ack::Next => {
+                idx += 1;
+                match ota::block_at(image, kind, idx as usize) {
+                    Some(block) => {
+                        let frame = ota::block_frame(kind, block, ota::HEADER_STD);
+                        ble::write_ota_frame(peripheral, write, &frame, chunk_delay).await?;
+                        let sent = (idx as usize) * kind.block_size() + block.len();
+                        let pct = (sent as u64 * 100 / size as u64) as i32;
+                        if pct >= last_pct + 2 || idx == 0 {
+                            last_pct = pct;
+                            info!(pct, block = idx, total = total_blocks, resends, "flashing");
+                        }
+                    }
+                    None => {
+                        // All blocks sent; device should send Done next.
+                        info!("all blocks sent; awaiting device commit (Done)…");
+                    }
+                }
+            }
+            ota::Ack::Resend => {
+                resends += 1;
+                if idx >= 0 {
+                    if let Some(block) = ota::block_at(image, kind, idx as usize) {
+                        warn!(block = idx, resends, "device requested resend");
+                        let frame = ota::block_frame(kind, block, ota::HEADER_STD);
+                        ble::write_ota_frame(peripheral, write, &frame, chunk_delay).await?;
+                    }
+                }
+            }
+            ota::Ack::Restart => {
+                warn!("device requested restart from block 0");
+                idx = 0;
+                if let Some(block) = ota::block_at(image, kind, 0) {
+                    let frame = ota::block_frame(kind, block, ota::HEADER_STD);
+                    ble::write_ota_frame(peripheral, write, &frame, chunk_delay).await?;
+                    last_pct = -1;
+                }
+            }
+            ota::Ack::Done => {
+                info!(
+                    elapsed_secs = %format!("{:.1}", flash_start.elapsed().as_secs_f32()),
+                    resends,
+                    "OTA complete — device accepted the image and is committing/rebooting"
+                );
+                return Ok(());
+            }
+            ota::Ack::Fail => {
+                bail!(
+                    "device reported OTA FAILURE (op=4) at block {}/{} — the image was rejected \
+                     (check-code mismatch or transfer error). Nothing was committed; retry.",
+                    idx.max(0),
+                    total_blocks
+                );
+            }
+            ota::Ack::Unknown(op) => {
+                warn!(op, "unknown OTA ACK op; ignoring");
+            }
+        }
+    }
 }
