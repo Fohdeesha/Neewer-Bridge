@@ -441,17 +441,27 @@ half-dead. The supervisor guards against that with a cheap **GATT read every
 `probe_secs`** — the radio answers it, so a healthy light stays connected with no churn;
 three consecutive misses (or a reported disconnect) mean a dead link → reconnect.
 Reconnects use a **jittered backoff** so a fleet doesn't reconnect in lockstep. That's the
-whole liveness model — there's no elaborate "wedge" state to detect.
+whole liveness model — the bridge deliberately doesn't try to auto-detect a firmware "wedge"
+(see the note below on why).
 
-⚠️ **A light stuck on its last colour and ignoring commands is almost always a weak RX
-link** — the bridge can't currently reach it, so a new command never lands. It
-**reconnects and resumes on its own** once the signal is good again; no power-cycle or
-special recovery is needed. If one unit does this repeatedly it's the weakest radio in the
-fleet — move it nearer the adapter (or the adapter nearer it). RSSI is logged per light (at
-session start and on each probe) precisely so you can spot a marginal placement. (Earlier
-versions of these notes mis-diagnosed this as an unrecoverable firmware "wedge" needing a
-power-cycle, and shipped a `test --recover` poke tool plus a notify-silence wedge detector;
-both were removed once the real variable turned out to be signal.)
+⚠️ **A light stuck on its last colour and ignoring commands has two possible causes —
+tell them apart by whether moving it closer helps:**
+- **Weak RX link** (the common one) — the bridge can't currently reach the fixture, so a
+  new command never lands. It **reconnects and resumes on its own** once the signal is good
+  again; **move it (or the adapter) nearer** and it recovers, no power-cycle needed. If one
+  unit does this repeatedly it's the weakest radio in the fleet. RSSI is logged per light
+  (at session start and on each probe) precisely so you can spot a marginal placement.
+- **Firmware wedge** (rarer, seen on a damaged unit) — the fixture is hung: it stays
+  unresponsive/unconnectable **even with the adapter touching it**, and **only a full
+  power-cycle clears it** — RF proximity does not, and neither does reflashing the current
+  firmware. Weak RF seems to *trigger* the wedge, but once wedged it's a firmware state. So:
+  if getting close fixes it, it was a weak link; if it's still dead at touching range,
+  power-cycle it.
+
+(Note: the bridge does **not** auto-detect the wedge — an earlier notify-silence "wedge"
+detector plus a `test --recover` tool were removed for having too many false positives and
+aggressively churning connections. The liveness model above is deliberately just the
+GATT-read check + jittered reconnect.)
 
 **Discovery scanning is on-demand, not permanent.** btleplug only discovers a light while
 a scan is running, so the bridge scans to (re)find a *disconnected* fixture — but only
