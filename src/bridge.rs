@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::light::LightActor;
 use crate::profile::{extract_slice, map_dmx, CctRange, Profile};
 use crate::protocol::LightState;
+use crate::scan;
 
 /// One DMX consumer: where a light lives in a universe and how to push to it.
 struct Sink {
@@ -41,8 +42,23 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     let adapter = ble::acquire_adapter(&cfg.ble.adapter).await?;
-    ble::start_scan(&adapter).await?;
-    info!("BLE scan started (shared)");
+    // Discovery scanning is coordinated (scan.rs), not permanently on: the bridge
+    // scans only while a light is disconnected, in duty-cycled bursts, and not at
+    // all once every light is connected. A continuous scan starves the active
+    // connections on a cheap USB controller and makes the kernel log
+    // `LE Set Scan Enable` timeouts (NOTES.md §5).
+    let scan = scan::ScanCoordinator::new();
+    tokio::spawn(scan::run(
+        adapter.clone(),
+        scan.clone(),
+        Duration::from_secs(cfg.ble.scan_window_secs),
+        Duration::from_secs(cfg.ble.scan_pause_secs),
+    ));
+    info!(
+        scan_window_secs = cfg.ble.scan_window_secs,
+        scan_pause_secs = cfg.ble.scan_pause_secs,
+        "BLE discovery-scan coordinator started (scans only while a light is disconnected)"
+    );
 
     // Build the universe → sinks map (+ a flat list for the failsafe task) and
     // spawn one actor per light. Sinks are shared via Arc between the ArtNet
@@ -80,6 +96,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             rx,
             cfg.ble.flush_hz,
             cfg.ble.probe_secs,
+            scan.clone(),
         );
         tokio::spawn(actor.run());
     }

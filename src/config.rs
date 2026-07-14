@@ -47,6 +47,19 @@ pub struct Ble {
     /// best-effort status query for telemetry.
     #[serde(default = "default_probe_secs")]
     pub probe_secs: u64,
+    /// Discovery-scan burst length, seconds. The bridge scans for a missing light
+    /// only in bursts of this long (then pauses — see `scan_pause_secs`). While
+    /// every configured light is connected it does NOT scan at all, which keeps a
+    /// cheap USB BT controller from choking (continuous scanning + active
+    /// connections makes the kernel log `LE Set Scan Enable` timeouts).
+    #[serde(default = "default_scan_window_secs")]
+    pub scan_window_secs: u64,
+    /// Pause between discovery bursts, seconds, while a light is still missing.
+    /// A returning/flaky fixture is picked up within roughly one burst+pause,
+    /// without a continuous scan. `0` = scan continuously *while* something is
+    /// missing (still off once all are connected).
+    #[serde(default = "default_scan_pause_secs")]
+    pub scan_pause_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -136,6 +149,8 @@ impl Default for Ble {
             adapter: default_adapter(),
             flush_hz: default_flush_hz(),
             probe_secs: default_probe_secs(),
+            scan_window_secs: default_scan_window_secs(),
+            scan_pause_secs: default_scan_pause_secs(),
         }
     }
 }
@@ -172,6 +187,12 @@ fn default_flush_hz() -> u32 {
 }
 fn default_probe_secs() -> u64 {
     20
+}
+fn default_scan_window_secs() -> u64 {
+    8
+}
+fn default_scan_pause_secs() -> u64 {
+    15
 }
 /// Default CCT scaling range (raw ×100K): 3200K..5600K, the common bi-color span.
 pub const DEFAULT_CCT_MIN: u8 = 32;

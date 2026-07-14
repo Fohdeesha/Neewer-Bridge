@@ -15,3 +15,4 @@ pub mod logging;
 pub mod models;
 pub mod profile;
 pub mod protocol;
+pub mod scan;

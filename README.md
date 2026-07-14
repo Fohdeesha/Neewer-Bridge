@@ -194,6 +194,11 @@ adapter     = "default" # "default", an index ("0"), or a name substring
 flush_hz    = 15        # max BLE state updates per light per second (coalescing cap)
 probe_secs  = 20        # GATT-read connection check (3 misses recycle the link) +
                         # status-telemetry read interval
+scan_window_secs = 8    # discovery scan is on-demand: scan for a MISSING light in
+scan_pause_secs  = 15   # bursts of scan_window_secs, then idle scan_pause_secs — and
+                        # not at all once every light is connected. Keeps a permanent
+                        # scan from starving the links on cheap USB dongles. pause 0 =
+                        # continuous while something's missing (still off when all up)
 
 [failsafe]              # what to do when ArtNet data stops arriving
 mode         = "hold"   # hold | blackout | poweroff
@@ -422,6 +427,15 @@ session start and on each probe) precisely so you can spot a marginal placement.
 versions of these notes mis-diagnosed this as an unrecoverable firmware "wedge" needing a
 power-cycle, and shipped a `test --recover` poke tool plus a notify-silence wedge detector;
 both were removed once the real variable turned out to be signal.)
+
+**Discovery scanning is on-demand, not permanent.** btleplug only discovers a light while
+a scan is running, so the bridge scans to (re)find a *disconnected* fixture — but only
+then, and even then in duty-cycled bursts (`scan_window_secs` on, `scan_pause_secs` off),
+never continuously. Once every configured light is connected the adapter isn't scanning at
+all. A permanent scan competes with the active connections for the radio and makes cheap
+USB controllers (e.g. Realtek RTL8761BU) log kernel `LE Set Scan Enable` timeouts;
+scanning only when something is actually missing keeps the links stable. A light left
+powered off for days is polled in brief periodic bursts, not scanned constantly.
 
 Each supervisor also **reads device status** off the notify characteristic —
 battery %, temperature, firmware version, and power/mode — querying on connect and

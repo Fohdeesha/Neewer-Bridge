@@ -21,6 +21,14 @@ adapter     = "default"
 flush_hz    = 15         # max BLE state updates per light per second (coalescing cap)
 probe_secs  = 20         # how often (s) to run the cheap GATT-read connection check
                          # (3 consecutive misses recycle the link) + read status telemetry
+# Discovery scanning is on-demand, not permanent: the bridge scans only while a light
+# is disconnected, in duty-cycled bursts, and NOT AT ALL once every light is connected.
+# A continuous scan starves the active connections on cheap USB BT dongles (kernel
+# "LE Set Scan Enable" timeouts); this keeps the radio free for the links.
+scan_window_secs = 8     # length of each discovery burst (s) while a light is missing
+scan_pause_secs  = 15    # idle gap between bursts (s) so a powered-off/flaky light is
+                         # polled periodically, never scanned constantly. 0 = scan
+                         # continuously while something's missing (still off when all up)
 # NB: a light stuck on its last colour and ignoring commands is almost always a WEAK RX
 # LINK — the bridge can't currently reach it. It reconnects and resumes on its own once
 # the signal is good again, so keep a flaky unit within decent range of the adapter. (No

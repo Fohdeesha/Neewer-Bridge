@@ -23,6 +23,7 @@
 //! lifetime, the DMX→light mapping is stable regardless of power-on/discovery
 //! order — a light that's currently absent simply keeps retrying.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -39,6 +40,7 @@ use crate::driver::Driver;
 use crate::profile::Profile;
 use crate::protocol::replies::{self, Reply};
 use crate::protocol::{queries, LightState};
+use crate::scan::ScanCoordinator;
 
 /// How long a liveness probe may take before it counts as a failure (§5).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -57,6 +59,7 @@ pub struct LightActor {
     rx: watch::Receiver<LightState>,
     flush_hz: u32,
     probe_secs: u64,
+    scan: Arc<ScanCoordinator>,
 }
 
 impl LightActor {
@@ -66,8 +69,9 @@ impl LightActor {
         rx: watch::Receiver<LightState>,
         flush_hz: u32,
         probe_secs: u64,
+        scan: Arc<ScanCoordinator>,
     ) -> Self {
-        Self { cfg, adapter, rx, flush_hz, probe_secs }
+        Self { cfg, adapter, rx, flush_hz, probe_secs, scan }
     }
 
     fn label(&self) -> String {
@@ -83,6 +87,12 @@ impl LightActor {
         let mut reconnect_count: u64 = 0;
 
         loop {
+            // Request the discovery scan for exactly as long as this light is
+            // disconnected. The coordinator scans only while ≥1 such request is
+            // outstanding (and even then in bursts), so a fully-connected fleet
+            // does no scanning at all — which is what stops the cheap USB
+            // controller choking on a permanent scan (NOTES.md §5 / scan.rs).
+            let mut searching = Some(self.scan.begin_search());
             let (peripheral, name) = self.find().await;
             let driver = Driver::resolve(&self.cfg.driver, profile, mac_bytes, &name, self.cfg.cmd_type);
             info!(light = %label, ble_name = %name, driver = driver.label(), "connecting");
@@ -90,6 +100,9 @@ impl LightActor {
             match ble::connect_and_verify(&peripheral).await {
                 Ok(chars) => {
                     info!(light = %label, "connected");
+                    // Connected: drop the discovery request for the whole session
+                    // (re-acquired on the next loop iteration if the link drops).
+                    searching = None;
                     // Power is driven entirely by the flushed LightState (the
                     // bridge seeds the initial state's power from
                     // `power_on_connect`), so there's no separate power-on here.
@@ -102,6 +115,9 @@ impl LightActor {
 
             // Best-effort disconnect so the OS doesn't keep a half-open handle.
             let _ = ble::disconnect(&peripheral).await;
+            // Release the discovery request (if still held after a failed
+            // connect) so we don't scan during the backoff sleep.
+            drop(searching.take());
             // De-sync the herd: on a shared adapter, several actors reconnecting in
             // lockstep saturate it (scan + connect + disconnect) and starve each
             // other. Spread reconnects with per-light + per-attempt jitter on top of

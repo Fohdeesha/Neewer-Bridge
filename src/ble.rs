@@ -192,6 +192,13 @@ pub async fn start_scan(adapter: &Adapter) -> Result<()> {
     Ok(())
 }
 
+/// Stop the shared scan. Used by the [`crate::scan`] coordinator's duty cycle so
+/// the adapter isn't scanning while every light is already connected.
+pub async fn stop_scan(adapter: &Adapter) -> Result<()> {
+    adapter.stop_scan().await.context("stop_scan failed")?;
+    Ok(())
+}
+
 /// Look for a peripheral with `target_mac` among those already discovered by the
 /// shared scan. Returns `(peripheral, ble_name)` or `None` if not seen yet.
 pub async fn find_scanned(adapter: &Adapter, target_mac: &str) -> Result<Option<(Peripheral, String)>> {
