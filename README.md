@@ -169,8 +169,8 @@ from Neewer's OTA server (`support.neewer.com/bluetoothlight/app/v1/home/devices
 | Flag | Default | Meaning |
 |---|---|---|
 | `--file PATH` | **required** | The firmware `.bin` to flash. Sanity-checked (size + ARM vector table) before anything is sent. |
-| `--version M.M.P` | `3.0.5` | Version being flashed (goes in the header; should match the `.bin`). |
-| `--name NAME` | `TL60 RGB-3` | Cosmetic model name in the header (the device ignores it). |
+| `--version M.M.P` | from filename | Version being flashed (goes in the header; should match the `.bin`). Omitted ⇒ parsed from the filename's `V<maj>.<min>.<patch>` marker (Neewer's own naming, e.g. `TL60-3_V3.0.5_20250908.bin`); an error if the filename has none. |
+| `--name NAME` | filename stem | Cosmetic model name in the header (the device ignores it). |
 | `--check` | off | Dry-run: connect, run the link-stability check, resolve the block type — **never writes firmware**. Run this first. |
 | `--confirm` | off | Actually flash. Required for the real write. |
 | `--settle-secs N` | `20` | Seconds the link must stay connected in the pre-flash stability check (aborts if it drops). |
@@ -208,6 +208,14 @@ neewer-bridge artnet-send --universe 0 --address 1 --channels 80,255,10
 Edit `config.toml` (shipped ready to go — no copy/rename step). Lights are bound
 by **MAC address** — the stable identity that makes the DMX→light mapping
 deterministic across reboots.
+
+A **missing** config file is fine for the tool commands (`scan`, `test`, `monitor`,
+…) — they fall back to built-in defaults. An **existing but invalid** config
+(syntax error, bad light entry, out-of-range value) is a hard error for *every*
+command: the bridge never silently swaps your settings for defaults (that once
+made `ota`/`test` run against the wrong adapter with only a mislabelled log line
+to show for it). The startup log states the absolute path of the config it loaded
+— or that loading failed, and why.
 
 ```toml
 [artnet]
@@ -434,6 +442,14 @@ drops). The failsafe controls behaviour when ArtNet stops: `hold` keeps the last
 state, `blackout` sets brightness 0, `poweroff` powers the light off — after
 `timeout_secs` of silence.
 
+The ArtNet socket is bound **before** anything else starts, and a bind failure
+(port already in use, bad `bind_ip`) — or the listener dying later — is a fatal
+error with a non-zero exit, so a supervisor (systemd, screen + a wrapper) can see
+and restart a bridge that isn't actually receiving. Out-of-order/duplicate ArtDmx
+datagrams are dropped using the Art-Net Sequence field (tracked per source +
+port-address; senders that disable sequencing, seq = 0, are unaffected, and an
+idle source resyncs after 2 s so a restarted console is never locked out).
+
 **Connection health & reconnect.** These are two-chip fixtures (a BLE radio module in
 front of the LED MCU that runs the command parser), and they give no write ACK
 (`write-without-response`), so an unchecked link can look "connected" while it's actually
@@ -450,7 +466,10 @@ tell them apart by whether moving it closer helps:**
   new command never lands. It **reconnects and resumes on its own** once the signal is good
   again; **move it (or the adapter) nearer** and it recovers, no power-cycle needed. If one
   unit does this repeatedly it's the weakest radio in the fleet. RSSI is logged per light
-  (at session start and on each probe) precisely so you can spot a marginal placement.
+  (at connect, session start, and on each probe) precisely so you can spot a marginal
+  placement. It's advertisement RSSI captured when the light was last discovered —
+  BlueZ clears the live value once a device connects, so the discovery reading is the
+  freshest one a session can have.
 - **Firmware wedge** (rarer, seen on a damaged unit) — the fixture is hung: it stays
   unresponsive/unconnectable **even with the adapter touching it**, and **only a full
   power-cycle clears it** — RF proximity does not, and neither does reflashing the current

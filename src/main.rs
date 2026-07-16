@@ -179,12 +179,14 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
         /// Firmware version being flashed, "MAJOR.MINOR.PATCH" (display metadata in the
-        /// 0x96 header — should match the .bin, e.g. 3.0.5 for the TL60 RGB-3).
-        #[arg(long, default_value = "3.0.5")]
-        version: String,
+        /// 0x96 header — should match the .bin). Omitted ⇒ derived from the filename's
+        /// `V<maj>.<min>.<patch>` marker; an error if the filename has none.
+        #[arg(long)]
+        version: Option<String>,
         /// Cosmetic device/model name written into the header (device ignores it).
-        #[arg(long, default_value = "TL60 RGB-3")]
-        name: String,
+        /// Omitted ⇒ the firmware filename stem.
+        #[arg(long)]
+        name: Option<String>,
         /// Probe only: connect, run the link-stability check, resolve the OTA block
         /// type — but do NOT write firmware. Use this first to confirm the link holds.
         #[arg(long)]
@@ -208,21 +210,6 @@ enum Command {
     Monitor,
     /// Run the full ArtNet→BLE bridge (the default when no command is given).
     Run,
-}
-
-/// Parse a "MAJOR.MINOR.PATCH" version string into 3 bytes for the OTA header.
-fn parse_version_triplet(s: &str) -> anyhow::Result<[u8; 3]> {
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 3 {
-        anyhow::bail!("version must be MAJOR.MINOR.PATCH (e.g. 3.0.5), got {s:?}");
-    }
-    let mut v = [0u8; 3];
-    for (i, p) in parts.iter().enumerate() {
-        v[i] = p
-            .parse::<u8>()
-            .map_err(|_| anyhow::anyhow!("version component {p:?} is not a 0-255 number"))?;
-    }
-    Ok(v)
 }
 
 /// Resolve the config path. An explicit `--config` is used as-is; otherwise
@@ -251,21 +238,30 @@ async fn main() {
     // defaults if the config is missing/invalid — logging must never fail to come
     // up). The returned guards must live for the whole run to keep the
     // non-blocking file writer flushing.
-    let log_cfg = Config::load(&config_path).map(|c| c.logging).unwrap_or_default();
+    let loaded = Config::load(&config_path);
+    let log_cfg = loaded.as_ref().map(|c| c.logging.clone()).unwrap_or_default();
     let _log_guards = logging::init(&log_cfg, cli.verbose);
 
-    // Announce which config file actually won. The resolver prefers `config.toml`
-    // beside the executable over the working directory, so a stale copy there can
-    // silently shadow the intended one — and a wrong config (e.g. lights on the
-    // `advanced` profile instead of `rgb`) then looks like a broken bridge (all
-    // white, colour ignored) with nothing in the log to explain it. Print the
-    // absolute path so it's unambiguous which file on disk was loaded.
+    // Announce which config file actually won — and, critically, whether it
+    // actually LOADED. The resolver prefers `config.toml` beside the executable
+    // over the working directory, so a stale copy there can silently shadow the
+    // intended one — and a wrong config (e.g. lights on the `advanced` profile
+    // instead of `rgb`) then looks like a broken bridge (all white, colour
+    // ignored) with nothing in the log to explain it. Print the absolute path so
+    // it's unambiguous which file on disk was consulted. A file that exists but
+    // fails to parse/validate must never be announced as "loaded".
     let shown = std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
-    if config_path.is_file() {
-        info!(config = %shown.display(), "loaded config");
-    } else {
-        warn!(config = %config_path.display(),
-              "config file not found — using built-in defaults (no lights will be driven)");
+    match (&loaded, config_path.is_file()) {
+        (Ok(_), _) => info!(config = %shown.display(), "loaded config"),
+        (Err(e), true) => warn!(
+            config = %shown.display(),
+            error = %format!("{e:#}"),
+            "config file exists but FAILED to load — commands that need it will refuse to run"
+        ),
+        (Err(_), false) => warn!(
+            config = %config_path.display(),
+            "config file not found — using built-in defaults (no lights will be driven)"
+        ),
     }
 
     if let Err(e) = dispatch(&cli, &config_path).await {
@@ -278,16 +274,23 @@ async fn main() {
 async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
     // No subcommand ⇒ run the bridge (`neewer-bridge` alone just runs).
     let command = cli.command.as_ref().unwrap_or(&Command::Run);
+    // scan/test/monitor/… don't require a config FILE — a missing one falls back
+    // to defaults so the tools work out of the box. An existing-but-invalid file
+    // is a hard error for every command (load_or_default): silently proceeding on
+    // defaults would run `ota`/`test` against the wrong adapter or `monitor` on
+    // the wrong port with nothing but a mislabelled log line to show for it.
+    let load = || {
+        Config::load_or_default(config_path)
+            .with_context(|| format!("config {} exists but is invalid", config_path.display()))
+    };
     match command {
-        // scan/test/monitor don't require a config file — fall back to defaults
-        // so the tools work out of the box.
         Command::Adapters => commands::adapters().await,
         Command::Scan { seconds, all, json } => {
-            let cfg = Config::load(config_path).unwrap_or_default();
+            let cfg = load()?;
             commands::scan(&cfg, *seconds, *all, *json).await
         }
         Command::Add { mac, driver, profile, universe, name, blink, address, cct_min, cct_max } => {
-            let cfg = Config::load(config_path).unwrap_or_default();
+            let cfg = load()?;
             match mac {
                 Some(mac) => {
                     let universe = universe.context("--universe is required with --mac")?;
@@ -308,27 +311,51 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
             commands::lights(&cfg)
         }
         Command::Inspect { mac, seconds } => {
-            let cfg = Config::load(config_path).unwrap_or_default();
+            let cfg = load()?;
             commands::inspect(&cfg.ble.adapter, mac, *seconds).await
         }
         Command::ArtnetSend { target, port, universe, address, channels, hz, seconds } => {
             commands::artnet_send(target, *port, *universe, *address, channels, *hz, *seconds).await
         }
         Command::Test { mac, driver, seconds, colors, modes, pixel, set, status } => {
-            let cfg = Config::load(config_path).unwrap_or_default();
+            let cfg = load()?;
             commands::test(&cfg.ble.adapter, mac, driver, *seconds, *colors, *modes, *pixel, set.as_deref(), *status).await
         }
         Command::Ota { mac, file, version, name, check, confirm, settle_secs, seconds, chunk_delay_ms } => {
-            let cfg = Config::load(config_path).unwrap_or_default();
-            let ver = parse_version_triplet(version)?;
+            let cfg = load()?;
+            // Version: explicit flag wins; else derive from the filename's
+            // V<maj>.<min>.<patch> marker. Refusing to guess beats stamping a
+            // wrong version into the 0x96 header.
+            let ver = match version {
+                Some(s) => commands::parse_version_triplet(s)?,
+                None => {
+                    let fname = file.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+                    commands::version_from_filename(fname).with_context(|| {
+                        format!(
+                            "could not derive a firmware version from {fname:?} — pass \
+                             --version MAJOR.MINOR.PATCH (it should match the .bin)"
+                        )
+                    })?
+                }
+            };
+            // Header name is cosmetic (the device ignores it); default to the
+            // filename stem rather than assuming any particular model.
+            let header_name = match name {
+                Some(n) => n.clone(),
+                None => file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("firmware")
+                    .to_string(),
+            };
             commands::ota(
-                &cfg.ble.adapter, mac, file, ver, name, *confirm, *check, *settle_secs, *seconds,
-                *chunk_delay_ms,
+                &cfg.ble.adapter, mac, file, ver, &header_name, *confirm, *check, *settle_secs,
+                *seconds, *chunk_delay_ms,
             )
             .await
         }
         Command::Monitor => {
-            let cfg = Config::load(config_path).unwrap_or_default();
+            let cfg = load()?;
             commands::monitor(&cfg.artnet.bind_ip, cfg.artnet.port).await
         }
         // `run` requires a valid config (it defines the light bindings).

@@ -10,11 +10,15 @@
 //!   link would look healthy forever — NeewerLite's stale-session lesson. The read
 //!   is answered by the light's radio, so a healthy light stays connected with zero
 //!   churn; three consecutive misses — or a reported disconnect — means a dead link
-//!   and we reconnect. There is **no separate "wedge" state**: a light stuck on its
-//!   last colour is simply one the radio can't currently reach (usually weak RX on a
-//!   marginal unit), and the reconnect loop brings it back on its own once the link
-//!   is good again — no power-cycle, no special recovery frame (that whole path was
-//!   a mis-diagnosis; the real variable is signal). Keep a flaky unit in good range.
+//!   and we reconnect. A stuck/unresponsive fixture has TWO distinct causes
+//!   (NOTES.md top banner, corrected 2026-07-14): a **weak-RF link** (drops or
+//!   won't connect at −90 dBm and below; moving it closer + this reconnect loop
+//!   recovers it) and a genuine **firmware WEDGE** (the fixture stays dead even
+//!   with the adapter touching it; ONLY a physical power-cycle clears it — RF
+//!   proximity and reflashing do not). The bridge deliberately does NOT try to
+//!   auto-detect the wedge: an earlier notify-silence detector false-positived and
+//!   aggressively recycled healthy links, and a real wedge needs human action
+//!   (power-cycle) anyway. Distinguish them by whether proximity recovers it.
 //! - status reads (battery/temperature/firmware/state) alongside each probe, purely
 //!   as logged telemetry — a light without notify is still fully controllable.
 //! - reconnect with jittered backoff (de-syncs the fleet), indefinitely.
@@ -75,7 +79,14 @@ impl LightActor {
     }
 
     fn label(&self) -> String {
-        self.cfg.name.clone().unwrap_or_else(|| self.cfg.mac.clone())
+        // An empty configured name (older `add` runs wrote `name = ""`) falls
+        // back to the MAC, same as no name at all.
+        self.cfg
+            .name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.cfg.mac.clone())
     }
 
     /// Run forever: (re)connect and serve until shut down.
@@ -93,9 +104,19 @@ impl LightActor {
             // does no scanning at all — which is what stops the cheap USB
             // controller choking on a permanent scan (NOTES.md §5 / scan.rs).
             let mut searching = Some(self.scan.begin_search());
-            let (peripheral, name) = self.find().await;
-            let driver = Driver::resolve(&self.cfg.driver, profile, mac_bytes, &name, self.cfg.cmd_type);
-            info!(light = %label, ble_name = %name, driver = driver.label(), "connecting");
+            let (peripheral, name, discovery_rssi) = self.find().await;
+            // Discovery can race the platform's name cache (BlueZ may not have
+            // local_name yet when we find the peripheral by MAC); an empty name
+            // would make `driver = "auto"` mis-resolve an NH-* Home light to
+            // Classic, so fall back to the configured name for resolution.
+            let resolve_name: &str = if name.is_empty() {
+                self.cfg.name.as_deref().unwrap_or("")
+            } else {
+                &name
+            };
+            let driver =
+                Driver::resolve(&self.cfg.driver, profile, mac_bytes, resolve_name, self.cfg.cmd_type);
+            info!(light = %label, ble_name = %name, driver = driver.label(), rssi = ?discovery_rssi, "connecting");
 
             match ble::connect_and_verify(&peripheral).await {
                 Ok(chars) => {
@@ -106,7 +127,9 @@ impl LightActor {
                     // Power is driven entirely by the flushed LightState (the
                     // bridge seeds the initial state's power from
                     // `power_on_connect`), so there's no separate power-on here.
-                    if let Err(e) = self.session(&label, &peripheral, &chars, &driver).await {
+                    if let Err(e) =
+                        self.session(&label, &peripheral, &chars, &driver, discovery_rssi).await
+                    {
                         warn!(light = %label, error = %e, "session ended; will reconnect");
                     }
                 }
@@ -133,8 +156,10 @@ impl LightActor {
         }
     }
 
-    /// Poll the shared scan until our light appears.
-    async fn find(&self) -> (Peripheral, String) {
+    /// Poll the shared scan until our light appears. Returns the peripheral, its
+    /// advertised name, and the discovery-time RSSI (the freshest signal reading
+    /// this session will get — BlueZ clears the property once connected).
+    async fn find(&self) -> (Peripheral, String, Option<i16>) {
         let label = self.label();
         loop {
             match ble::find_scanned(&self.adapter, &self.cfg.mac).await {
@@ -148,12 +173,21 @@ impl LightActor {
 
     /// Active session: coalescing flush loop + liveness probing. Returns `Err`
     /// when the session should be torn down and reconnected.
+    ///
+    /// Note the select arms run their handlers to completion before the loop
+    /// re-enters `select!` — so a probe against a *degrading* link can stall the
+    /// flush arm for up to `PROBE_TIMEOUT` (12 s). That's a deliberate tradeoff:
+    /// a link that slow isn't transferring write frames anyway (HW-proven on the
+    /// TL60: 10 s of streamed colour over a −90 dBm "connected" link changed
+    /// nothing), it's per-light (each actor is its own task, the fleet is never
+    /// blocked), and on a healthy link the read returns in tens of ms.
     async fn session(
         &mut self,
         label: &str,
         p: &Peripheral,
         chars: &NeewerChars,
         driver: &Driver,
+        discovery_rssi: Option<i16>,
     ) -> Result<()> {
         let flush_ms = (1000 / self.flush_hz.max(1)).max(1) as u64;
         let mut flush = interval(Duration::from_millis(flush_ms));
@@ -176,7 +210,11 @@ impl LightActor {
         let mut last_sent: Option<LightState> = None;
         // Connection-health failures (consecutive GATT-read misses); reset on success.
         let mut failures: u32 = 0;
-        let rssi0 = ble::rssi(p).await;
+        // Advertisement RSSI: BlueZ clears the live property once the device
+        // connects, so the "most recent advertisement RSSI" for this session is
+        // the value captured at discovery — fall back to it whenever the live
+        // read is empty (which, with on-demand scanning, is nearly always).
+        let rssi0 = ble::rssi(p).await.or(discovery_rssi);
         info!(
             light = %label,
             flush_hz = self.flush_hz,
@@ -251,7 +289,10 @@ impl LightActor {
                 _ = probe.tick() => {
                     // Advertisement RSSI (diagnostics only — not a liveness signal,
                     // but the most useful field for spotting a weak/flaky placement).
-                    let rssi = ble::rssi(p).await;
+                    // Falls back to the discovery-time value: BlueZ clears the live
+                    // property while connected, and the discovery reading IS the most
+                    // recent advertisement RSSI this session has.
+                    let rssi = ble::rssi(p).await.or(discovery_rssi);
                     if !ble::is_connected(p).await {
                         bail!("peripheral reports disconnected");
                     }

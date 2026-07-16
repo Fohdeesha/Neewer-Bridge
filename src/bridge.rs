@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::watch;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::artnet::{self, ArtDmx};
 use crate::ble;
@@ -40,6 +40,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     if cfg.lights.is_empty() {
         warn!("no [[lights]] configured — the bridge will receive ArtNet but drive nothing");
     }
+
+    // Bind the ArtNet socket FIRST, before touching BLE or spawning anything: a
+    // bind failure (port already in use, bad bind IP) must be a fatal startup
+    // error with a non-zero exit — under a supervisor, warn-and-exit-0 is a
+    // silent outage.
+    let sock = artnet::bind(&cfg.artnet.bind_ip, cfg.artnet.port).await?;
 
     let adapter = ble::acquire_adapter(&cfg.ble.adapter).await?;
     // Discovery scanning is coordinated (scan.rs), not permanently on: the bridge
@@ -74,7 +80,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         let last_ch = light.address + profile.channel_count() - 1;
         let channels = format!("{}-{}", light.address, last_ch);
         info!(
-            name = light.name.as_deref().unwrap_or("(unnamed)"),
+            name = light.name.as_deref().filter(|n| !n.is_empty()).unwrap_or("(unnamed)"),
             mac = %light.mac,
             profile = %light.profile,
             universe = light.universe,
@@ -82,7 +88,12 @@ pub async fn run(cfg: Config) -> Result<()> {
             "configuring light"
         );
         // Seed initial power from power_on_connect: the actor sends this as soon
-        // as it connects, before any ArtNet arrives.
+        // as it connects, before any ArtNet arrives. Until the first ArtDmx for
+        // this light lands, that seed is the deterministic startup baseline
+        // (LightState::default() = CCT 3200K @ 50%) — the locked §5.4 "defined
+        // startup state" decision. With a console streaming (openHAB refreshes
+        // at ~1.2 Hz) the baseline is visible for well under a second; it only
+        // persists if the bridge restarts while the ArtNet source is down.
         let initial = LightState { power: light.power_on_connect, ..LightState::default() };
         let (tx, rx) = watch::channel(initial);
         let cct = CctRange { min: light.cct_min, max: light.cct_max };
@@ -107,13 +118,22 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     spawn_failsafe(&cfg, base, last_artnet.clone(), all_sinks);
 
-    // ArtNet listener — owns the senders; updates them as packets arrive.
-    let bind_ip = cfg.artnet.bind_ip.clone();
-    let port = cfg.artnet.port;
+    // ArtNet listener — owns the senders; updates them as packets arrive. The
+    // socket was bound above, so the only way this task ends is a receive error
+    // — which the select! below treats as fatal.
     let last_for_listener = last_artnet.clone();
+    let mut seq = artnet::SeqTracker::new();
     let listener = tokio::spawn(async move {
-        let res = artnet::listen(&bind_ip, port, move |_src, pkt: ArtDmx| {
+        artnet::serve(sock, move |src, pkt: ArtDmx| {
+            // Any ArtDmx (even a stale one) proves the source is alive, so it
+            // feeds the failsafe timer before the sequence check.
             last_for_listener.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
+            // Drop out-of-order/duplicate packets (Art-Net Sequence field) so a
+            // late datagram can't briefly re-apply an old state.
+            if !seq.is_fresh(src.ip(), pkt.port_address, pkt.sequence) {
+                debug!(%src, port = pkt.port_address, seq = pkt.sequence, "stale ArtDmx dropped");
+                return;
+            }
             if let Some(sinks) = universe_map.get(&pkt.port_address) {
                 for s in sinks {
                     if let Some(slice) =
@@ -127,10 +147,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 }
             }
         })
-        .await;
-        if let Err(e) = res {
-            warn!(error = %e, "ArtNet listener stopped");
-        }
+        .await
     });
 
     info!(
@@ -142,8 +159,19 @@ pub async fn run(cfg: Config) -> Result<()> {
     );
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => info!("Ctrl-C received — shutting down"),
-        _ = listener => warn!("ArtNet listener task ended unexpectedly"),
+        _ = tokio::signal::ctrl_c() => {
+            info!("Ctrl-C received — shutting down");
+        }
+        res = listener => {
+            // The receive loop never returns Ok; any exit here is a failure and
+            // must surface as one (non-zero exit) so a supervisor restarts us.
+            let err = match res {
+                Ok(Ok(())) => anyhow::anyhow!("ArtNet listener ended unexpectedly"),
+                Ok(Err(e)) => e.context("ArtNet listener failed"),
+                Err(join_err) => anyhow::Error::from(join_err).context("ArtNet listener task panicked"),
+            };
+            return Err(err);
+        }
     }
     info!("shutdown: failsafe = {} (lights keep their last commanded state)", cfg.failsafe.mode);
     Ok(())

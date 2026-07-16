@@ -29,10 +29,14 @@ scan_window_secs = 8     # length of each discovery burst (s) while a light is m
 scan_pause_secs  = 15    # idle gap between bursts (s) so a powered-off/flaky light is
                          # polled periodically, never scanned constantly. 0 = scan
                          # continuously while something's missing (still off when all up)
-# NB: a light stuck on its last colour and ignoring commands is almost always a WEAK RX
-# LINK — the bridge can't currently reach it. It reconnects and resumes on its own once
-# the signal is good again, so keep a flaky unit within decent range of the adapter. (No
-# power-cycle or special "recovery" is needed; that was an earlier mis-diagnosis.)
+# NB: a light stuck on its last colour / ignoring commands has TWO possible causes:
+#   1. WEAK RX LINK (common) — the bridge can't currently reach it. The reconnect loop
+#      recovers it on its own once the signal improves; keep a flaky unit within decent
+#      range of the adapter (or move the adapter closer).
+#   2. FIRMWARE WEDGE (rare; seen on a damaged unit) — the fixture is hung and stays
+#      unresponsive EVEN with the adapter touching it. Only a physical power-cycle
+#      clears this; better signal does not.
+# Distinguish them by whether moving it closer recovers it. See README "Troubleshooting".
 
 [failsafe]
 # What lights do when ArtNet data stops arriving.
@@ -78,7 +82,10 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 #                                 # (ColorReplacement/Single/Two/Three-Moving/Fire), TL-series only
 # universe = 0                    # ArtNet 15-bit Port-Address (Net/Sub-Net/Universe)
 # address  = 1                    # 1-based DMX start channel
-# power_on_connect = true
+# power_on_connect = true         # power the light on at connect. Until the first
+#                                 # ArtNet packet arrives it shows a deterministic
+#                                 # baseline (CCT 3200K @ 50%); a streaming console
+#                                 # overwrites that within its refresh interval
 # # CCT scaling range, raw x100K (25 = 2500K, 100 = 10000K). Per-model — check the
 # # manual. Default 32..56 (3200..5600K); e.g. the TL120C is 25..100 (2500..10000K).
 # cct_min  = 32

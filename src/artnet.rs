@@ -5,7 +5,9 @@
 //! light's config binds to; the wire splits it across the `Net` byte and the
 //! `SubUni` byte (Sub-Net high nibble + Universe low nibble).
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
@@ -90,18 +92,24 @@ pub fn split_port_address(port_address: u16) -> (u8, u8, u8) {
     (net, sub_net, universe)
 }
 
-/// Bind the ArtNet UDP listener and call `on_packet` for every valid ArtDmx
-/// datagram received. Runs until the socket errors or the task is cancelled.
-pub async fn listen<F>(bind_ip: &str, port: u16, mut on_packet: F) -> Result<()>
-where
-    F: FnMut(SocketAddr, ArtDmx),
-{
+/// Bind the ArtNet UDP socket. Split out from [`listen`] so the bridge can bind
+/// **before** spawning anything else — a bind failure (port already in use, bad
+/// bind IP) must be a hard startup error, not a warning inside a spawned task.
+pub async fn bind(bind_ip: &str, port: u16) -> Result<UdpSocket> {
     let addr = format!("{bind_ip}:{port}");
     let sock = UdpSocket::bind(&addr)
         .await
         .with_context(|| format!("binding ArtNet listener to {addr}"))?;
     info!(%addr, "ArtNet listener bound");
+    Ok(sock)
+}
 
+/// Receive loop over an already-bound socket: call `on_packet` for every valid
+/// ArtDmx datagram. Runs until the socket errors or the task is cancelled.
+pub async fn serve<F>(sock: UdpSocket, mut on_packet: F) -> Result<()>
+where
+    F: FnMut(SocketAddr, ArtDmx),
+{
     // Max ArtDmx = 18 header + 512 data = 530 bytes; round up.
     let mut buf = vec![0u8; 1024];
     loop {
@@ -110,6 +118,90 @@ where
             Some(pkt) => on_packet(src, pkt),
             None => trace!(%src, bytes = n, "ignored non-ArtDmx datagram"),
         }
+    }
+}
+
+/// Bind + serve in one call (used by `monitor`; the bridge binds separately so
+/// bind failures are fatal at startup).
+pub async fn listen<F>(bind_ip: &str, port: u16, on_packet: F) -> Result<()>
+where
+    F: FnMut(SocketAddr, ArtDmx),
+{
+    let sock = bind(bind_ip, port).await?;
+    serve(sock, on_packet).await
+}
+
+/// How long a (source, port-address) key may go quiet before its sequence
+/// tracking is reset. A restarted sender (whose sequence numbering starts over)
+/// must never be locked out by the stale-window check below.
+const SEQ_IDLE_RESET: Duration = Duration::from_secs(2);
+
+/// Cap on tracked (source, port-address) keys — purely defensive (a scanner
+/// spraying spoofed sources shouldn't grow the map unbounded). Resetting simply
+/// resyncs sequence tracking, which is always safe.
+const SEQ_MAX_KEYS: usize = 1024;
+
+/// Out-of-order ArtDmx suppression, per the Art-Net spec's Sequence field:
+/// the sender increments 1..=255 (wrapping back to 1; 0 means "sequencing
+/// disabled"), and a receiver should drop packets that arrive behind the newest
+/// one seen. Tracked per (source IP, port-address) so multiple controllers
+/// don't fight each other's counters.
+///
+/// A packet is **fresh** when sequencing is disabled (0), the key is new, the
+/// key has been idle past the reset window, or the wrapped distance from the
+/// last accepted sequence is 1..=127. Duplicates (distance 0) and late packets
+/// (distance ≥128) are stale.
+pub struct SeqTracker {
+    idle_reset: Duration,
+    map: HashMap<(IpAddr, u16), (u8, Instant)>,
+}
+
+impl SeqTracker {
+    pub fn new() -> Self {
+        Self::with_idle_reset(SEQ_IDLE_RESET)
+    }
+
+    /// Testing hook: a custom idle-reset window (`Duration::ZERO` = every packet
+    /// resyncs, i.e. tracking disabled).
+    pub fn with_idle_reset(idle_reset: Duration) -> Self {
+        Self { idle_reset, map: HashMap::new() }
+    }
+
+    /// Record `seq` for (`src`, `port_address`) and report whether the packet
+    /// should be processed (`true`) or dropped as stale/duplicate (`false`).
+    pub fn is_fresh(&mut self, src: IpAddr, port_address: u16, seq: u8) -> bool {
+        if seq == 0 {
+            return true; // sender disabled sequencing
+        }
+        let now = Instant::now();
+        if self.map.len() > SEQ_MAX_KEYS {
+            self.map.clear();
+        }
+        match self.map.get_mut(&(src, port_address)) {
+            Some((last, seen)) if now.duration_since(*seen) < self.idle_reset => {
+                // Wrapped distance from the last accepted sequence. The sender
+                // skips 0 on wrap (…, 0xFF, 0x01, …), which wrapping_sub handles
+                // naturally (0x01 − 0xFF = 2).
+                let delta = seq.wrapping_sub(*last);
+                let fresh = (1..=127).contains(&delta);
+                if fresh {
+                    *last = seq;
+                    *seen = now;
+                }
+                fresh
+            }
+            _ => {
+                // New key, or idle past the reset window: accept and resync.
+                self.map.insert((src, port_address), (seq, now));
+                true
+            }
+        }
+    }
+}
+
+impl Default for SeqTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -207,5 +299,64 @@ mod tests {
         assert_eq!(pkt.port_address, 0x0123);
         assert_eq!(pkt.sequence, 9);
         assert_eq!(pkt.data, data);
+    }
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::from([192, 168, 1, last])
+    }
+
+    #[test]
+    fn seq_in_order_and_gaps_are_fresh() {
+        let mut t = SeqTracker::new();
+        assert!(t.is_fresh(ip(1), 0, 1));
+        assert!(t.is_fresh(ip(1), 0, 2));
+        assert!(t.is_fresh(ip(1), 0, 10)); // gaps (lost packets) are fine
+    }
+
+    #[test]
+    fn seq_duplicates_and_stale_are_dropped() {
+        let mut t = SeqTracker::new();
+        assert!(t.is_fresh(ip(1), 0, 50));
+        assert!(!t.is_fresh(ip(1), 0, 50)); // exact duplicate
+        assert!(!t.is_fresh(ip(1), 0, 49)); // one behind
+        assert!(!t.is_fresh(ip(1), 0, 50u8.wrapping_sub(127))); // far behind (delta 129... wraps ≥128)
+        assert!(t.is_fresh(ip(1), 0, 51)); // stale packets didn't poison the counter
+    }
+
+    #[test]
+    fn seq_wraps_past_255() {
+        let mut t = SeqTracker::new();
+        assert!(t.is_fresh(ip(1), 0, 0xFF));
+        // Sender wraps 0xFF → 0x01 (0 is skipped): wrapping distance 2 = fresh.
+        assert!(t.is_fresh(ip(1), 0, 0x01));
+        assert!(!t.is_fresh(ip(1), 0, 0xFF)); // now 0xFF is behind
+    }
+
+    #[test]
+    fn seq_zero_disables_sequencing() {
+        let mut t = SeqTracker::new();
+        assert!(t.is_fresh(ip(1), 0, 0));
+        assert!(t.is_fresh(ip(1), 0, 0)); // always fresh
+        // ...and doesn't disturb a real counter on the same key.
+        assert!(t.is_fresh(ip(1), 0, 7));
+        assert!(t.is_fresh(ip(1), 0, 0));
+        assert!(!t.is_fresh(ip(1), 0, 6));
+    }
+
+    #[test]
+    fn seq_keys_are_independent() {
+        let mut t = SeqTracker::new();
+        assert!(t.is_fresh(ip(1), 0, 100));
+        assert!(t.is_fresh(ip(2), 0, 5)); // different source
+        assert!(t.is_fresh(ip(1), 1, 5)); // different port-address
+        assert!(!t.is_fresh(ip(1), 0, 99)); // original key still tracks
+    }
+
+    #[test]
+    fn seq_idle_reset_resyncs_a_restarted_sender() {
+        // Zero idle window = every packet is past the window ⇒ always resync.
+        let mut t = SeqTracker::with_idle_reset(Duration::ZERO);
+        assert!(t.is_fresh(ip(1), 0, 200));
+        assert!(t.is_fresh(ip(1), 0, 1)); // would be stale, but the key had "idled"
     }
 }

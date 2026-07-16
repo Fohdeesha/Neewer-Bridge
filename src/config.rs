@@ -248,12 +248,46 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Load the config, falling back to built-in defaults ONLY when the file
+    /// does not exist (so `scan`/`test`/`monitor` work out of the box). An
+    /// existing-but-broken file is a **hard error**, never silently replaced
+    /// with defaults — a config with one bad entry must not make `ota` or
+    /// `test` quietly run with the wrong adapter/port (this project has been
+    /// bitten by silently-wrong configs before; see the "all lights white"
+    /// post-mortem in NOTES.md).
+    pub fn load_or_default(path: &Path) -> Result<Self> {
+        if path.is_file() {
+            Self::load(path)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
     /// Structural validation independent of any hardware being present.
     pub fn validate(&self) -> Result<()> {
         if !KNOWN_FAILSAFE_MODES.contains(&self.failsafe.mode.as_str()) {
             bail!(
                 "failsafe.mode {:?} unknown; expected one of {KNOWN_FAILSAFE_MODES:?}",
                 self.failsafe.mode
+            );
+        }
+        // [ble] rate/interval fields must be non-zero: flush_hz 0 has no
+        // meaning, probe_secs 0 would spin the probe loop, and a
+        // scan_window_secs of 0 would hammer the adapter with start/stop-scan
+        // pairs — exactly the load the duty-cycled scan exists to avoid.
+        // (scan_pause_secs 0 is legal: documented as "scan continuously while
+        // something is missing".)
+        if self.ble.flush_hz == 0 {
+            bail!("[ble] flush_hz must be ≥ 1 (max BLE updates per light per second)");
+        }
+        if self.ble.probe_secs == 0 {
+            bail!("[ble] probe_secs must be ≥ 1 (seconds between connection-health probes)");
+        }
+        if self.ble.scan_window_secs == 0 {
+            bail!(
+                "[ble] scan_window_secs must be ≥ 1 (a 0-second scan burst would just \
+                 hammer the adapter with start/stop-scan; use scan_pause_secs = 0 for \
+                 a continuous scan while a light is missing)"
             );
         }
         // Logging levels (global + optional per-destination overrides).
@@ -316,18 +350,42 @@ impl Config {
     }
 }
 
+/// Escape a string for embedding in a TOML basic (double-quoted) string:
+/// backslashes and quotes are escaped, control characters become spaces. BLE
+/// names are usually tame, but a stray quote must not produce an unparsable
+/// config (append_light validates before writing, so it would fail safe — this
+/// makes it succeed instead).
+fn toml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Append a `[[lights]]` block to a config file (creating it if absent),
 /// preserving any existing content/comments. The result is validated before it
-/// is written, so a bad addition can't corrupt the file.
+/// is written, so a bad addition can't corrupt the file. An absent/empty name
+/// omits the `name =` line entirely (log labels then fall back to the MAC)
+/// rather than writing a useless `name = ""`.
 pub fn append_light(path: &Path, light: &LightCfg) -> Result<()> {
     let mut text = std::fs::read_to_string(path).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
+    let name_line = match light.name.as_deref() {
+        Some(n) if !n.is_empty() => format!("name = \"{}\"\n", toml_escape(n)),
+        _ => String::new(),
+    };
     text.push_str(&format!(
-        "\n[[lights]]\nmac = \"{}\"\nname = \"{}\"\ndriver = \"{}\"\nprofile = \"{}\"\nuniverse = {}\naddress = {}\npower_on_connect = {}\ncct_min = {}\ncct_max = {}\ncmd_type = {}\n",
+        "\n[[lights]]\nmac = \"{}\"\n{}driver = \"{}\"\nprofile = \"{}\"\nuniverse = {}\naddress = {}\npower_on_connect = {}\ncct_min = {}\ncct_max = {}\ncmd_type = {}\n",
         normalize_mac(&light.mac),
-        light.name.clone().unwrap_or_default(),
+        name_line,
         light.driver,
         light.profile,
         light.universe,
@@ -437,6 +495,69 @@ mod tests {
         assert_eq!(loaded.lights[0].universe, 2);
         assert_eq!(loaded.lights[1].address, 5);
         assert_eq!(loaded.lights[0].cmd_type, 1); // round-trips through append
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_or_default_missing_vs_broken() {
+        // Missing file → defaults (commands work out of the box).
+        let missing = std::env::temp_dir().join(format!("nb_missing_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        let cfg = Config::load_or_default(&missing).unwrap();
+        assert_eq!(cfg.artnet.port, crate::artnet::ARTNET_PORT);
+
+        // Existing-but-broken file → hard error, NOT silent defaults.
+        let broken = std::env::temp_dir().join(format!("nb_broken_{}.toml", std::process::id()));
+        std::fs::write(&broken, "[artnet]]").unwrap();
+        assert!(Config::load_or_default(&broken).is_err());
+        // Valid TOML that fails validation is also a hard error.
+        std::fs::write(&broken, "[ble]\nflush_hz = 0\n").unwrap();
+        assert!(Config::load_or_default(&broken).is_err());
+        let _ = std::fs::remove_file(&broken);
+    }
+
+    #[test]
+    fn validate_rejects_zero_ble_intervals() {
+        let mut c = Config::default();
+        assert!(c.validate().is_ok());
+        c.ble.flush_hz = 0;
+        assert!(c.validate().is_err());
+        c.ble.flush_hz = 15;
+        c.ble.probe_secs = 0;
+        assert!(c.validate().is_err());
+        c.ble.probe_secs = 20;
+        c.ble.scan_window_secs = 0;
+        assert!(c.validate().is_err());
+        c.ble.scan_window_secs = 8;
+        c.ble.scan_pause_secs = 0; // legal: continuous scan while searching
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn append_light_escapes_name_and_omits_empty() {
+        let path = std::env::temp_dir().join(format!("nb_escape_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // A name with a quote + backslash must survive the TOML round trip.
+        let light = LightCfg {
+            mac: "AA:BB:CC:DD:EE:01".into(),
+            name: Some("Key \"main\" \\ rig".into()),
+            driver: "auto".into(),
+            profile: "full".into(),
+            universe: 0,
+            address: 1,
+            power_on_connect: true,
+            cct_min: DEFAULT_CCT_MIN,
+            cct_max: DEFAULT_CCT_MAX,
+            cmd_type: 2,
+        };
+        append_light(&path, &light).unwrap();
+        // No name at all → the name line is omitted (not `name = ""`).
+        let unnamed = LightCfg { mac: "AA:BB:CC:DD:EE:02".into(), name: None, address: 10, ..light.clone() };
+        append_light(&path, &unnamed).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.lights[0].name.as_deref(), Some("Key \"main\" \\ rig"));
+        assert_eq!(loaded.lights[1].name, None);
         let _ = std::fs::remove_file(&path);
     }
 

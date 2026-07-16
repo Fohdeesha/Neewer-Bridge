@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::artnet;
 use crate::ble;
-use crate::config::{self, parse_mac, LightCfg, KNOWN_DRIVERS};
+use crate::config::{self, parse_mac, LightCfg, KNOWN_DRIVERS, KNOWN_PROFILES};
 use crate::driver::Driver;
 use crate::models::Catalog;
 use crate::profile::Profile;
@@ -123,7 +123,8 @@ pub fn lights(cfg: &config::Config) -> Result<()> {
         let (net, sub_net, uni) = artnet::split_port_address(l.universe);
         let last = l.address + profile.channel_count() - 1;
 
-        println!("\n  [{}] {}  ({})", i + 1, l.name.as_deref().unwrap_or("(unnamed)"), l.mac);
+        let display_name = l.name.as_deref().filter(|n| !n.is_empty()).unwrap_or("(unnamed)");
+        println!("\n  [{}] {}  ({})", i + 1, display_name, l.mac);
         println!(
             "      driver {} · profile {} · CCT {}00-{}00K · power-on-connect {}",
             l.driver, l.profile, l.cct_min, l.cct_max, l.power_on_connect,
@@ -317,9 +318,12 @@ pub async fn add(config_path: &Path, adapter_selector: &str) -> Result<()> {
         return Ok(());
     }
 
-    let profile =
-        prompt_default(&mut reader, &format!("Profile [cct/cct_gm/hsi/full] ({def_profile}): "), &def_profile)
-            .await?;
+    let profile = prompt_default(
+        &mut reader,
+        &format!("Profile [{}] ({def_profile}): ", KNOWN_PROFILES.join("/")),
+        &def_profile,
+    )
+    .await?;
     if Profile::parse(&profile).is_none() {
         bail!("unknown profile {profile:?}");
     }
@@ -579,15 +583,21 @@ pub async fn test(
     // Status read (`--status`): query firmware version / battery / temperature / state
     // and print the decoded replies. Non-mutating — no blink, no colour change — so
     // it's safe to run anytime. Short-circuits before the blink/CCT sequence.
+    // Both early paths disconnect explicitly (best-effort) so the light re-advertises
+    // immediately rather than waiting for the OS to reap the process's connection.
     if status {
-        return test_status(&peripheral, &chars.write, mac_bytes).await;
+        let res = test_status(&peripheral, &chars.write, mac_bytes).await;
+        let _ = ble::disconnect(&peripheral).await;
+        return res;
     }
 
     // Single-frame set (`--set SPEC`): send exactly one frame (or pixel palette) and
     // hold it, for guided one-at-a-time testing. The light keeps the state after
     // disconnect. Short-circuits before the blink/CCT sequence.
     if let Some(spec) = set {
-        return test_set(&peripheral, &chars.write, mac_bytes, spec).await;
+        let res = test_set(&peripheral, &chars.write, mac_bytes, spec).await;
+        let _ = ble::disconnect(&peripheral).await;
+        return res;
     }
 
     // Encoders per protocol family. `auto` is treated as classic for this manual
@@ -1047,6 +1057,47 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
 
 // ── Firmware OTA (custom 0x78 block protocol) ─────────────────────────────────
 
+/// Parse a "MAJOR.MINOR.PATCH" version string into 3 bytes for the OTA header.
+pub fn parse_version_triplet(s: &str) -> Result<[u8; 3]> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 3 {
+        bail!("version must be MAJOR.MINOR.PATCH (e.g. 3.0.5), got {s:?}");
+    }
+    let mut v = [0u8; 3];
+    for (i, p) in parts.iter().enumerate() {
+        v[i] = p
+            .parse::<u8>()
+            .map_err(|_| anyhow::anyhow!("version component {p:?} is not a 0-255 number"))?;
+    }
+    Ok(v)
+}
+
+/// Derive the firmware version from a Neewer OTA filename, which embeds it as
+/// `V<maj>.<min>.<patch>` (e.g. `TL60-3_V3.0.5_20250908.bin`). Case-insensitive.
+/// Returns `None` if no such marker parses — the caller then requires an explicit
+/// `--version` (better than silently stamping a wrong default into the header).
+pub fn version_from_filename(name: &str) -> Option<[u8; 3]> {
+    let bytes = name.as_bytes();
+    for (i, &c) in bytes.iter().enumerate() {
+        if c != b'V' && c != b'v' {
+            continue;
+        }
+        // Candidate: digits '.' digits '.' digits immediately after the V. A
+        // trailing dot is trimmed so `…V1.2.3.bin` doesn't capture the extension
+        // separator as a fourth (empty) component.
+        let rest = &name[i + 1..];
+        let end = rest
+            .char_indices()
+            .find(|(_, ch)| !ch.is_ascii_digit() && *ch != '.')
+            .map(|(j, _)| j)
+            .unwrap_or(rest.len());
+        if let Ok(v) = parse_version_triplet(rest[..end].trim_end_matches('.')) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// Read the next inbound notify frame, or `None` on timeout.
 async fn ota_next_frame(stream: &mut ble::NotifyStream, timeout: Duration) -> Option<Vec<u8>> {
     use futures::StreamExt;
@@ -1176,20 +1227,41 @@ pub async fn ota(
     info!(secs = settle_secs, "checking link stability before flashing…");
     ota_link_precheck(&peripheral, &write, mac_bytes, Duration::from_secs(settle_secs)).await?;
 
-    // 5. Probe the OTA block type (0xD0 → 0x1A). Default to 128-byte if silent.
+    // The precheck's keepalive version reads elicit notify replies nothing has
+    // consumed — up to ~settle_secs of them sit buffered in the stream. Drain
+    // them now so the type probe below reads fresh frames; otherwise the stale
+    // replies can exhaust its window and the 0x1A reply is never seen (the
+    // block kind would silently default — wrong for an OTA_PRO fixture).
+    let mut drained = 0u32;
+    while ota_next_frame(&mut stream, Duration::from_millis(250)).await.is_some() {
+        drained += 1;
+    }
+    if drained > 0 {
+        info!(frames = drained, "drained stale notify frames from the precheck");
+    }
+
+    // 5. Probe the OTA block type (0xD0 → 0x1A). Non-type frames (status pushes)
+    // don't consume the budget — only time does. Default to 128-byte blocks if
+    // the device never answers (both our fixtures are Std128; an OTA_PRO device
+    // would reject the header cleanly).
     ble::write_command(&peripheral, &write, &ota::probe_frame(ota::HEADER_STD)).await?;
-    let mut kind = ota::BlockKind::Std128;
-    for _ in 0..4 {
+    let mut kind = None;
+    let probe_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < probe_deadline {
         match ota_next_frame(&mut stream, Duration::from_millis(600)).await {
             Some(f) => {
                 if let Some(k) = ota::parse_type_reply(&f) {
-                    kind = k;
+                    kind = Some(k);
                     break;
                 }
             }
-            None => break,
+            None => break, // 600 ms of post-drain silence: no reply is coming
         }
     }
+    let kind = kind.unwrap_or_else(|| {
+        warn!("no 0x1A OTA-type reply from the device — defaulting to 128-byte blocks");
+        ota::BlockKind::Std128
+    });
     let total_blocks = ota::block_count(image.len(), kind);
     info!(ota_type = ?kind, block_size = kind.block_size(), total_blocks, "OTA type resolved");
 
@@ -1223,18 +1295,30 @@ pub async fn ota(
     let _ = ble::disconnect(&peripheral).await;
     result?;
 
-    // 7. Let the device reboot, then reconnect and read back the version.
+    // 7. Let the device reboot, then reconnect and read back the version. This is
+    // entirely best-effort reporting: the flash already committed (the device sent
+    // Done), so nothing here may fail the command — a light that boots slowly or
+    // won't take a notify subscription right away is still a successful flash.
     info!("waiting 12s for the light to reboot on the new firmware…");
     tokio::time::sleep(Duration::from_secs(12)).await;
     match ble::find_by_mac(&adapter, mac, Duration::from_secs(20)).await {
         Ok(p2) => match ble::connect_and_verify(&p2).await {
             Ok(c2) => {
                 if let Some(n2) = &c2.notify {
-                    let mut s2 = ble::subscribe_notify(&p2, n2).await?;
-                    ble::write_command(&p2, &c2.write, &queries::version(mac_bytes)).await.ok();
-                    if let Some(f) = ota_next_frame(&mut s2, Duration::from_secs(3)).await {
-                        if let Some(reply) = replies::parse(&f) {
-                            info!(post_flash = %reply.summary(), "reconnected — device reports");
+                    match ble::subscribe_notify(&p2, n2).await {
+                        Ok(mut s2) => {
+                            ble::write_command(&p2, &c2.write, &queries::version(mac_bytes))
+                                .await
+                                .ok();
+                            if let Some(f) = ota_next_frame(&mut s2, Duration::from_secs(3)).await
+                            {
+                                if let Some(reply) = replies::parse(&f) {
+                                    info!(post_flash = %reply.summary(), "reconnected — device reports");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "post-flash notify subscribe failed (flash itself succeeded)")
                         }
                     }
                 }
@@ -1368,5 +1452,35 @@ async fn ota_transfer(
                 warn!(op, "unknown OTA ACK op; ignoring");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_triplet_parses_and_rejects() {
+        assert_eq!(parse_version_triplet("3.0.5").unwrap(), [3, 0, 5]);
+        assert_eq!(parse_version_triplet("10.20.30").unwrap(), [10, 20, 30]);
+        assert!(parse_version_triplet("3.0").is_err());
+        assert!(parse_version_triplet("3.0.5.1").is_err());
+        assert!(parse_version_triplet("3.0.x").is_err());
+        assert!(parse_version_triplet("3.0.999").is_err()); // >255
+    }
+
+    #[test]
+    fn version_from_real_neewer_filenames() {
+        // The actual OTA-server naming scheme.
+        assert_eq!(version_from_filename("TL60-3_V3.0.5_20250908.bin"), Some([3, 0, 5]));
+        assert_eq!(version_from_filename("TL120-2_V2.0.5_20250905.bin"), Some([2, 0, 5]));
+        // Case-insensitive marker.
+        assert_eq!(version_from_filename("tube_v1.2.3.bin"), Some([1, 2, 3]));
+        // A lone V that isn't a version marker doesn't fool it (later marker wins).
+        assert_eq!(version_from_filename("Verbatim_V4.5.6.bin"), Some([4, 5, 6]));
+        // No marker → None (caller must require --version).
+        assert_eq!(version_from_filename("firmware.bin"), None);
+        assert_eq!(version_from_filename("TL60_20250908.bin"), None);
+        assert_eq!(version_from_filename("V3.0.bin"), None); // not a triplet
     }
 }

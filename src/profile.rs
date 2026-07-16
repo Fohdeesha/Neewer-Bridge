@@ -40,10 +40,10 @@ pub enum Profile {
     /// 10ch unified mode-channel personality (NOTES.md §8.1). ch1 Mode-select
     /// (value bands → CCT/HSI/FX/RGBCW/XY), ch2 Dimmer, ch3-10 mode-specific.
     Advanced,
-    /// 19ch per-segment PIXEL personality (TL-series pixel fixtures). ch1 Dimmer,
-    /// ch2 Effect-select, ch3 Speed, then 8×(Hue, Sat) — one HSI colour per tube
-    /// segment. The effects animate the palette across the tube (no static mode
-    /// exists over BLE on these fixtures).
+    /// 20ch per-segment PIXEL personality (TL-series pixel fixtures). ch1 Dimmer,
+    /// ch2 Effect-select, ch3 Speed, ch4 Direction, then 8×(Hue, Sat) — one HSI
+    /// colour per tube segment. The effects animate the palette across the tube
+    /// (no static mode exists over BLE on these fixtures).
     Pixel,
 }
 

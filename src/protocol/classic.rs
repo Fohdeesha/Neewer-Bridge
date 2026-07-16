@@ -23,14 +23,10 @@ const TAG_XY: u8 = 0xB9;
 // (Infinity) devices like the TL120C, which ignores the direct `0xB9` frame and
 // needs this MAC-embedded form (matching how its FX `0x91` and pixel `0xB0`
 // frames are also MAC-embedded).
-//
-// RGBCW (`0xA8` direct / `0xA9` by-MAC) was REMOVED after hardware testing
-// (2026-07-01): the TL120C ignores BOTH forms over direct BLE — the app only ever
-// relays RGBCW through a 2.4GHz group master, never to the light's own BLE. HSI
-// and XY cover colour. See NOTES.md §3.3 / the frames remain in git history.
 const TAG_XY_MAC: u8 = 0xB7;
 // RGBCW: direct `0xA8` (ignored on the TL120C — probe-only) / by-MAC `0xA9` (works —
-// the production frame). See [`rgbcw`] / [`rgbcw_mac`].
+// the production frame, hardware-confirmed 2026-07-01; an earlier "both ignored"
+// verdict was a malformed-frame bug, see [`rgbcw_mac`]). See [`rgbcw`] / [`rgbcw_mac`].
 const TAG_RGBCW: u8 = 0xA8;
 const TAG_RGBCW_MAC: u8 = 0xA9;
 // Old 9-scene FX (`0x88`) — the classic simple effect family (squad car, ambulance,

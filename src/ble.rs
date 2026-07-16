@@ -200,14 +200,23 @@ pub async fn stop_scan(adapter: &Adapter) -> Result<()> {
 }
 
 /// Look for a peripheral with `target_mac` among those already discovered by the
-/// shared scan. Returns `(peripheral, ble_name)` or `None` if not seen yet.
-pub async fn find_scanned(adapter: &Adapter, target_mac: &str) -> Result<Option<(Peripheral, String)>> {
+/// shared scan. Returns `(peripheral, ble_name, rssi)` or `None` if not seen yet.
+///
+/// The RSSI is captured HERE, at discovery time, because it is advertisement
+/// RSSI: BlueZ clears the property the moment the device connects, so reading it
+/// after connect (as the actor used to) yields `None` almost every time now that
+/// scanning is on-demand. The discovery-time value is the freshest signal
+/// measurement we will ever have for this session.
+pub async fn find_scanned(
+    adapter: &Adapter,
+    target_mac: &str,
+) -> Result<Option<(Peripheral, String, Option<i16>)>> {
     let target = normalize_mac(target_mac);
     for p in adapter.peripherals().await.context("listing peripherals")? {
         if let Ok(Some(props)) = p.properties().await {
             if normalize_mac(&props.address.to_string()) == target {
                 let name = props.local_name.unwrap_or_default();
-                return Ok(Some((p, name)));
+                return Ok(Some((p, name, props.rssi)));
             }
         }
     }
@@ -240,15 +249,43 @@ pub struct NeewerChars {
     pub notify: Option<Characteristic>,
 }
 
-/// Connect, discover services, and locate the Neewer write/notify
-/// characteristics. Fails clearly if this isn't a Neewer light.
-pub async fn connect_and_verify(p: &Peripheral) -> Result<NeewerChars> {
-    if !p.is_connected().await.unwrap_or(false) {
-        debug!("connecting…");
-        p.connect().await.context("connect failed")?;
+/// Upper bound on one `connect()` attempt. Generous: marginal fixtures have been
+/// observed taking ~21 s to connect on BlueZ, and BlueZ's own supervision usually
+/// errors out around 25–40 s — this only fires if the platform call *hangs*
+/// (e.g. a stuck D-Bus operation), which would otherwise stall the light's actor
+/// forever while it holds a discovery-scan guard.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
+/// Upper bound on service discovery after a successful connect.
+pub const DISCOVER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `connect()` bounded by [`CONNECT_TIMEOUT`] (skipped if already connected).
+async fn connect_bounded(p: &Peripheral) -> Result<()> {
+    if p.is_connected().await.unwrap_or(false) {
+        return Ok(());
     }
+    debug!("connecting…");
+    match tokio::time::timeout(CONNECT_TIMEOUT, p.connect()).await {
+        Ok(res) => res.context("connect failed"),
+        Err(_) => bail!("connect timed out after {CONNECT_TIMEOUT:?} (hung platform BLE call)"),
+    }
+}
+
+/// `discover_services()` bounded by [`DISCOVER_TIMEOUT`].
+async fn discover_bounded(p: &Peripheral) -> Result<()> {
+    match tokio::time::timeout(DISCOVER_TIMEOUT, p.discover_services()).await {
+        Ok(res) => res.context("service discovery failed"),
+        Err(_) => bail!("service discovery timed out after {DISCOVER_TIMEOUT:?}"),
+    }
+}
+
+/// Connect, discover services, and locate the Neewer write/notify
+/// characteristics. Fails clearly if this isn't a Neewer light. Both platform
+/// calls are time-bounded so a hung BLE stack can never stall a light's actor
+/// indefinitely (it fails, backs off, and retries like any other error).
+pub async fn connect_and_verify(p: &Peripheral) -> Result<NeewerChars> {
+    connect_bounded(p).await?;
     debug!("connected; discovering services");
-    p.discover_services().await.context("service discovery failed")?;
+    discover_bounded(p).await?;
 
     let chars = p.characteristics();
     debug!(count = chars.len(), "discovered characteristics");
@@ -384,10 +421,8 @@ pub struct CharInfo {
 /// Connect, discover services, and read every readable characteristic — a
 /// generic GATT dump for identifying unknown / non-standard lights.
 pub async fn inspect(p: &Peripheral) -> Result<Vec<CharInfo>> {
-    if !p.is_connected().await.unwrap_or(false) {
-        p.connect().await.context("connect failed")?;
-    }
-    p.discover_services().await.context("service discovery failed")?;
+    connect_bounded(p).await?;
+    discover_bounded(p).await?;
     let mut out = Vec::new();
     for c in p.characteristics() {
         let value = if c.properties.contains(CharPropFlags::READ) {
@@ -407,10 +442,13 @@ pub async fn inspect(p: &Peripheral) -> Result<Vec<CharInfo>> {
 /// The most recent advertisement RSSI for this peripheral (dBm), if known.
 ///
 /// This is **advertisement** RSSI (btleplug exposes no on-demand connected-link
-/// RSSI — see NOTES.md). It's refreshed by the shared scan while the device
-/// advertises; a device that stops advertising once connected keeps its last
-/// value. Good for signal-strength diagnostics, NOT for liveness (we use a GATT
-/// read probe for that). Always `None` on macOS/CoreBluetooth.
+/// RSSI — see NOTES.md). It's only refreshed while a discovery scan sees the
+/// device advertise — and on BlueZ the property is **cleared the moment the
+/// device connects**, so on a connected light this is typically `None` now that
+/// scanning is on-demand. Callers that want a per-session signal number should
+/// use the value [`find_scanned`] captured at discovery time (the actor does).
+/// Good for signal-strength diagnostics, NOT for liveness (we use a GATT read
+/// probe for that). Always `None` on macOS/CoreBluetooth.
 pub async fn rssi(p: &Peripheral) -> Option<i16> {
     p.properties().await.ok().flatten().and_then(|pr| pr.rssi)
 }
