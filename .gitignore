@@ -7,7 +7,7 @@
 # neewer-python/ — plus the decompiled NEEWER Studio APK/, Reference Docs/, and
 # protocol-analysis.md. Ignoring the whole folder keeps those nested repos entirely
 # untracked (never add/commit/push to them from here). Our own derived findings live
-# in tracked files (NOTES.md, models.toml, README.md), not in here.
+# in tracked files (models.toml, README.md), not in here.
 /Analysis-Sources/
 
 # Large reference artifact

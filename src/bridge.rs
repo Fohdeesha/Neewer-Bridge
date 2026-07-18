@@ -2,7 +2,7 @@
 //! shared scan, feed mapped ArtDmx into each light's `watch` channel, and run
 //! the ArtNet-loss failsafe.
 //!
-//! Data flow (NOTES.md §8):
+//! Data flow:
 //!   ArtNet UDP → parse → per-universe lookup → map_dmx → watch::Sender
 //!                                                          ↓ (coalesced)
 //!                                            per-light actor → BLE write
@@ -52,7 +52,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     // scans only while a light is disconnected, in duty-cycled bursts, and not at
     // all once every light is connected. A continuous scan starves the active
     // connections on a cheap USB controller and makes the kernel log
-    // `LE Set Scan Enable` timeouts (NOTES.md §5).
+    // `LE Set Scan Enable` timeouts (see scan.rs).
     let scan = scan::ScanCoordinator::new();
     tokio::spawn(scan::run(
         adapter.clone(),

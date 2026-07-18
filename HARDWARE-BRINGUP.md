@@ -3,7 +3,7 @@
 The steps to validate the bridge end-to-end once a **USB Bluetooth adapter** is
 plugged in and a **Neewer light** is powered on nearby. Every step is fully
 scriptable (no interactive prompts), so it can be automated and the BLE traffic
-inspected. There's a one-shot harness at `scripts/bringup.ps1`.
+inspected.
 
 All commands assume `target\debug\neewer-bridge.exe` (or `cargo run --`).
 Add `-v` to see BLE writes (hex), `-vv` to also see btleplug wire logs.
@@ -89,4 +89,5 @@ and none while the value is constant.
 - A `bringup.log` excerpt showing mapped DMX → expected BLE bytes (step 4 table).
 - A reconnect cycle in the log.
 - Note any model-specific quirks (driver needed, whether a readable
-  characteristic exists for the liveness probe, CCT range) back into `NOTES.md`.
+  characteristic exists for the liveness probe, CCT range) back into the
+  README's hardware notes.

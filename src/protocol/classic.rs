@@ -68,7 +68,7 @@ pub fn cct3(brr: u8, cct: u8, gm: i8) -> Vec<u8> {
 /// dimming-curve type (0 = standard); the firmware's CCT handler ignores it, but the
 /// app always sends it and — critically on the two-chip radio+LED-MCU lights — `LEN`
 /// must equal the payload count because the inter-chip UART reframer reassembles by
-/// the header, not by ATT boundaries (NOTES.md §2.1). GM is read signed (`sxtb`) but
+/// the header, not by ATT boundaries. GM is read signed (`sxtb`) but
 /// every legal value (0..=100) is <128, so the sign-extension is a no-op (50 = neutral).
 /// This is the GM-CCT form the driver uses (was the 5-byte `cct_gm5`).
 pub fn cct4(brr: u8, cct: u8, gm: i8) -> Vec<u8> {

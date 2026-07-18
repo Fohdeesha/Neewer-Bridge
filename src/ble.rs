@@ -1,7 +1,7 @@
 //! BLE layer (btleplug). Milestone 1-2 scope: discover Neewer lights, confirm
 //! the peripheral address is the real MAC, connect, verify the Neewer GATT
-//! profile, and send commands. The per-light actor + health FSM (NOTES.md §5)
-//! is built on top of these primitives in a later milestone.
+//! profile, and send commands. The per-light actor + connection-health logic
+//! (`light.rs`) is built on top of these primitives.
 //!
 //! Everything here logs verbosely (commands are logged as hex) so that bring-up
 //! on real hardware is debuggable.
@@ -224,7 +224,8 @@ pub async fn find_scanned(
 }
 
 /// Find any readable characteristic for use as a non-mutating liveness probe
-/// (NOTES.md §5). Standard Generic Access chars (e.g. Device Name) are usually
+/// (the connection check in `light.rs`). Standard Generic Access chars (e.g.
+/// Device Name) are usually
 /// readable even if the Neewer control chars are not.
 pub fn find_readable_char(p: &Peripheral) -> Option<Characteristic> {
     p.characteristics()
@@ -442,7 +443,7 @@ pub async fn inspect(p: &Peripheral) -> Result<Vec<CharInfo>> {
 /// The most recent advertisement RSSI for this peripheral (dBm), if known.
 ///
 /// This is **advertisement** RSSI (btleplug exposes no on-demand connected-link
-/// RSSI — see NOTES.md). It's only refreshed while a discovery scan sees the
+/// RSSI read). It's only refreshed while a discovery scan sees the
 /// device advertise — and on BlueZ the property is **cleared the moment the
 /// device connects**, so on a connected light this is typically `None` now that
 /// scanning is on-demand. Callers that want a per-session signal number should

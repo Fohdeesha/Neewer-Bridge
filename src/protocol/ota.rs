@@ -6,10 +6,9 @@
 //! NOT a Nordic DFU service. (The other transport, `getFirmwareUpdateMode == 1`,
 //! is stock Nordic Secure DFU over `0xFE59`; we do not implement it.)
 //!
-//! Ground truth: decompiled `rb1.java` (the state machine) + `cn.java` (the frame
-//! builders), cross-checked against `Analysis-Sources/protocol-analysis.md` and
-//! bengt's `docs/PROTOCOL.md` (independent firmware disassembly). See NOTES.md §
-//! "OTA / DFU".
+//! Ground truth: the decompiled official app (`rb1.java`, the state machine, +
+//! `cn.java`, the frame builders), cross-checked against verygeeky/neewer-lights'
+//! `PROTOCOL.md` (independent firmware disassembly).
 //!
 //! ## Wire protocol
 //!
@@ -258,8 +257,8 @@ mod tests {
     #[test]
     fn check_code_matches_real_tl60_firmware() {
         // The live TL60 RGB-3 image (TL60-3_V3.0.5_20250908.bin): 142420 bytes,
-        // additive sum 0x00CBBE77 — computed independently on the VM and pinned here
-        // so the encoder can't silently drift. (See NOTES.md OTA notes.)
+        // additive sum 0x00CBBE77 — computed independently and pinned here
+        // so the encoder can't silently drift.
         // We can't ship the 142 KB blob in the test, but we CAN assert the encoder
         // reproduces a known partial sum shape and the u32 wrap semantics.
         let ones = vec![1u8; 1000];

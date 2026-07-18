@@ -7,9 +7,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/):
 **MAJOR** = breaking config/CLI/protocol-behaviour changes, **MINOR** = new
 features (new commands, profiles, supported models), **PATCH** = fixes.
 
-Release procedure (see also NOTES.md §0): bump `version` in `Cargo.toml`, add
-an entry here, commit, then tag `vX.Y.Z`. The binary prints its version on
-startup (first log line) and via `neewer-bridge --version`.
+Release procedure: bump `version` in `Cargo.toml`, add an entry here, commit,
+then tag `vX.Y.Z`. The binary prints its version on startup (first log line)
+and via `neewer-bridge --version`.
 
 ## [1.0.0] — 2026-07-18
 

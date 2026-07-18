@@ -74,7 +74,7 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 # mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)
 # name     = "Key light"          # optional label
 # driver   = "auto"               # auto | classic | infinity | home
-# profile  = "advanced"           # cct | cct_gm | hsi | rgbcw | full | advanced | pixel (NOTES.md §8.1)
+# profile  = "advanced"           # cct | cct_gm | hsi | rgb | rgbcw | full | advanced | pixel (see README)
 #                                 # `rgbcw` (5ch) = direct R,G,B,CW,WW passthrough — maps onto
 #                                 #   openHAB's DMX color (3ch) + tunablewhite (2ch) things
 #                                 # `advanced` (10ch) = mode-channel: CCT/HSI/FX/RGBCW/XY

@@ -1,4 +1,4 @@
-//! DMX profiles and the DMX→`LightState` mapper (NOTES.md §8.1).
+//! DMX profiles and the DMX→`LightState` mapper.
 //!
 //! A profile is a fixed channel layout sized to a light's capability. The mapper
 //! is a pure function (DMX bytes in, `LightState` out) so it is fully unit-
@@ -37,7 +37,7 @@ pub enum Profile {
     Rgbcw,
     /// 5ch: Dimmer, Mode, CCT/Hue, GM/Sat, (reserved). Mode <128 = CCT, ≥128 = HSI.
     Full,
-    /// 10ch unified mode-channel personality (NOTES.md §8.1). ch1 Mode-select
+    /// 10ch unified mode-channel personality. ch1 Mode-select
     /// (value bands → CCT/HSI/FX/RGBCW/XY), ch2 Dimmer, ch3-10 mode-specific.
     Advanced,
     /// 20ch per-segment PIXEL personality (TL-series pixel fixtures). ch1 Dimmer,
@@ -140,7 +140,7 @@ impl Profile {
 /// DMX personality so a console patched for the fixture feels familiar. Bands not
 /// listed (GEL 96-127, Pixel 160-191, 232-255) are unimplemented → neutral white.
 /// RGBCW (128-159) is driven via the **by-MAC** frame (`0xA9`); the direct `0xA8` is
-/// ignored on the TL120C — hardware-confirmed 2026-07-01 (see NOTES.md §3.3).
+/// ignored on the TL120C — hardware-confirmed 2026-07-01.
 pub mod mode_band {
     pub const CCT: std::ops::RangeInclusive<u8> = 0..=31;
     pub const HSI: std::ops::RangeInclusive<u8> = 32..=63;
@@ -243,8 +243,7 @@ fn xy_value(dmx: u8) -> u16 {
 /// Pixel effect-select channel → effect id, in five value bands. Only the effects
 /// that work over direct BLE on the TL120C are exposed (hardware-verified): 1
 /// ColorReplacement, 3 SingleColorMoving, 4 TwoColorMoving, 5 ThreeColorMoving, 7
-/// Fire. (The app's other 5 pixel effects are ignored over direct BLE — NOTES.md
-/// §3.3.)
+/// Fire. (The app's other 5 pixel effects are ignored over direct BLE.)
 #[inline]
 fn pixel_effect_select(dmx: u8) -> u8 {
     match dmx {

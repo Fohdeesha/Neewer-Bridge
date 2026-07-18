@@ -1,7 +1,7 @@
 //! The capability-aware driver: turns a `LightState` into the BLE command bytes
 //! for a specific protocol family. This is the layer that owns the model-
 //! dependent choices the pure `protocol` encoders deliberately don't (e.g.
-//! which classic CCT frame form to use), per NOTES.md §6.
+//! which classic CCT frame form to use).
 
 use crate::profile::Profile;
 use crate::protocol::{classic, home, infinity, pixel, LightState, Mode};
@@ -64,7 +64,7 @@ impl Driver {
                 Driver::Classic { supports_gm, .. } => {
                     if *supports_gm {
                         // The app's exact 4-byte GM form (was our 5-byte cct_gm5);
-                        // byte-verified on the TL120C by bengt/verygeeky (NOTES.md §2.1/§3.3).
+                        // byte-verified on the TL120C by verygeeky/neewer-lights.
                         classic::cct4(st.brightness, st.cct, st.gm)
                     } else {
                         classic::cct2(st.brightness, st.cct)

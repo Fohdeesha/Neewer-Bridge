@@ -1,9 +1,9 @@
-//! Bridge configuration (TOML). See `NOTES.md` §8.2 for the documented schema
-//! and the tracked, ready-to-edit `config.toml` for a worked example.
+//! Bridge configuration (TOML). See the tracked, ready-to-edit `config.toml`
+//! for a fully commented worked example of the schema.
 //!
 //! The binding identity for every light is its **MAC address** — stable across
-//! reboots and independent of power-on/discovery order (NOTES.md §4). On
-//! Linux/Windows the BLE peripheral address *is* this MAC.
+//! reboots and independent of power-on/discovery order. On Linux/Windows the
+//! BLE peripheral address *is* this MAC.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -111,8 +111,8 @@ pub struct LightCfg {
     /// Protocol family: `auto` | `classic` | `infinity` | `home`.
     #[serde(default = "default_driver")]
     pub driver: String,
-    /// DMX profile name (see NOTES.md §8.1): `cct` | `cct_gm` | `hsi` | `rgbcw` |
-    /// `full` | `advanced` | `pixel`.
+    /// DMX profile name (see the README's "DMX profiles"): `cct` | `cct_gm` |
+    /// `hsi` | `rgb` | `rgbcw` | `full` | `advanced` | `pixel`.
     pub profile: String,
     /// ArtNet 15-bit Port-Address (Net/Sub-Net/Universe combined), 0..=32767.
     pub universe: u16,
@@ -229,7 +229,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Known DMX profiles (kept in sync with NOTES.md §8.1).
+/// Known DMX profiles (kept in sync with `profile.rs` and the README).
 pub const KNOWN_PROFILES: &[&str] =
     &["cct", "cct_gm", "hsi", "rgb", "rgbcw", "full", "advanced", "pixel"];
 /// Known driver selectors.
@@ -254,7 +254,7 @@ impl Config {
     /// with defaults — a config with one bad entry must not make `ota` or
     /// `test` quietly run with the wrong adapter/port (this project has been
     /// bitten by silently-wrong configs before; see the "all lights white"
-    /// post-mortem in NOTES.md).
+    /// entry in the README's troubleshooting section).
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if path.is_file() {
             Self::load(path)

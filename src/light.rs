@@ -11,7 +11,7 @@
 //!   is answered by the light's radio, so a healthy light stays connected with zero
 //!   churn; three consecutive misses — or a reported disconnect — means a dead link
 //!   and we reconnect. A stuck/unresponsive fixture has TWO distinct causes
-//!   (NOTES.md top banner, corrected 2026-07-14): a **weak-RF link** (drops or
+//!   (both seen live on hardware): a **weak-RF link** (drops or
 //!   won't connect at −90 dBm and below; moving it closer + this reconnect loop
 //!   recovers it) and a genuine **firmware WEDGE** (the fixture stays dead even
 //!   with the adapter touching it; ONLY a physical power-cycle clears it — RF
@@ -102,7 +102,7 @@ impl LightActor {
             // disconnected. The coordinator scans only while ≥1 such request is
             // outstanding (and even then in bursts), so a fully-connected fleet
             // does no scanning at all — which is what stops the cheap USB
-            // controller choking on a permanent scan (NOTES.md §5 / scan.rs).
+            // controller choking on a permanent scan (see scan.rs).
             let mut searching = Some(self.scan.begin_search());
             let (peripheral, name, discovery_rssi) = self.find().await;
             // Discovery can race the platform's name cache (BlueZ may not have
@@ -223,7 +223,7 @@ impl LightActor {
             "session active"
         );
 
-        // Status reads (NOTES.md §3.6): subscribe to the notify characteristic and
+        // Status reads (protocol::queries/replies): subscribe to the notify char and
         // fire an initial battery/temp/version/state query. MAC-addressed, so only
         // for MAC-carrying drivers (classic/infinity, not Home). Pure telemetry, all
         // best-effort — a light without notify is still fully controllable.

@@ -5,7 +5,7 @@
 //! but `opcode` is a *reply* code. This maps the codes we understand into a small
 //! [`Reply`] enum; unknown/short frames return `None` so the caller can still log the
 //! raw hex. Field offsets are byte-exact from the decompiled `cn.java` parser and
-//! cross-checked against the bengt/verygeeky `replies.py` (NOTES.md §2.1, §3.6).
+//! cross-checked against verygeeky/neewer-lights' `replies.py`.
 //!
 //! The queries that elicit these are built in [`super::queries`]. Some lights also
 //! *volunteer* state (e.g. the TL120C pushes a `0x05` battery frame on connect).

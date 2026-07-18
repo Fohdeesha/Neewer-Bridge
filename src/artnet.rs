@@ -1,5 +1,5 @@
-//! ArtNet receive path. We only need **ArtDmx** (OpCode `0x5000`) — see
-//! NOTES.md §7. Everything else (ArtPoll etc.) is ignored for now.
+//! ArtNet receive path. We only need **ArtDmx** (OpCode `0x5000`); everything
+//! else (ArtPoll etc.) is ignored for now.
 //!
 //! Port-Address is the 15-bit `Net(7) | Sub-Net(4) | Universe(4)` value that a
 //! light's config binds to; the wire splits it across the `Net` byte and the

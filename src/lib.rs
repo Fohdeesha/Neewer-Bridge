@@ -1,8 +1,8 @@
 //! Neewer-Bridge: an ArtNet (DMX-over-UDP) to Neewer Bluetooth light bridge.
 //!
 //! The library crate holds the reusable building blocks; the binary (`main.rs`)
-//! wires them into a CLI. See `NOTES.md` at the repo root for the full design
-//! and the reverse-engineering notes that back the protocol module.
+//! wires them into a CLI. The protocol encoders are byte-exact against the
+//! official apps' reverse-engineered frames — see the `protocol` module docs.
 
 pub mod artnet;
 pub mod ble;

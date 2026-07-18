@@ -7,7 +7,7 @@
 //! Reverse-engineered from an HCI capture of NEEWER Studio driving a TL120C and
 //! verified live (red+blue, magenta+cyan, fire palettes all rendered as distinct
 //! bands along the tube). Cross-checked against `verygeeky/neewer-lights`
-//! (`pixel.py`, `docs/PROTOCOL.md`) — see NOTES.md §3 / protocol-analysis.md.
+//! (`pixel.py`, `docs/PROTOCOL.md`).
 //!
 //! # Wire format
 //! "Pixel" is NOT a raw per-LED framebuffer: you pick an effect id + scalar
@@ -144,15 +144,13 @@ pub fn palette(mac: [u8; 6], effect_id: u8, sub_index: u8, blocks: &[Block]) -> 
 /// blanks the output and PAUSE is ignored (the effect keeps animating), so a
 /// truly static per-segment render is NOT available over BLE on this fixture:
 /// every pixel effect animates (or collapses to a single colour at speed 0).
-/// See NOTES.md §3.3 / §10.
 pub const RUN_PLAY: u8 = 1;
 
 /// The pixel effects that render over a DIRECT BLE connection on the TL120C
 /// (`commandType == 2`). Hardware-verified 2026-07-01: of the app's 10 pixel
 /// effects, exactly these 5 work when the `0xB0` frame is sent straight to the
 /// light; the other 5 (ColorAlternate, Colorful, ColorGradient, Trail, ColorShift)
-/// are silently ignored — they only work relayed through the 2.4G hub. See
-/// NOTES.md §3.3.
+/// are silently ignored — they only work relayed through the 2.4G hub.
 pub const EFFECT_COLOR_REPLACEMENT_ID: u8 = 1;
 pub const EFFECT_SINGLE_MOVING: u8 = 3;
 pub const EFFECT_TWO_MOVING: u8 = 4;

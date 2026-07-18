@@ -655,8 +655,8 @@ pub async fn test(
 
     // Optional advanced-mode probe: exercise XY and a couple of FX effects (the
     // modes that work over direct BLE on Infinity fixtures). Both use MAC-addressed
-    // frames — the TL120C ignores the direct 0xB9/0x88 forms. (RGBCW is NOT probed:
-    // the TL120C ignores it entirely over direct BLE — see NOTES.md §3.3.) Watch
+    // frames — the TL120C ignores the direct 0xB9/0x88 forms. (RGBCW is not
+    // probed here — use `--set rgbcwmac:…` for that.) Watch
     // the light to confirm each mode engages.
     if modes {
         info!("XY probe — CIE coordinate (MAC-addressed 0xB7, as the bridge sends)");
@@ -729,7 +729,8 @@ pub async fn test(
             ("Fire: orange flicker over dark bg", 7, vec![Block::Off, Block::Hsi { hue: 25, sat: 100 }]),
         ];
         for (label, effect, blocks) in &demos {
-            // Clear the previous effect's latch first (see NOTES.md §3.3).
+            // Clear the previous effect's latch first (a plain CCT frame overrides
+            // a running pixel effect; a new effect frame alone does not).
             ble::write_command(&peripheral, &chars.write, &set_cct(50, 56)).await?;
             tokio::time::sleep(Duration::from_millis(700)).await;
             info!("PIXEL {label}");
@@ -878,7 +879,7 @@ fn build_pixel_effect_test(mac: [u8; 6], id: u8) -> (Vec<Vec<u8>>, String) {
 /// (no blink, no output change), so it's safe to run against a light in use. The
 /// replies arrive asynchronously on the notify characteristic — hence the settle
 /// wait at the end. The TL120C firmware handles these MAC reads (the direct `0x80`/
-/// `0x85` version/state queries are dropped — see NOTES.md §2.1/§3.6).
+/// `0x85` version/state queries are dropped by the firmware).
 async fn test_status(p: &Peripheral, write: &Characteristic, mac: [u8; 6]) -> Result<()> {
     info!("reading status (version / battery / temperature / state); decoded replies below");
     for (label, frame) in [
@@ -903,7 +904,7 @@ async fn test_status(p: &Peripheral, write: &Characteristic, mac: [u8; 6]) -> Re
 /// behind `test --set`, for guided one-value-at-a-time hardware testing. The light
 /// keeps the state after disconnect. Non-CCT/pixel specs first send a CCT-white
 /// frame to clear any latched pixel/FX mode (a plain CCT overrides the animation
-/// where a power-cycle does not — see NOTES.md §3.3).
+/// where a power-cycle does not).
 async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &str) -> Result<()> {
     let parts: Vec<&str> = spec.split(':').collect();
     let get = |i: usize| parts.get(i).copied();

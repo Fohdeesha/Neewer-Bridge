@@ -14,11 +14,11 @@ protocol. CLI, config-file driven, runs on **Windows and Linux**.
 - **141-model capability catalog** so `add` auto-fills a light's driver, profile,
   and CCT range from its Bluetooth name.
 
-> Status: hardware-validated end-to-end on a Neewer TL120C, TL21C and TL60 RGB —
-> CCT, HSI, XY, RGBCW, GM, FX, and per-segment pixel all confirmed over a direct BLE
-> connection (per-model: each fixture supports a different subset — see the
-> hardware notes below). See `NOTES.md` for the full design, protocol
-> reverse-engineering, and reliability notes.
+> Status: hardware-validated end-to-end on a five-light fleet — Neewer TL120C
+> (×2), TL21C, TL60 RGB, and TL97C. CCT, HSI, XY, RGBCW, GM, FX, and per-segment
+> pixel are all confirmed over a direct BLE connection (each model supports a
+> different subset — see the hardware notes under
+> [DMX profiles](#dmx-profiles-channel-layouts)).
 
 Releases follow [semantic versioning](https://semver.org/) — see
 [CHANGELOG.md](CHANGELOG.md). The binary reports its version via
@@ -44,7 +44,7 @@ toolchain is used (Visual Studio Build Tools / Community). A Bluetooth LE adapte
 is needed to talk to lights (a USB BLE dongle works).
 
 ```sh
-git clone <this repo>
+git clone https://github.com/Fohdeesha/Neewer-Bridge.git
 cd Neewer-Bridge
 cargo build --release
 # binary at target/release/neewer-bridge  (neewer-bridge.exe on Windows)
@@ -161,7 +161,7 @@ driver / profile / CCT range are filled automatically; any flag overrides.
 | `--modes` | off | Probe the advanced modes: XY and a few FX effects (MAC-addressed frames). |
 | `--pixel` | off | Probe per-segment PIXEL control (`0xB0`): cycle the 5 working pixel effects (ColorReplacement / Single/Two/Three-ColorMoving / Fire) so distinct bands/animations appear along the tube. TL-series pixel fixtures only (e.g. TL120C). |
 | `--status` | off | Read device status — firmware version, battery, temperature, power/mode — and print the decoded replies. **Non-mutating** (no blink, no colour change), so it's safe to run against a light in use. |
-| `--set SPEC` | — | Send ONE frame and hold it (guided one-at-a-time testing; the light keeps the state after disconnect). `SPEC` = `cct:<K>:<bri>` (2-byte form), `cctgm:<K>:<gm>:<bri>[:3\|4\|5]` (GM CCT, gm −50..50, optional frame form — default the app's 4-byte), `hsi:<hue>:<sat>:<bri>`, `xy:<x>:<y>:<bri>` (by-MAC `0xB7`), `xydirect:<x>:<y>:<bri>` (direct `0xB9`), `fx:<id>:<bri>` (MAC `0x91`), `fxdirect:<id>:<bri>` (direct `0x8B` — the TL21C's FX path), `scene:<id>:<bri>` (old 9-scene `0x88`), `pixel:<hue,…>:<eff>:<speed>`, `pixfx:<id>` (raw effect probe 1–10), `rgbcwmac:<r>:<g>:<b>[:<cw>:<ww>:<bri>]` (RGBCW via by-MAC `0xA9` — the production form; `rgbcw:…` = the direct `0xA8`, ignored on the TL120C), or `warmdim` (safe dim-warm end state). |
+| `--set SPEC` | — | Send ONE frame and hold it (guided one-at-a-time testing; the light keeps the state after disconnect). `SPEC` = `cct:<K>:<bri>` (2-byte form), `cctgm:<K>:<gm>:<bri>[:3\|4\|5]` (GM CCT, gm −50..50, optional frame form — default the app's 4-byte), `hsi:<hue>:<sat>:<bri>`, `xy:<x>:<y>:<bri>` (by-MAC `0xB7`), `xydirect:<x>:<y>:<bri>` (direct `0xB9`), `fx:<id>:<bri>` (MAC `0x91`), `fxdirect:<id>:<bri>` (direct `0x8B` — the TL21C's FX path), `scene:<id>:<bri>` (old 9-scene `0x88`), `pixel:<hue,…>:<eff>:<speed>`, `pixfx:<id>` (raw effect probe 1–10), `rgbcwmac:<r>:<g>:<b>[:<cw>:<ww>:<bri>]` (RGBCW via by-MAC `0xA9` — the production form; `rgbcw:…` = the direct `0xA8`, ignored on the TL120C), `warmdim` (safe dim-warm end state), or `raw:<hex>` (send an arbitrary frame verbatim — protocol spelunking, e.g. `raw:78D00048`). |
 
 `test` blinks the light 3× (also a visual identify), sets 5600K @ 50%, then runs
 any requested probes. FX and PIXEL latch the light into their mode — `test`
@@ -217,10 +217,9 @@ deterministic across reboots.
 A **missing** config file is fine for the tool commands (`scan`, `test`, `monitor`,
 …) — they fall back to built-in defaults. An **existing but invalid** config
 (syntax error, bad light entry, out-of-range value) is a hard error for *every*
-command: the bridge never silently swaps your settings for defaults (that once
-made `ota`/`test` run against the wrong adapter with only a mislabelled log line
-to show for it). The startup log states the absolute path of the config it loaded
-— or that loading failed, and why.
+command — the bridge never silently swaps your settings for defaults. The startup
+log states the absolute path of the config it loaded — or that loading failed,
+and why.
 
 ```toml
 [artnet]
@@ -425,7 +424,8 @@ loop effects).
 | 6 | CCT-flash | 12 | HUE-loop | 18 | Music |
 
 FX is only available on models whose catalog entry has `supports_fx` (run
-`neewer-bridge models`). The TL120C supports all 18.
+`neewer-bridge models`). All four hardware-validated models (TL120C, TL60 RGB,
+TL21C, TL97C) support all 18.
 
 ## Drivers
 
@@ -462,8 +462,9 @@ half-dead. The supervisor guards against that with a cheap **GATT read every
 `probe_secs`** — the radio answers it, so a healthy light stays connected with no churn;
 three consecutive misses (or a reported disconnect) mean a dead link → reconnect.
 Reconnects use a **jittered backoff** so a fleet doesn't reconnect in lockstep. That's the
-whole liveness model — the bridge deliberately doesn't try to auto-detect a firmware "wedge"
-(see the note below on why).
+whole liveness model — deliberately simple; the bridge doesn't try to auto-detect a
+firmware "wedge" (a detector for it proved too false-positive-prone, and a real wedge
+needs a human power-cycle anyway — see below).
 
 ⚠️ **A light stuck on its last colour and ignoring commands has two possible causes —
 tell them apart by whether moving it closer helps:**
@@ -472,20 +473,13 @@ tell them apart by whether moving it closer helps:**
   again; **move it (or the adapter) nearer** and it recovers, no power-cycle needed. If one
   unit does this repeatedly it's the weakest radio in the fleet. RSSI is logged per light
   (at connect, session start, and on each probe) precisely so you can spot a marginal
-  placement. It's advertisement RSSI captured when the light was last discovered —
-  BlueZ clears the live value once a device connects, so the discovery reading is the
-  freshest one a session can have.
+  placement.
 - **Firmware wedge** (rarer, seen on a damaged unit) — the fixture is hung: it stays
   unresponsive/unconnectable **even with the adapter touching it**, and **only a full
   power-cycle clears it** — RF proximity does not, and neither does reflashing the current
   firmware. Weak RF seems to *trigger* the wedge, but once wedged it's a firmware state. So:
   if getting close fixes it, it was a weak link; if it's still dead at touching range,
   power-cycle it.
-
-(Note: the bridge does **not** auto-detect the wedge — an earlier notify-silence "wedge"
-detector plus a `test --recover` tool were removed for having too many false positives and
-aggressively churning connections. The liveness model above is deliberately just the
-GATT-read check + jittered reconnect.)
 
 **Discovery scanning is on-demand, not permanent.** btleplug only discovers a light while
 a scan is running, so the bridge scans to (re)find a *disconnected* fixture — but only
@@ -539,4 +533,4 @@ series (Infinity) fixtures only; Home (`NH-*`) lights are skipped.
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE).

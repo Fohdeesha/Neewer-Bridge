@@ -3,8 +3,8 @@
 //! These ask the light for state; the answer arrives asynchronously on the notify
 //! characteristic and is decoded by [`super::replies`]. They are the "Infinity"
 //! MAC-addressed reads — the TL120C firmware **drops** the direct `0x80`/`0x85`
-//! query opcodes but handles these MAC variants (bengt/verygeeky firmware disasm;
-//! NOTES.md §2.1). For a directly-connected light the target MAC is the light's
+//! query opcodes but handles these MAC variants (verygeeky/neewer-lights firmware
+//! disassembly). For a directly-connected light the target MAC is the light's
 //! own MAC — it acts as its own group master and answers for itself.
 //!
 //! Byte-exact from the decompiled `cn.java`:
@@ -51,7 +51,7 @@ pub fn state(mac: [u8; 6]) -> Vec<u8> {
 // (2026-07-09) as a "spare canary" for the TL60, then was removed. The all-white/
 // no-colour it was first blamed for turned out to be a WRONG CONFIG (lights on the
 // `advanced` profile, not `rgb`) — the SAME symptom, root-caused later the same day;
-// the `0xC4` blame was a misattribution (NOTES.md top banner). `0xC4` is almost
+// the `0xC4` blame was a misattribution. `0xC4` is almost
 // certainly harmless, but there's no reason to re-add it: battery (`0x95`) already
 // elicits a reply from every reply-capable model (incl. a healthy TL60), so the canary
 // doesn't need a second capability probe. Keep the liveness path to plain reads.

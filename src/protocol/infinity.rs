@@ -3,7 +3,7 @@
 //! prefix, different tags. `LEN` counts the MAC + subtag + value bytes.
 //!
 //! On Linux/Windows the MAC is exactly the BLE peripheral address (no discovery
-//! hack needed — see NOTES.md §4).
+//! hack needed).
 
 use super::{gm_byte, with_checksum};
 
