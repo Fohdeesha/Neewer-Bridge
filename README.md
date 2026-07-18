@@ -39,9 +39,16 @@ Releases follow [semantic versioning](https://semver.org/) — see
 
 ## Install
 
-Requires the [Rust toolchain](https://rustup.rs) (stable). On Windows the MSVC
-toolchain is used (Visual Studio Build Tools / Community). A Bluetooth LE adapter
-is needed to talk to lights (a USB BLE dongle works).
+**Prebuilt binaries:** every release ships ready-to-run zips for **Windows x64**
+and **Linux x64** on the
+[Releases page](https://github.com/Fohdeesha/Neewer-Bridge/releases) — unzip
+anywhere, edit the bundled `config.toml` (it sits beside the binary, exactly
+where the bridge looks first), and run. A Bluetooth LE adapter is needed to talk
+to lights (a USB BLE dongle works).
+
+**Building from source** requires the [Rust toolchain](https://rustup.rs)
+(stable). On Windows the MSVC toolchain is used (Visual Studio Build Tools /
+Community); on Linux install `libdbus-1-dev` and `pkg-config` (BlueZ D-Bus).
 
 ```sh
 git clone https://github.com/Fohdeesha/Neewer-Bridge.git

@@ -1,0 +1,127 @@
+# Build and publish release binaries whenever a version tag (vX.Y.Z) is pushed.
+# Release procedure: bump `version` in Cargo.toml, add a CHANGELOG entry, commit,
+# tag vX.Y.Z, push the tag — this workflow does the rest (test, build, package,
+# publish). `workflow_dispatch` allows re-running it for an existing tag.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release (e.g. v1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest still-supported Ubuntu runner => widest glibc compatibility
+          # for the shipped binary. Bump when GitHub retires the image.
+          - os: ubuntu-22.04
+            label: linux-x64
+          - os: windows-latest
+            label: windows-x64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # btleplug's Linux backend talks to BlueZ over D-Bus.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config zip
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$v" != "$TAG" ]; then
+            echo "Cargo.toml version v$v does not match tag $TAG" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The zips are self-contained: the binary, the ready-to-edit config.toml
+      # (the bridge looks for it beside the executable first), and the license.
+      # models.toml is compiled into the binary and doesn't need to ship.
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir stage
+          cp target/release/neewer-bridge config.toml LICENSE stage/
+          cd stage && zip "../neewer-bridge-$TAG-linux-x64.zip" ./*
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory stage | Out-Null
+          Copy-Item target/release/neewer-bridge.exe, config.toml, LICENSE stage/
+          Compress-Archive -Path stage/* -DestinationPath "neewer-bridge-$env:TAG-windows-x64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: neewer-bridge-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Use the tag's CHANGELOG section as the release notes.
+      - name: Extract release notes from CHANGELOG
+        shell: bash
+        run: |
+          ver="${TAG#v}"
+          awk -v ver="$ver" '
+            $0 ~ "^## \\[" ver "\\]" {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/master/CHANGELOG.md)." > notes.md
+          fi
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "$TAG" dist/*.zip \
+              --repo "${{ github.repository }}" \
+              --title "Neewer-Bridge $TAG" \
+              --verify-tag \
+              --notes-file notes.md
+          fi

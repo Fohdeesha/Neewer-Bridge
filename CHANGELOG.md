@@ -8,8 +8,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/):
 features (new commands, profiles, supported models), **PATCH** = fixes.
 
 Release procedure: bump `version` in `Cargo.toml`, add an entry here, commit,
-then tag `vX.Y.Z`. The binary prints its version on startup (first log line)
-and via `neewer-bridge --version`.
+then tag `vX.Y.Z` and push the tag — GitHub Actions builds the Windows/Linux
+binaries, runs the tests, and publishes the GitHub release automatically (with
+this file's entry as the release notes). The binary prints its version on
+startup (first log line) and via `neewer-bridge --version`.
 
 ## [1.0.0] — 2026-07-18
 
