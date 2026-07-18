@@ -1,6 +1,6 @@
 [package]
 name = "neewer-bridge"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "ArtNet (DMX-over-UDP) to Neewer Bluetooth light control bridge"
 license = "MIT"

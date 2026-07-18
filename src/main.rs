@@ -242,6 +242,15 @@ async fn main() {
     let log_cfg = loaded.as_ref().map(|c| c.logging.clone()).unwrap_or_default();
     let _log_guards = logging::init(&log_cfg, cli.verbose);
 
+    // Version banner — first line of every invocation, so any log capture
+    // (screen buffer, rotated file, bug report) records which build produced it.
+    // The same version string backs `--version` (clap reads it from Cargo.toml).
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "neewer-bridge v{} starting",
+        env!("CARGO_PKG_VERSION")
+    );
+
     // Announce which config file actually won — and, critically, whether it
     // actually LOADED. The resolver prefers `config.toml` beside the executable
     // over the working directory, so a stale copy there can silently shadow the

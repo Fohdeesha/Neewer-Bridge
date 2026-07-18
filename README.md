@@ -20,6 +20,10 @@ protocol. CLI, config-file driven, runs on **Windows and Linux**.
 > hardware notes below). See `NOTES.md` for the full design, protocol
 > reverse-engineering, and reliability notes.
 
+Releases follow [semantic versioning](https://semver.org/) — see
+[CHANGELOG.md](CHANGELOG.md). The binary reports its version via
+`neewer-bridge --version` and as the first log line on every startup.
+
 ## Contents
 
 - [Install](#install)
@@ -31,6 +35,7 @@ protocol. CLI, config-file driven, runs on **Windows and Linux**.
 - [Drivers](#drivers)
 - [Reliability](#reliability)
 - [Troubleshooting](#troubleshooting)
+- [Changelog](CHANGELOG.md)
 
 ## Install
 
@@ -101,7 +106,7 @@ No command ⇒ `run` (launching the bare binary starts the bridge).
 | `--config PATH` | see right | Config file path. Default: `config.toml` next to the executable if present, else `config.toml` in the working directory. |
 | `-v` | — | Debug logging for this crate (logs BLE writes as hex). |
 | `-vv` | — | Trace + btleplug BLE wire logs. |
-| `--version` | — | Print version. |
+| `--version` | — | Print the release version (also logged as the first line on every startup; see [CHANGELOG.md](CHANGELOG.md)). |
 | `--help` | — | Help (works on any subcommand too, e.g. `add --help`). |
 
 Logging destinations and default level come from the `[logging]` config section
