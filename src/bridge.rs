@@ -18,12 +18,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::watch;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use crate::artnet::{self, ArtDmx};
 use crate::ble;
 use crate::config::Config;
 use crate::light::LightActor;
+use crate::merge;
 use crate::profile::{extract_slice, map_dmx, CctRange, Profile};
 use crate::protocol::LightState;
 use crate::scan;
@@ -41,11 +41,14 @@ pub async fn run(cfg: Config) -> Result<()> {
         warn!("no [[lights]] configured — the bridge will receive ArtNet but drive nothing");
     }
 
-    // Bind the ArtNet socket FIRST, before touching BLE or spawning anything: a
-    // bind failure (port already in use, bad bind IP) must be a fatal startup
+    // Bind every ArtNet input FIRST, before touching BLE or spawning anything:
+    // a bind failure (port already in use, bad bind IP) must be a fatal startup
     // error with a non-zero exit — under a supervisor, warn-and-exit-0 is a
-    // silent outage.
-    let sock = artnet::bind(&cfg.artnet.bind_ip, cfg.artnet.port).await?;
+    // silent outage. Input 0 is the primary [artnet] bind_ip/port; each
+    // [[artnet.inputs]] adds another listener, merged per channel (merge.rs —
+    // bind_inputs is the same setup path `monitor` uses).
+    let (bound, merger) = merge::bind_inputs(&cfg.artnet).await?;
+    let inputs_cfg = cfg.artnet.resolved_inputs();
 
     let adapter = ble::acquire_adapter(&cfg.ble.adapter).await?;
     // Discovery scanning is coordinated (scan.rs), not permanently on: the bridge
@@ -118,42 +121,56 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     spawn_failsafe(&cfg, base, last_artnet.clone(), all_sinks);
 
-    // ArtNet listener — owns the senders; updates them as packets arrive. The
-    // socket was bound above, so the only way this task ends is a receive error
-    // — which the select! below treats as fatal.
+    // ArtNet listeners + merge/dispatch pump (merge.rs) — receives on every
+    // input, sequence-filters per input, merges per channel, and pushes the
+    // merged universes into the light sinks. The sockets were bound above, so
+    // the only way this task ends is a receive error — which the select! below
+    // treats as fatal.
     let last_for_listener = last_artnet.clone();
-    let mut seq = artnet::SeqTracker::new();
     let listener = tokio::spawn(async move {
-        artnet::serve(sock, move |src, pkt: ArtDmx| {
-            // Any ArtDmx (even a stale one) proves the source is alive, so it
-            // feeds the failsafe timer before the sequence check.
-            last_for_listener.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
-            // Drop out-of-order/duplicate packets (Art-Net Sequence field) so a
-            // late datagram can't briefly re-apply an old state.
-            if !seq.is_fresh(src.ip(), pkt.port_address, pkt.sequence) {
-                debug!(%src, port = pkt.port_address, seq = pkt.sequence, "stale ArtDmx dropped");
-                return;
-            }
-            if let Some(sinks) = universe_map.get(&pkt.port_address) {
-                for s in sinks {
-                    if let Some(slice) =
-                        extract_slice(&pkt.data, s.address, s.profile.channel_count())
-                    {
-                        let state = map_dmx(s.profile, slice, s.cct);
-                        // Ignore send errors: a downed actor has no receiver; it
-                        // reads the latest value when it reconnects.
-                        let _ = s.tx.send(state);
+        merge::serve_all(
+            bound,
+            merger,
+            // Any ArtDmx on any input (even a stale one) proves a source is
+            // alive, so it feeds the failsafe timer before the sequence check.
+            move |_idx, _label, _src, _pkt| {
+                last_for_listener.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
+            },
+            move |port_address, data, _changed| {
+                // Dispatch even when the merge is unchanged: the failsafe task
+                // mutates sink state out-of-band (blackout/poweroff), and an
+                // unconditional re-dispatch of the resumed — possibly
+                // identical — stream is what overwrites it back to normal.
+                // The per-light actor already skips unchanged BLE writes.
+                if let Some(sinks) = universe_map.get(&port_address) {
+                    for s in sinks {
+                        if let Some(slice) = extract_slice(data, s.address, s.profile.channel_count())
+                        {
+                            let state = map_dmx(s.profile, slice, s.cct);
+                            // Ignore send errors: a downed actor has no receiver;
+                            // it reads the latest value when it reconnects.
+                            let _ = s.tx.send(state);
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .await
     });
 
+    let inputs_desc = inputs_cfg
+        .iter()
+        .map(|i| format!("{}={}:{}", i.label, i.bind_ip, i.port))
+        .collect::<Vec<_>>()
+        .join(", ");
     info!(
         lights = cfg.lights.len(),
-        bind = %cfg.artnet.bind_ip,
-        port = cfg.artnet.port,
+        inputs = %inputs_desc,
+        merge = %if inputs_cfg.len() > 1 {
+            cfg.artnet.merge.as_str()
+        } else {
+            "n/a (single input)"
+        },
         failsafe = %cfg.failsafe.mode,
         "bridge running — press Ctrl-C to stop"
     );

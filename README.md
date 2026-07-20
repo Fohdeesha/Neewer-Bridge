@@ -7,6 +7,10 @@ protocol. CLI, config-file driven, runs on **Windows and Linux**.
 - Drives **multiple lights at once**, each bound to a fixed set of DMX channels.
 - **Deterministic binding by MAC** — the DMX-channel → physical-light mapping is
   identical on every boot, independent of power-on or discovery order.
+- **Multiple DMX sources with per-channel merge** — listen on extra UDP ports
+  and/or different bind IPs and merge the streams `htp` (highest), `lowest`, or
+  `ltp` (latest **changed** wins, so a re-streaming source never steals an
+  override) — see [Multiple DMX sources](#multiple-dmx-sources--merging).
 - Supports classic (`0x78`), Infinity (`0x78`+MAC), and Neewer Home (`0x7A`,
   `NH-*`) lights.
 - Full built-in control: **CCT (+GM), HSI, CIE XY, and the 18-effect FX engine**
@@ -30,6 +34,7 @@ Releases follow [semantic versioning](https://semver.org/) — see
 - [Quick start](#quick-start)
 - [Commands](#commands) — every subcommand and flag
 - [Configuration](#configuration)
+- [Multiple DMX sources & merging](#multiple-dmx-sources--merging)
 - [DMX profiles](#dmx-profiles-channel-layouts)
 - [FX effects](#fx-effects)
 - [Drivers](#drivers)
@@ -103,7 +108,7 @@ No command ⇒ `run` (launching the bare binary starts the bridge).
 | `test <MAC>` | Connect one light and prove control (blink + CCT, optional colour/mode probes). |
 | `ota <MAC>` | Flash a firmware `.bin` to a light over the custom `0x78` OTA block protocol (`--check` to dry-run, `--confirm` to write). |
 | `artnet-send` | Send ArtDmx to drive the bridge / a node without a console. |
-| `monitor` | Listen for ArtNet and print received ArtDmx (no BLE needed). |
+| `monitor` | Listen for ArtNet on every configured input and print received ArtDmx (no BLE needed). With multiple inputs it also prints the merged output whenever it changes — the way to watch/debug a DMX merge live. |
 | `run` | The full bridge: ArtNet → mapper → per-light BLE actors. **The default** — running `neewer-bridge` with no command does this. |
 
 ### Global flags
@@ -232,6 +237,17 @@ and why.
 [artnet]
 bind_ip = "0.0.0.0"   # interface to receive ArtNet on (0.0.0.0 = all)
 port    = 6454        # standard ArtNet port (configurable)
+merge   = "ltp"       # how multiple inputs combine per channel: htp | lowest | ltp
+                      # (irrelevant with a single input — see "Multiple DMX sources")
+merge_timeout_secs = 10  # drop a source from the merge after N s of silence
+                         # (its channels fall back to the others); 0 = never
+
+# Optional extra listeners — each block adds another ArtNet input (its own
+# UDP port and/or bind IP). The bind_ip/port above is always input 0.
+# [[artnet.inputs]]
+# name    = "console"   # optional label used in logs
+# bind_ip = "0.0.0.0"
+# port    = 6455
 
 [ble]
 adapter     = "default" # "default", an index ("0"), or a name substring
@@ -275,8 +291,55 @@ cmd_type = 2                    # advanced-mode frame family (the app's per-mode
 
 Add as many `[[lights]]` blocks as you have fixtures. The config is validated on
 load: MAC format, known driver/profile/failsafe values, universe ≤ 32767, address
-1–512, the whole profile fitting within 512 channels, ordered CCT range, and no
-duplicate MACs. Run `neewer-bridge lights` to see the resulting channel map.
+1–512, the whole profile fitting within 512 channels, ordered CCT range, no
+duplicate MACs, a known merge mode, and no two inputs on the same bind_ip+port.
+Run `neewer-bridge lights` to see the resulting channel map.
+
+## Multiple DMX sources & merging
+
+The bridge can accept ArtNet from **several senders at once** — say, openHAB
+driving the everyday state on the standard port while a lighting console (or
+`artnet-send`) overrides on a second port. Each `[[artnet.inputs]]` block adds
+another UDP listener, on its own port and/or a different bind IP (up to 8
+listeners total; binding the *same* port on two different **specific** local
+IPs is fine and is exactly the multi-IP use case — but the wildcard `0.0.0.0`
+claims a port on every interface, so it can't share a port with another input;
+validation rejects that combination). The main `bind_ip`/`port` is always
+input 0, labelled `primary` in logs.
+
+The inputs are combined **per DMX channel, per universe**, controlled by
+`[artnet] merge`:
+
+| Mode | Per-channel rule |
+|---|---|
+| `htp` | Highest takes precedence — the max across sources (the classic dimmer merge). |
+| `lowest` | The min across sources. |
+| `ltp` (default) | Latest takes precedence — the source that most recently **changed** the channel owns it. |
+
+`ltp` is deliberately *last-changed*, not last-received: a source re-streaming
+the same values at full refresh rate never steals a channel back from a source
+that actually changed it. That's what makes the openHAB + console combination
+work — the console grabs whatever it touches, and openHAB's steady refresh
+doesn't undo it.
+
+A source that goes silent for `merge_timeout_secs` (default 10, `0` = never) is
+dropped from the merge: in `htp`/`lowest` its contribution disappears, and in
+`ltp` the channels it owned fall back to the most recently active remaining
+source — so when the console disconnects, its overrides expire and openHAB's
+state resumes on its own. A channel with **no** live source holds its last
+value (total signal loss stays the `[failsafe]` section's job).
+
+Notes:
+- With a single input (the default config) none of this is active and there is
+  no behaviour change — merge settings only matter across inputs.
+- Merging happens **between configured inputs**. Two senders hitting the *same*
+  input still overwrite each other last-write-wins, as before — give each
+  source its own input if you want them merged.
+- ArtDmx sequence numbers are tracked per input, so the same console feeding
+  two inputs can't trip the stale-packet filter.
+- `neewer-bridge monitor` runs this exact pipeline and logs every packet with
+  its input label **plus** the merged output whenever it changes — the fastest
+  way to sanity-check a merge setup before pointing it at lights.
 
 ## DMX profiles (channel layouts)
 
@@ -454,13 +517,14 @@ drops). The failsafe controls behaviour when ArtNet stops: `hold` keeps the last
 state, `blackout` sets brightness 0, `poweroff` powers the light off — after
 `timeout_secs` of silence.
 
-The ArtNet socket is bound **before** anything else starts, and a bind failure
-(port already in use, bad `bind_ip`) — or the listener dying later — is a fatal
-error with a non-zero exit, so a supervisor (systemd, screen + a wrapper) can see
-and restart a bridge that isn't actually receiving. Out-of-order/duplicate ArtDmx
-datagrams are dropped using the Art-Net Sequence field (tracked per source +
-port-address; senders that disable sequencing, seq = 0, are unaffected, and an
-idle source resyncs after 2 s so a restarted console is never locked out).
+Every ArtNet input socket is bound **before** anything else starts, and a bind
+failure (port already in use, bad `bind_ip`) — or any listener dying later — is a
+fatal error with a non-zero exit, so a supervisor (systemd, screen + a wrapper)
+can see and restart a bridge that isn't actually receiving. Out-of-order/duplicate
+ArtDmx datagrams are dropped using the Art-Net Sequence field (tracked per input,
+per source + port-address; senders that disable sequencing, seq = 0, are
+unaffected, and an idle source resyncs after 2 s so a restarted console is never
+locked out).
 
 **Connection health & reconnect.** These are two-chip fixtures (a BLE radio module in
 front of the LED MCU that runs the command parser), and they give no write ACK

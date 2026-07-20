@@ -32,6 +32,62 @@ pub struct ArtNet {
     /// configurable so the bridge isn't locked to it.
     #[serde(default = "default_artnet_port")]
     pub port: u16,
+    /// How DMX from multiple inputs is combined per channel: `htp` (highest),
+    /// `lowest`, or `ltp` (latest — the source that most recently **changed**
+    /// a channel owns it; re-streaming unchanged data doesn't steal it back).
+    /// Irrelevant with a single input.
+    #[serde(default = "default_merge_mode")]
+    pub merge: String,
+    /// Seconds an input may go silent before it's dropped from the merge (its
+    /// channels fall back to the remaining sources). `0` = never drop.
+    #[serde(default = "default_merge_timeout_secs")]
+    pub merge_timeout_secs: u64,
+    /// Additional ArtNet listeners (`[[artnet.inputs]]`), each on its own
+    /// bind IP and/or port. The `bind_ip`/`port` above is always input 0.
+    #[serde(default)]
+    pub inputs: Vec<ArtNetInput>,
+}
+
+/// One extra ArtNet listener (see `ArtNet::inputs`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ArtNetInput {
+    /// Optional label used in logs (defaults to `input1`, `input2`, …).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Local IP to bind this input to. `0.0.0.0` = all interfaces.
+    #[serde(default = "default_bind_ip")]
+    pub bind_ip: String,
+    /// UDP port for this input.
+    #[serde(default = "default_artnet_port")]
+    pub port: u16,
+}
+
+/// A fully resolved input: what to bind + how to label it in logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedInput {
+    pub bind_ip: String,
+    pub port: u16,
+    pub label: String,
+}
+
+impl ArtNet {
+    /// All listeners in input order: the primary `bind_ip`/`port` first (input
+    /// 0, labelled `primary`), then each `[[artnet.inputs]]` entry.
+    pub fn resolved_inputs(&self) -> Vec<ResolvedInput> {
+        let mut out = vec![ResolvedInput {
+            bind_ip: self.bind_ip.clone(),
+            port: self.port,
+            label: "primary".into(),
+        }];
+        for (i, inp) in self.inputs.iter().enumerate() {
+            let label = match inp.name.as_deref().filter(|n| !n.is_empty()) {
+                Some(n) => n.to_string(),
+                None => format!("input{}", i + 1),
+            };
+            out.push(ResolvedInput { bind_ip: inp.bind_ip.clone(), port: inp.port, label });
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -140,7 +196,13 @@ pub struct LightCfg {
 
 impl Default for ArtNet {
     fn default() -> Self {
-        Self { bind_ip: default_bind_ip(), port: default_artnet_port() }
+        Self {
+            bind_ip: default_bind_ip(),
+            port: default_artnet_port(),
+            merge: default_merge_mode(),
+            merge_timeout_secs: default_merge_timeout_secs(),
+            inputs: Vec::new(),
+        }
     }
 }
 impl Default for Ble {
@@ -179,6 +241,18 @@ fn default_bind_ip() -> String {
 fn default_artnet_port() -> u16 {
     crate::artnet::ARTNET_PORT
 }
+/// LTP (latest-changed takes precedence) is the least surprising default for
+/// colour fixtures: whichever source last *changed* a channel wins, instead of
+/// HTP's per-channel max mixing two sources' colours together.
+fn default_merge_mode() -> String {
+    "ltp".into()
+}
+/// Matches the conventional ArtNet merge data-loss window.
+fn default_merge_timeout_secs() -> u64 {
+    10
+}
+/// Sanity cap on extra `[[artnet.inputs]]` (8 listeners total).
+pub const MAX_EXTRA_INPUTS: usize = 7;
 fn default_adapter() -> String {
     "default".into()
 }
@@ -270,6 +344,60 @@ impl Config {
                 "failsafe.mode {:?} unknown; expected one of {KNOWN_FAILSAFE_MODES:?}",
                 self.failsafe.mode
             );
+        }
+        // [artnet]: merge mode + the input list. Bind IPs aren't parsed here —
+        // a bad one fails the bind, which is already a fatal startup error.
+        if crate::merge::MergeMode::parse(&self.artnet.merge).is_none() {
+            bail!(
+                "artnet.merge {:?} unknown; expected one of {:?}",
+                self.artnet.merge,
+                crate::merge::KNOWN_MERGE_MODES
+            );
+        }
+        if self.artnet.inputs.len() > MAX_EXTRA_INPUTS {
+            bail!(
+                "artnet.inputs has {} entries; at most {MAX_EXTRA_INPUTS} extra inputs \
+                 ({} listeners total) are supported",
+                self.artnet.inputs.len(),
+                MAX_EXTRA_INPUTS + 1
+            );
+        }
+        let inputs = self.artnet.resolved_inputs();
+        for inp in &inputs {
+            if inp.port == 0 {
+                bail!("artnet input {:?}: port must be 1..=65535", inp.label);
+            }
+        }
+        // Two inputs on the identical (bind_ip, port) would be one stream split
+        // arbitrarily between two lanes — always a config mistake. The same
+        // port on two *specific* IPs is fine (the multi-IP use case), but a
+        // wildcard bind claims the port on every interface, so mixing it with
+        // any other input on that port would fail at bind time (EADDRINUSE on
+        // Linux) — reject it here with a clearer message.
+        let is_wildcard = |ip: &str| matches!(ip.trim(), "0.0.0.0" | "::" | "[::]");
+        for i in 0..inputs.len() {
+            for j in (i + 1)..inputs.len() {
+                if inputs[i].port != inputs[j].port {
+                    continue;
+                }
+                if inputs[i].bind_ip == inputs[j].bind_ip {
+                    bail!(
+                        "artnet inputs {:?} and {:?} both bind {}:{} — each input needs its own \
+                         bind_ip/port combination",
+                        inputs[i].label, inputs[j].label, inputs[i].bind_ip, inputs[i].port
+                    );
+                }
+                if is_wildcard(&inputs[i].bind_ip) || is_wildcard(&inputs[j].bind_ip) {
+                    bail!(
+                        "artnet inputs {:?} ({}) and {:?} ({}) share port {} but one binds the \
+                         wildcard address, which claims the port on every interface — use \
+                         specific IPs on both, or different ports",
+                        inputs[i].label, inputs[i].bind_ip,
+                        inputs[j].label, inputs[j].bind_ip,
+                        inputs[i].port
+                    );
+                }
+            }
         }
         // [ble] rate/interval fields must be non-zero: flush_hz 0 has no
         // meaning, probe_secs 0 would spin the probe loop, and a
@@ -559,6 +687,76 @@ mod tests {
         assert_eq!(loaded.lights[0].name.as_deref(), Some("Key \"main\" \\ rig"));
         assert_eq!(loaded.lights[1].name, None);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn artnet_inputs_parse_and_resolve() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [artnet]
+            bind_ip = "192.168.1.4"
+            port = 6454
+            merge = "htp"
+            merge_timeout_secs = 5
+
+            [[artnet.inputs]]
+            name = "console"
+            port = 6455
+
+            [[artnet.inputs]]
+            bind_ip = "192.168.1.5"
+            "#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let inputs = cfg.artnet.resolved_inputs();
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs[0], ResolvedInput { bind_ip: "192.168.1.4".into(), port: 6454, label: "primary".into() });
+        assert_eq!(inputs[1], ResolvedInput { bind_ip: "0.0.0.0".into(), port: 6455, label: "console".into() });
+        // Unnamed entry gets a positional label; port defaults to 6454 —
+        // legal because both 6454 binds are on specific (different) IPs.
+        assert_eq!(inputs[2], ResolvedInput { bind_ip: "192.168.1.5".into(), port: 6454, label: "input2".into() });
+        assert_eq!(cfg.artnet.merge, "htp");
+        assert_eq!(cfg.artnet.merge_timeout_secs, 5);
+    }
+
+    #[test]
+    fn artnet_defaults_are_single_input_ltp() {
+        let cfg = Config::default();
+        assert_eq!(cfg.artnet.merge, "ltp");
+        assert_eq!(cfg.artnet.merge_timeout_secs, 10);
+        assert_eq!(cfg.artnet.resolved_inputs().len(), 1);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_bad_merge_config() {
+        let mut c = Config::default();
+        c.artnet.merge = "average".into();
+        assert!(c.validate().is_err()); // unknown merge mode
+
+        c.artnet.merge = "ltp".into();
+        c.artnet.inputs.push(ArtNetInput { name: None, bind_ip: "0.0.0.0".into(), port: 6454 });
+        assert!(c.validate().is_err()); // duplicates the primary bind
+
+        c.artnet.inputs[0].port = 6455;
+        assert!(c.validate().is_ok());
+
+        c.artnet.inputs.push(ArtNetInput { name: None, bind_ip: "0.0.0.0".into(), port: 6455 });
+        assert!(c.validate().is_err()); // duplicate among extras
+        c.artnet.inputs[1].bind_ip = "10.0.0.1".into();
+        assert!(c.validate().is_err()); // wildcard + specific IP on one port
+        c.artnet.inputs[0].bind_ip = "10.0.0.2".into(); // two specific IPs = fine
+        assert!(c.validate().is_ok());
+
+        c.artnet.inputs[1].port = 0;
+        assert!(c.validate().is_err()); // port 0
+
+        c.artnet.inputs[1].port = 6455;
+        for p in 0..7u16 {
+            c.artnet.inputs.push(ArtNetInput { name: None, bind_ip: "0.0.0.0".into(), port: 7000 + p });
+        }
+        assert!(c.validate().is_err()); // more than 7 extra inputs
     }
 
     #[test]

@@ -365,7 +365,7 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
         }
         Command::Monitor => {
             let cfg = load()?;
-            commands::monitor(&cfg.artnet.bind_ip, cfg.artnet.port).await
+            commands::monitor(&cfg.artnet).await
         }
         // `run` requires a valid config (it defines the light bindings).
         Command::Run => {

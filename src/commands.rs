@@ -531,27 +531,57 @@ pub async fn artnet_send(
     Ok(())
 }
 
-/// `monitor` — bind the ArtNet listener and print a summary of every ArtDmx
-/// packet received. Hardware-free; point a console / QLC+ at this host to verify
-/// ArtNet reception, universe addressing, and channel data without any lights.
-pub async fn monitor(bind_ip: &str, port: u16) -> Result<()> {
-    info!(bind_ip, port, "ArtNet monitor — press Ctrl-C to stop");
-    artnet::listen(bind_ip, port, |src, pkt| {
-        let (net, sub_net, universe) = artnet::split_port_address(pkt.port_address);
-        let preview: Vec<String> = pkt.data.iter().take(12).map(|b| format!("{b:3}")).collect();
+/// `monitor` — bind every configured ArtNet input and print a summary of each
+/// ArtDmx packet received. Hardware-free; point a console / QLC+ at this host
+/// to verify ArtNet reception, universe addressing, and channel data without
+/// any lights. Runs the exact merge pipeline `run` uses (merge::bind_inputs +
+/// serve_all), so with multiple inputs it also logs the merged per-universe
+/// output whenever it changes — the way to observe/debug the DMX merge live.
+pub async fn monitor(artnet_cfg: &config::ArtNet) -> Result<()> {
+    let (bound, merger) = crate::merge::bind_inputs(artnet_cfg).await?;
+    let multi = bound.len() > 1;
+    if multi {
         info!(
-            %src,
-            port = pkt.port_address,
-            net,
-            sub_net,
-            universe,
-            seq = pkt.sequence,
-            channels = pkt.data.len(),
-            "ArtDmx ch1.. = [{}{}]",
-            preview.join(" "),
-            if pkt.data.len() > 12 { " …" } else { "" },
+            inputs = bound.len(),
+            merge = %artnet_cfg.merge,
+            merge_timeout_secs = artnet_cfg.merge_timeout_secs,
+            "ArtNet monitor (merging) — press Ctrl-C to stop"
         );
-    })
+    } else {
+        info!("ArtNet monitor — press Ctrl-C to stop");
+    }
+    crate::merge::serve_all(
+        bound,
+        merger,
+        |_idx, label, src, pkt| {
+            let (net, sub_net, universe) = artnet::split_port_address(pkt.port_address);
+            info!(
+                input = %label,
+                %src,
+                port = pkt.port_address,
+                net,
+                sub_net,
+                universe,
+                seq = pkt.sequence,
+                channels = pkt.data.len(),
+                "ArtDmx ch1.. = {}",
+                artnet::preview(&pkt.data, 12),
+            );
+        },
+        // Merged output only when it actually changed (steady re-sends would
+        // double every packet line) and only with >1 input (with one input the
+        // merged view IS the packet just logged above).
+        move |port_address, data, changed| {
+            if multi && changed {
+                info!(
+                    port = port_address,
+                    channels = data.len(),
+                    "merged ch1.. = {}",
+                    artnet::preview(data, 12),
+                );
+            }
+        },
+    )
     .await
 }
 

@@ -121,16 +121,6 @@ where
     }
 }
 
-/// Bind + serve in one call (used by `monitor`; the bridge binds separately so
-/// bind failures are fatal at startup).
-pub async fn listen<F>(bind_ip: &str, port: u16, on_packet: F) -> Result<()>
-where
-    F: FnMut(SocketAddr, ArtDmx),
-{
-    let sock = bind(bind_ip, port).await?;
-    serve(sock, on_packet).await
-}
-
 /// How long a (source, port-address) key may go quiet before its sequence
 /// tracking is reset. A restarted sender (whose sequence numbering starts over)
 /// must never be locked out by the stale-window check below.
@@ -205,11 +195,17 @@ impl Default for SeqTracker {
     }
 }
 
-/// Log a one-line summary of an ArtDmx packet (used by the `monitor` command and
-/// useful generally for debugging).
+/// Format the first `n` channels of a DMX buffer for log lines, e.g.
+/// `[100  50 …]`. Shared by `monitor`'s packet/merged log lines and
+/// [`log_packet`].
+pub fn preview(data: &[u8], n: usize) -> String {
+    let cells: Vec<String> = data.iter().take(n).map(|b| format!("{b:3}")).collect();
+    format!("[{}{}]", cells.join(" "), if data.len() > n { " …" } else { "" })
+}
+
+/// Log a one-line summary of an ArtDmx packet (debugging helper).
 pub fn log_packet(src: SocketAddr, pkt: &ArtDmx) {
     let (net, sub_net, universe) = split_port_address(pkt.port_address);
-    let preview: Vec<String> = pkt.data.iter().take(8).map(|b| format!("{b:3}")).collect();
     debug!(
         %src,
         port = pkt.port_address,
@@ -218,9 +214,8 @@ pub fn log_packet(src: SocketAddr, pkt: &ArtDmx) {
         universe,
         seq = pkt.sequence,
         len = pkt.data.len(),
-        "ArtDmx [{}{}]",
-        preview.join(" "),
-        if pkt.data.len() > 8 { " …" } else { "" },
+        "ArtDmx {}",
+        preview(&pkt.data, 8),
     );
 }
 

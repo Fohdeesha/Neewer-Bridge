@@ -12,6 +12,24 @@
 bind_ip = "0.0.0.0"
 # UDP port to listen on. 6454 is the ArtNet standard; change only if needed.
 port = 6454
+# --- Multiple DMX sources (optional) ---------------------------------------
+# The bridge can listen on EXTRA ports and/or different bind IPs and merge the
+# streams per channel (see README "Multiple DMX sources & merging"). With a
+# single input these settings are inactive and nothing changes.
+#   merge: htp = highest value wins | lowest = lowest wins | ltp = the source
+#   that most recently CHANGED a channel owns it (re-streaming the same data
+#   never steals an override back — last changed, not last received).
+merge = "ltp"
+# Drop a source from the merge after this many seconds of silence — its
+# channels fall back to the remaining sources (a disconnected console's
+# overrides expire on their own). 0 = never drop.
+merge_timeout_secs = 10
+# Each [[artnet.inputs]] block adds another listener (the bind_ip/port above is
+# always input 0, labelled "primary" in logs). Up to 8 listeners total.
+# [[artnet.inputs]]
+# name    = "console"   # optional label used in logs
+# bind_ip = "0.0.0.0"
+# port    = 6455
 
 [ble]
 # Which Bluetooth adapter to use. "default" = first adapter. You can also give an

@@ -13,6 +13,40 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.1.0] — 2026-07-20
+
+### Added
+
+- **Multiple ArtNet inputs with per-channel DMX merge.** The bridge can now
+  listen for ArtNet on several sockets at once — extra UDP ports and/or
+  different bind IPs — and merge the streams per channel before driving the
+  lights, like a hardware DMX merger. Each `[[artnet.inputs]]` config block
+  adds a listener (up to 8 total, each with optional `name`, `bind_ip`,
+  `port`); the existing `[artnet] bind_ip`/`port` is always input 0.
+- **Merge modes** (`[artnet] merge`): `htp` (highest takes precedence),
+  `lowest`, and `ltp` (default) — latest takes precedence per channel, where
+  "latest" means the source that most recently **changed** the value, not the
+  one that last re-sent it: a source streaming unchanged refreshes never
+  steals a channel back from a live override.
+- **Source expiry** (`[artnet] merge_timeout_secs`, default 10, `0` = never):
+  a source silent past the timeout is dropped from the merge — its HTP/lowest
+  contribution disappears, and LTP channels it owned fall back to the most
+  recently active remaining source. A channel with no live source holds its
+  last value (total loss remains the `[failsafe]`'s job).
+- `monitor` now listens on **every** configured input, tags each logged packet
+  with its input label, and (with multiple inputs) logs the merged output
+  whenever it changes — a live view of the exact merge pipeline `run` uses.
+
+### Changed
+
+- ArtDmx sequence tracking is now per input (so one console feeding two inputs
+  keeps independent sequence streams). Single-input configs behave exactly as
+  before; the merge settings are inactive until a second input is added.
+- Config validation now rejects `[artnet] port = 0` (it would bind an
+  arbitrary ephemeral port — never useful for a listener) and a wildcard
+  (`0.0.0.0`) input sharing a port with another input (the OS would refuse
+  the second bind at startup anyway; two *specific* IPs may share a port).
+
 ## [1.0.0] — 2026-07-18
 
 First versioned release. Everything below is the state of the project as of
@@ -53,4 +87,5 @@ TL21C, TL97C) deployed on Linux/BlueZ.
 - `--version` prints the release; the version is also the first startup
   log line.
 
+[1.1.0]: https://github.com/Fohdeesha/Neewer-Bridge/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Fohdeesha/Neewer-Bridge/releases/tag/v1.0.0
