@@ -1,606 +1,208 @@
 # Neewer-Bridge
 
-An efficient, reliable **ArtNet → Neewer Bluetooth** light bridge. It receives
-ArtNet (DMX-over-UDP) and controls Neewer LED lights over their proprietary BLE
-protocol. CLI, config-file driven, runs on **Windows and Linux**.
+Control Neewer LED lights from anything that speaks ArtNet (QLC+, a lighting
+console, openHAB...). The bridge receives DMX over the network and drives the
+lights over Bluetooth. Windows and Linux, command line, one config file.
+Tested against real TL120C, TL21C, TL60 RGB, and TL97C fixtures.
 
-- Drives **multiple lights at once**, each bound to a fixed set of DMX channels.
-- **Deterministic binding by MAC** — the DMX-channel → physical-light mapping is
-  identical on every boot, independent of power-on or discovery order.
-- **Multiple DMX sources with per-channel merge** — listen on extra UDP ports
-  and/or different bind IPs and merge the streams `htp` (highest), `lowest`, or
-  `ltp` (latest **changed** wins, so a re-streaming source never steals an
-  override) — see [Multiple DMX sources](#multiple-dmx-sources--merging).
-- Supports classic (`0x78`), Infinity (`0x78`+MAC), and Neewer Home (`0x7A`,
-  `NH-*`) lights.
-- Full built-in control: **CCT (+GM), HSI, CIE XY, and the 18-effect FX engine**
-  — selectable live from a single DMX mode channel.
-- **141-model capability catalog** so `add` auto-fills a light's driver, profile,
-  and CCT range from its Bluetooth name.
+## Getting started
 
-> Status: hardware-validated end-to-end on a five-light fleet — Neewer TL120C
-> (×2), TL21C, TL60 RGB, and TL97C. CCT, HSI, XY, RGBCW, GM, FX, and per-segment
-> pixel are all confirmed over a direct BLE connection (each model supports a
-> different subset — see the hardware notes under
-> [DMX profiles](#dmx-profiles-channel-layouts)).
+1. Download the zip for your OS from the
+   [releases page](https://github.com/Fohdeesha/Neewer-Bridge/releases) and
+   unzip it anywhere. You need a Bluetooth LE adapter; a cheap USB dongle is
+   fine. (Or [build from source](#building-from-source).)
 
-Releases follow [semantic versioning](https://semver.org/) — see
-[CHANGELOG.md](CHANGELOG.md). The binary reports its version via
-`neewer-bridge --version` and as the first log line on every startup.
+2. Add your lights. Power them on and make sure the Neewer phone app isn't
+   connected to them (a light stops advertising while the app holds it), then:
 
-## Contents
+   ```
+   neewer-bridge add
+   ```
 
-- [Install](#install)
-- [Quick start](#quick-start)
-- [Commands](#commands) — every subcommand and flag
-- [Configuration](#configuration)
-- [Multiple DMX sources & merging](#multiple-dmx-sources--merging)
-- [DMX profiles](#dmx-profiles-channel-layouts)
-- [FX effects](#fx-effects)
-- [Drivers](#drivers)
-- [Reliability](#reliability)
-- [Troubleshooting](#troubleshooting)
-- [Changelog](CHANGELOG.md)
+   This scans, blinks the light it found so you know which one it is, asks for
+   an ArtNet universe and DMX address, and writes the entry to `config.toml`.
+   Run it once per light. The model is recognized from the Bluetooth name
+   (141 models known), so the driver, channel profile, and CCT range are filled
+   in for you. `neewer-bridge lights` shows the channel map you ended up with.
 
-## Install
+3. Start the bridge:
 
-**Prebuilt binaries:** every release ships ready-to-run zips for **Windows x64**
-and **Linux x64** on the
-[Releases page](https://github.com/Fohdeesha/Neewer-Bridge/releases) — unzip
-anywhere, edit the bundled `config.toml` (it sits beside the binary, exactly
-where the bridge looks first), and run. A Bluetooth LE adapter is needed to talk
-to lights (a USB BLE dongle works).
+   ```
+   neewer-bridge
+   ```
 
-**Building from source** requires the [Rust toolchain](https://rustup.rs)
-(stable). On Windows the MSVC toolchain is used (Visual Studio Build Tools /
-Community); on Linux install `libdbus-1-dev` and `pkg-config` (BlueZ D-Bus).
+4. Point your ArtNet source at this machine's IP (standard port 6454) on the
+   universe and address you picked.
+
+Lights are bound by MAC address, so the DMX mapping survives reboots and
+doesn't depend on what order things power on in. A light that drops, loses
+power, or goes out of range reconnects on its own.
+
+## Commands
+
+Run `neewer-bridge <command> --help` for the flags on each.
+
+| Command | What it does |
+|---|---|
+| `run` | The bridge itself. This is the default, so plain `neewer-bridge` works. |
+| `scan` | List nearby lights (name, MAC, signal). |
+| `add` | Add a light to the config. Interactive, or scriptable with `--mac`. |
+| `lights` | Show configured lights and their DMX channel mapping. |
+| `test <MAC>` | Connect one light and prove control: blink, set white, plus optional colour/mode/status probes. |
+| `monitor` | Print incoming ArtNet without touching any lights. |
+| `artnet-send` | Send test DMX values without needing a console. |
+| `models` | List the built-in model catalog. |
+| `adapters` | List Bluetooth adapters. |
+| `inspect <MAC>` | Dump a device's GATT services (for unknown lights). |
+| `ota <MAC>` | Flash Neewer firmware to a light. `--check` dry-runs, `--confirm` writes. Stop the bridge first. |
+
+`-v` turns on debug logging (shows every BLE write as hex), `-vv` adds the
+Bluetooth wire logs. `--config PATH` points at a different config file; by
+default the bridge uses `config.toml` next to the binary if there is one,
+otherwise the one in the current directory.
+
+## Configuration
+
+`add` writes light entries for you, and the shipped `config.toml` documents
+every field, so you rarely need to touch this by hand. The short version:
+
+```toml
+[artnet]
+bind_ip = "0.0.0.0"
+port    = 6454
+
+[ble]
+adapter  = "default"    # or an index ("0") or a name substring
+flush_hz = 15           # max BLE updates per light per second
+
+[failsafe]              # what to do when ArtNet stops arriving
+mode         = "hold"   # hold | blackout | poweroff
+timeout_secs = 0        # 0 = hold the last state forever
+
+[logging]
+level   = "info"
+console = true
+# file  = "neewer-bridge.log"   # optional rotating log file
+
+[[lights]]
+mac      = "AA:BB:CC:DD:EE:FF"
+name     = "Key light"
+profile  = "rgb"        # channel layout, see below
+universe = 0
+address  = 1            # 1-based DMX start channel
+```
+
+A broken config is a hard error; the bridge never silently falls back to
+defaults. The startup log prints the absolute path of the config it loaded.
+
+## DMX profiles
+
+The profile sets a light's channel layout. `add` picks a sensible one for the
+model; change it in the config if you want something else.
+
+| Profile | Ch | Layout |
+|---|---|---|
+| `cct`      | 2  | Dimmer, CCT |
+| `cct_gm`   | 3  | Dimmer, CCT, green/magenta |
+| `hsi`      | 3  | Dimmer, Hue, Saturation |
+| `rgb`      | 3  | Red, Green, Blue |
+| `rgbcw`    | 5  | Red, Green, Blue, Cool White, Warm White |
+| `full`     | 5  | Dimmer, Mode (CCT/HSI), CCT/Hue, GM/Sat |
+| `advanced` | 10 | Mode-select, Dimmer, then 8 mode-specific channels |
+| `pixel`    | 20 | Dimmer, Effect, Speed, Direction, then 8 pairs of Hue+Sat |
+
+`rgb` is the easiest way to get colour: three plain R/G/B channels, converted
+to the light's HSI mode internally, so it works on every colour model. In
+openHAB that's a single 3-channel DMX `color` thing per light, no rules needed.
+
+`rgbcw` passes all five channels straight through to the light's native RGBCW
+mode, one channel per LED bank (needs a model that has one, like the TL120C).
+It lines up with openHAB's `color` (3ch) + `tunablewhite` (2ch) things patched
+back to back.
+
+`advanced` exposes every built-in mode through one mode-select channel (ch1),
+with ch2 as dimmer and ch3 onward reinterpreted per mode:
+
+| ch1 | Mode | Channels |
+|---|---|---|
+| 0–31 | CCT | ch3 CCT, ch4 GM |
+| 32–63 | HSI | ch3 Hue, ch4 Sat |
+| 64–95 | FX | ch3 effect 1–18, ch4 speed, ch5–9 effect params |
+| 128–159 | RGBCW | ch3–7 R, G, B, CW, WW |
+| 192–231 | XY | ch3 X, ch4 Y |
+
+The 18 FX effects: Lightning, Paparazzi, Defective bulb, Explosion, Welding,
+CCT-flash, HUE-flash, CCT-pulse, HUE-pulse, Cop-Car, Candlelight, HUE-loop,
+CCT-loop, INT-loop, TV-screen, Fireworks, Party, Music.
+
+`pixel` (TL-series tubes) splits the tube into 8 segments and drives one of 5
+animated effects across them, selected on ch2: ColorReplacement (0–51),
+SingleColorMoving (52–102), TwoColorMoving (103–153), ThreeColorMoving
+(154–204), Fire (205–255). For the moving/fire effects, segment 1 is the
+background colour. The effects always animate; there is no truly static
+per-segment mode over BLE.
+
+Not every model supports every mode (XY, RGBCW, and pixel in particular vary).
+The catalog knows what each model can do (`neewer-bridge models`); a mode the
+light doesn't have is simply ignored.
+
+## Multiple DMX sources
+
+The bridge can listen on several ports/IPs at once and merge the streams per
+channel, like a hardware DMX merger. Typical setup: openHAB drives the everyday
+state on the standard port while a console overrides on a second one.
+
+```toml
+[artnet]
+merge = "ltp"            # ltp | htp | lowest
+merge_timeout_secs = 10  # silent source drops out of the merge; 0 = never
+
+[[artnet.inputs]]        # each block adds another listener
+name = "console"
+port = 6455
+```
+
+`htp` takes the highest value per channel, `lowest` the lowest. `ltp` (the
+default) gives each channel to whichever source changed it most recently.
+That's last-*changed*, not last-received, so a source re-streaming the same
+values never steals a channel back from one that actually changed it. When a
+source goes silent its channels fall back to the remaining sources.
+`neewer-bridge monitor` prints each input's packets plus the merged result,
+which is the easiest way to check a merge setup.
+
+## Troubleshooting
+
+- **Everything is white and colour changes only the brightness.** The lights
+  are on the wrong profile, usually because the bridge loaded a different
+  config than you think: it prefers `config.toml` next to the binary over the
+  one in your working directory. Run `neewer-bridge lights` to see which
+  profile each light actually loaded, and check the `loaded config` line in the
+  startup log.
+- **`scan` finds nothing, or only phones.** A Neewer light stops advertising
+  while the phone app is connected to it. Close the app, put the light in
+  Bluetooth mode, retry.
+- **`scan` doesn't show a light you know is on.** Already-configured lights
+  are hidden; use `scan --all` to see everything.
+- **A light stopped responding and is stuck on its last colour.** Almost
+  always a weak Bluetooth link. Move the light or the adapter closer and it
+  reconnects on its own; RSSI is logged per light so you can spot a marginal
+  placement. If it stays dead even right next to the adapter, power-cycle it.
+- **A light is stuck in an FX effect.** Effects latch. Power-cycle it, or run
+  `neewer-bridge test <MAC>`, which resets it to white.
+- **ArtNet isn't arriving.** Check the source targets this host's IP and the
+  right universe. `neewer-bridge monitor` shows what's actually being received.
+
+## Building from source
+
+Needs the [Rust toolchain](https://rustup.rs). On Linux, also
+`libdbus-1-dev` and `pkg-config`. On Windows, the MSVC build tools.
 
 ```sh
 git clone https://github.com/Fohdeesha/Neewer-Bridge.git
 cd Neewer-Bridge
 cargo build --release
-# binary at target/release/neewer-bridge  (neewer-bridge.exe on Windows)
+# binary at target/release/neewer-bridge
 ```
-
-Run it directly from `target/release/`, or via `cargo run --release -- <args>`.
-
-## Quick start
-
-The bridge looks for `config.toml` **next to the binary first**, then in the
-working directory — it ships ready to edit, so there's nothing to copy or
-rename, and you can run the binary from anywhere once the config sits beside it.
-(Use `--config PATH` to point elsewhere.)
-
-```sh
-# 1. Confirm your Bluetooth adapter and see what's nearby
-neewer-bridge scan
-
-# 2. Pair a light interactively — it blinks the fixture so you know which is
-#    which, identifies the model, and appends a [[lights]] entry to config.toml.
-neewer-bridge add
-
-# 3. Review the DMX channel mapping it produced
-neewer-bridge lights
-
-# 4. Run the bridge (`run` is the default — a bare `neewer-bridge` does the same)
-neewer-bridge
-```
-
-Point your lighting console / software (QLC+, etc.) at this host's IP on the
-configured ArtNet universe and DMX address.
-
-## Commands
-
-```
-neewer-bridge [--config PATH] [-v|-vv] [COMMAND]
-```
-
-No command ⇒ `run` (launching the bare binary starts the bridge).
-
-| Command | What it does |
-|---|---|
-| `adapters` | List BLE adapters (index + name) for the `[ble] adapter` setting. |
-| `models` | List the built-in light-model catalog (what `add` matches against). |
-| `lights` | Show configured lights and their absolute universe + DMX-channel mapping. |
-| `scan` | Discover NEW lights (not already in the config); list name / MAC / RSSI. |
-| `add` | Bind a light to the config (interactive, or non-interactive with `--mac`). |
-| `inspect <MAC>` | Connect and dump a device's full GATT (identify unknown lights). |
-| `test <MAC>` | Connect one light and prove control (blink + CCT, optional colour/mode probes). |
-| `ota <MAC>` | Flash a firmware `.bin` to a light over the custom `0x78` OTA block protocol (`--check` to dry-run, `--confirm` to write). |
-| `artnet-send` | Send ArtDmx to drive the bridge / a node without a console. |
-| `monitor` | Listen for ArtNet on every configured input and print received ArtDmx (no BLE needed). With multiple inputs it also prints the merged output whenever it changes — the way to watch/debug a DMX merge live. |
-| `run` | The full bridge: ArtNet → mapper → per-light BLE actors. **The default** — running `neewer-bridge` with no command does this. |
-
-### Global flags
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--config PATH` | see right | Config file path. Default: `config.toml` next to the executable if present, else `config.toml` in the working directory. |
-| `-v` | — | Debug logging for this crate (logs BLE writes as hex). |
-| `-vv` | — | Trace + btleplug BLE wire logs. |
-| `--version` | — | Print the release version (also logged as the first line on every startup; see [CHANGELOG.md](CHANGELOG.md)). |
-| `--help` | — | Help (works on any subcommand too, e.g. `add --help`). |
-
-Logging destinations and default level come from the `[logging]` config section
-(console and/or a size-rotating file — see [Configuration](#configuration)).
-Precedence, highest first: `RUST_LOG` (e.g. `RUST_LOG=neewer_bridge=trace`) >
-`-v`/`-vv` > `[logging] level`. Activity — connects, reconnects, power on/off,
-failsafe — logs at `info`; every BLE command sent to a light logs at `debug`, so
-setting `file_level = "debug"` keeps a full on-disk record while the console stays
-clean at `info`.
-
-`scan`, `add`, `test`, `ota`, `inspect`, `monitor`, `adapters`, and `artnet-send`
-work without a config file (they fall back to defaults); `lights` and `run` require
-a valid config.
-
-### Per-command flags
-
-**`scan`** — discover lights. Lights already bound in the config are hidden (a
-note says how many were skipped), so the list only shows what's new to add.
-| Flag | Default | Meaning |
-|---|---|---|
-| `--seconds N` | `6` | Scan duration. |
-| `--all` | off | List every BLE device — including already-configured lights (marked) and non-Neewer devices. |
-| `--json` | off | Machine-readable JSON array (name / mac / rssi / neewer / configured). |
-
-**`add`** — bind a light. With **no `--mac`** it runs interactively (scan →
-blink-to-identify → prompts). With **`--mac`** it runs non-interactively
-(scriptable). The model is identified from the light's Bluetooth name, so
-driver / profile / CCT range are filled automatically; any flag overrides.
-| Flag | Required? | Meaning |
-|---|---|---|
-| `--mac M` | — | Light MAC. If given, runs non-interactively. |
-| `--universe N` | with `--mac` | ArtNet universe / Port-Address (0–32767). |
-| `--address N` | with `--mac` | 1-based DMX start channel. |
-| `--driver D` | — | `auto`\|`classic`\|`infinity`\|`home` (default: from model). |
-| `--profile P` | — | `cct`\|`cct_gm`\|`hsi`\|`rgb`\|`rgbcw`\|`full`\|`advanced`\|`pixel` (default: from model). |
-| `--name X` | — | Label (default: model name). |
-| `--cct-min N` | — | CCT range min, raw ×100K (default: from model). |
-| `--cct-max N` | — | CCT range max, raw ×100K (default: from model). |
-| `--blink` | — | Blink the light to identify it (non-interactive mode). |
-
-**`inspect <MAC>`** — dump GATT.
-| Flag | Default | Meaning |
-|---|---|---|
-| `--seconds N` | `10` | How long to wait to find the device. |
-
-**`test <MAC>`** — prove BLE control on one light.
-| Flag | Default | Meaning |
-|---|---|---|
-| `--driver D` | `auto` | `classic`\|`infinity`\|`home`\|`auto`. |
-| `--seconds N` | `8` | How long to wait to find the light. |
-| `--colors` | off | After CCT, cycle HSI red→green→blue (RGB capability probe). |
-| `--modes` | off | Probe the advanced modes: XY and a few FX effects (MAC-addressed frames). |
-| `--pixel` | off | Probe per-segment PIXEL control (`0xB0`): cycle the 5 working pixel effects (ColorReplacement / Single/Two/Three-ColorMoving / Fire) so distinct bands/animations appear along the tube. TL-series pixel fixtures only (e.g. TL120C). |
-| `--status` | off | Read device status — firmware version, battery, temperature, power/mode — and print the decoded replies. **Non-mutating** (no blink, no colour change), so it's safe to run against a light in use. |
-| `--set SPEC` | — | Send ONE frame and hold it (guided one-at-a-time testing; the light keeps the state after disconnect). `SPEC` = `cct:<K>:<bri>` (2-byte form), `cctgm:<K>:<gm>:<bri>[:3\|4\|5]` (GM CCT, gm −50..50, optional frame form — default the app's 4-byte), `hsi:<hue>:<sat>:<bri>`, `xy:<x>:<y>:<bri>` (by-MAC `0xB7`), `xydirect:<x>:<y>:<bri>` (direct `0xB9`), `fx:<id>:<bri>` (MAC `0x91`), `fxdirect:<id>:<bri>` (direct `0x8B` — the TL21C's FX path), `scene:<id>:<bri>` (old 9-scene `0x88`), `pixel:<hue,…>:<eff>:<speed>`, `pixfx:<id>` (raw effect probe 1–10), `rgbcwmac:<r>:<g>:<b>[:<cw>:<ww>:<bri>]` (RGBCW via by-MAC `0xA9` — the production form; `rgbcw:…` = the direct `0xA8`, ignored on the TL120C), `warmdim` (safe dim-warm end state), or `raw:<hex>` (send an arbitrary frame verbatim — protocol spelunking, e.g. `raw:78D00048`). |
-
-`test` blinks the light 3× (also a visual identify), sets 5600K @ 50%, then runs
-any requested probes. FX and PIXEL latch the light into their mode — `test`
-power-cycles to exit and restores white.
-
-**`ota <MAC>`** — flash a firmware image over the custom `0x78` OTA block protocol
-(the transport the NEEWER app uses for "OTA"-mode fixtures, e.g. the TL60 RGB-3 —
-rides the normal control service, not Nordic DFU). Get the `.bin` + its version
-from Neewer's OTA server (`support.neewer.com/bluetoothlight/app/v1/home/devices/version?deviceModel=<model>&updateType=OTA&departmentType=1`).
-| Flag | Default | Meaning |
-|---|---|---|
-| `--file PATH` | **required** | The firmware `.bin` to flash. Sanity-checked (size + ARM vector table) before anything is sent. |
-| `--version M.M.P` | from filename | Version being flashed (goes in the header; should match the `.bin`). Omitted ⇒ parsed from the filename's `V<maj>.<min>.<patch>` marker (Neewer's own naming, e.g. `TL60-3_V3.0.5_20250908.bin`); an error if the filename has none. |
-| `--name NAME` | filename stem | Cosmetic model name in the header (the device ignores it). |
-| `--check` | off | Dry-run: connect, run the link-stability check, resolve the block type — **never writes firmware**. Run this first. |
-| `--confirm` | off | Actually flash. Required for the real write. |
-| `--settle-secs N` | `20` | Seconds the link must stay connected in the pre-flash stability check (aborts if it drops). |
-| `--seconds N` | `20` | How long to wait to find the light. |
-| `--chunk-delay-ms N` | `15` | Delay between the 20-byte GATT fragments of each frame. On a marginal link, raise it (20–40) to stop the device's UART reassembler being overrun (silent chunk drops → device resends). |
-
-**Safety:** `--check` never writes firmware; the flash needs `--confirm`; the
-pre-flash link check aborts before any firmware byte if the connection won't hold;
-and the device drives the transfer via ACKs and validates an additive check-code
-before committing — a dropped block fails cleanly (retryable), it doesn't brick,
-and nothing is committed until the final ACK (an interrupted flash leaves the old
-firmware intact). **Stop the main bridge first** — it fights this tool for the
-adapter/MAC — and for a weak-signal fixture, put the BLE adapter right next to the
-light (a USB extension) so the link can sustain the transfer.
-
-**`artnet-send`** — drive the bridge (or any ArtNet node) without a console.
-| Flag | Default | Meaning |
-|---|---|---|
-| `--target IP` | `127.0.0.1` | Destination IP. |
-| `--port P` | `6454` | Destination UDP port. |
-| `--universe N` | `0` | ArtNet universe / Port-Address. |
-| `--address N` | `1` | DMX start channel for the values. |
-| `--channels a,b,c` | **required** | Comma-separated channel values (0–255). |
-| `--hz H` | — | Stream at this rate; omit for a single packet. |
-| `--seconds S` | `2.0` | Stream duration (with `--hz`). |
-
-Example — set a light at universe 0, address 1, advanced profile, to FX Cop-Car
-(ch1=80 selects the FX band, ch2=255 full dimmer, ch3=10 → effect #10):
-```sh
-neewer-bridge artnet-send --universe 0 --address 1 --channels 80,255,10
-```
-
-## Configuration
-
-Edit `config.toml` (shipped ready to go — no copy/rename step). Lights are bound
-by **MAC address** — the stable identity that makes the DMX→light mapping
-deterministic across reboots.
-
-A **missing** config file is fine for the tool commands (`scan`, `test`, `monitor`,
-…) — they fall back to built-in defaults. An **existing but invalid** config
-(syntax error, bad light entry, out-of-range value) is a hard error for *every*
-command — the bridge never silently swaps your settings for defaults. The startup
-log states the absolute path of the config it loaded — or that loading failed,
-and why.
-
-```toml
-[artnet]
-bind_ip = "0.0.0.0"   # interface to receive ArtNet on (0.0.0.0 = all)
-port    = 6454        # standard ArtNet port (configurable)
-merge   = "ltp"       # how multiple inputs combine per channel: htp | lowest | ltp
-                      # (irrelevant with a single input — see "Multiple DMX sources")
-merge_timeout_secs = 10  # drop a source from the merge after N s of silence
-                         # (its channels fall back to the others); 0 = never
-
-# Optional extra listeners — each block adds another ArtNet input (its own
-# UDP port and/or bind IP). The bind_ip/port above is always input 0.
-# [[artnet.inputs]]
-# name    = "console"   # optional label used in logs
-# bind_ip = "0.0.0.0"
-# port    = 6455
-
-[ble]
-adapter     = "default" # "default", an index ("0"), or a name substring
-flush_hz    = 15        # max BLE state updates per light per second (coalescing cap)
-probe_secs  = 20        # GATT-read connection check (3 misses recycle the link) +
-                        # status-telemetry read interval
-scan_window_secs = 8    # discovery scan is on-demand: scan for a MISSING light in
-scan_pause_secs  = 15   # bursts of scan_window_secs, then idle scan_pause_secs — and
-                        # not at all once every light is connected. Keeps a permanent
-                        # scan from starving the links on cheap USB dongles. pause 0 =
-                        # continuous while something's missing (still off when all up)
-
-[failsafe]              # what to do when ArtNet data stops arriving
-mode         = "hold"   # hold | blackout | poweroff
-timeout_secs = 0        # 0 = never act (hold forever); >0 = act after N seconds
-
-[logging]               # verbosity + destinations (console and/or rotating file)
-level         = "info"  # trace | debug | info | warn | error (global default)
-console       = true    # log to stderr (stdout stays clean for --json output)
-# file        = "neewer-bridge.log"  # omit/empty = no file; rotated by size
-# file_level  = "debug" # keep a full debug record on disk while console stays info
-max_size_mb   = 10      # rotate the file past this size
-max_files     = 5       # rotated files to keep
-
-[[lights]]
-mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)
-name     = "Key light"          # optional label
-driver   = "auto"               # auto | classic | infinity | home
-profile  = "advanced"           # cct | cct_gm | hsi | rgb | rgbcw | full | advanced | pixel
-universe = 0                    # ArtNet 15-bit Port-Address (Net/Sub-Net/Universe)
-address  = 1                    # 1-based DMX start channel
-power_on_connect = true         # power the light on when it first connects
-cct_min  = 32                   # CCT range min, raw ×100K (32 = 3200K)
-cct_max  = 56                   # CCT range max, raw ×100K (56 = 5600K; TL120C = 25..100)
-cmd_type = 2                    # advanced-mode frame family (the app's per-model
-                                # commandType): 2 = MAC-embedded XY/RGBCW/FX frames
-                                # (Infinity fixtures like the TL120C); 0/1 = direct
-                                # frames (e.g. TL21C). `add` fills it automatically
-                                # from the model catalog; default 2.
-```
-
-Add as many `[[lights]]` blocks as you have fixtures. The config is validated on
-load: MAC format, known driver/profile/failsafe values, universe ≤ 32767, address
-1–512, the whole profile fitting within 512 channels, ordered CCT range, no
-duplicate MACs, a known merge mode, and no two inputs on the same bind_ip+port.
-Run `neewer-bridge lights` to see the resulting channel map.
-
-## Multiple DMX sources & merging
-
-The bridge can accept ArtNet from **several senders at once** — say, openHAB
-driving the everyday state on the standard port while a lighting console (or
-`artnet-send`) overrides on a second port. Each `[[artnet.inputs]]` block adds
-another UDP listener, on its own port and/or a different bind IP (up to 8
-listeners total; binding the *same* port on two different **specific** local
-IPs is fine and is exactly the multi-IP use case — but the wildcard `0.0.0.0`
-claims a port on every interface, so it can't share a port with another input;
-validation rejects that combination). The main `bind_ip`/`port` is always
-input 0, labelled `primary` in logs.
-
-The inputs are combined **per DMX channel, per universe**, controlled by
-`[artnet] merge`:
-
-| Mode | Per-channel rule |
-|---|---|
-| `htp` | Highest takes precedence — the max across sources (the classic dimmer merge). |
-| `lowest` | The min across sources. |
-| `ltp` (default) | Latest takes precedence — the source that most recently **changed** the channel owns it. |
-
-`ltp` is deliberately *last-changed*, not last-received: a source re-streaming
-the same values at full refresh rate never steals a channel back from a source
-that actually changed it. That's what makes the openHAB + console combination
-work — the console grabs whatever it touches, and openHAB's steady refresh
-doesn't undo it.
-
-A source that goes silent for `merge_timeout_secs` (default 10, `0` = never) is
-dropped from the merge: in `htp`/`lowest` its contribution disappears, and in
-`ltp` the channels it owned fall back to the most recently active remaining
-source — so when the console disconnects, its overrides expire and openHAB's
-state resumes on its own. A channel with **no** live source holds its last
-value (total signal loss stays the `[failsafe]` section's job).
-
-Notes:
-- With a single input (the default config) none of this is active and there is
-  no behaviour change — merge settings only matter across inputs.
-- Merging happens **between configured inputs**. Two senders hitting the *same*
-  input still overwrite each other last-write-wins, as before — give each
-  source its own input if you want them merged.
-- ArtDmx sequence numbers are tracked per input, so the same console feeding
-  two inputs can't trip the stale-packet filter.
-- `neewer-bridge monitor` runs this exact pipeline and logs every packet with
-  its input label **plus** the merged output whenever it changes — the fastest
-  way to sanity-check a merge setup before pointing it at lights.
-
-## DMX profiles (channel layouts)
-
-All channels are 8-bit. The master **Dimmer** sets brightness only — it never
-cuts power (lights are powered on and kept on; use the failsafe or remove power
-externally to turn them off).
-
-| Profile | Ch | Layout |
-|---|---|---|
-| `cct`      | 2  | 1 Dimmer · 2 CCT |
-| `cct_gm`   | 3  | 1 Dimmer · 2 CCT · 3 GM |
-| `hsi`      | 3  | 1 Dimmer · 2 Hue · 3 Saturation |
-| `rgb`      | 3  | 1 Red · 2 Green · 3 Blue — converted to HSI internally (below) |
-| `rgbcw`    | 5  | 1 Red · 2 Green · 3 Blue · 4 Cool White · 5 Warm White — direct (below) |
-| `full`     | 5  | 1 Dimmer · 2 **Mode** · 3 CCT/Hue · 4 GM/Sat · 5 reserved |
-| `advanced` | 10 | 1 **Mode-select** · 2 Dimmer · 3–10 mode-specific (below) |
-| `pixel`    | 20 | 1 Dimmer · 2 Effect-select · 3 Speed · 4 Direction · 5–20 = 8×(Hue, Sat) — 5 animated effects (below) |
-
-For **`full`**, the Mode channel (ch2) selects sub-mode live: `0–127` = CCT
-(ch3=CCT, ch4=GM), `128–255` = HSI (ch3=Hue, ch4=Saturation).
-
-For **`rgb`** (opt-in; any colour-capable model), three channels carry plain
-R, G, B and the bridge converts them to HSI internally (hue/sat from the RGB
-ratio, brightness = the max component). Because it drives the light's ordinary
-HSI mode, it works on **every** colour fixture — including models with no native
-RGBCW mode, such as the TL21C. In openHAB each light is a single 3-channel DMX
-`color` thing, no white channels and no rules; white renders as desaturated HSI
-through the RGB engine (for the dedicated CW/WW LED banks use `rgbcw` instead):
-
-```
-// things — one 3ch color thing per light
-color tl60_rgb [ dmxid="21/3", fadetime=0 ]
-// items
-Color TL60_Colour "TL60 Colour" { channel="dmx:color:neewer:tl60_rgb:color" }
-```
-
-For **`rgbcw`** (opt-in; RGBCW-capable models such as the TL120C), five channels are
-passed **straight through** to the light's native RGBCW mode — Red, Green, Blue,
-Cool-White, Warm-White, one DMX channel per physical LED bank, with no colour-space
-conversion. Each channel drives its own emitter, so you get independent colour + white
-mixing (what `hsi`/`xy` can't do). Level rides in the channel values themselves.
-
-This lays out exactly onto **openHAB's** native RGBCW support: a DMX `color` thing
-(3ch RGB) plus a `tunablewhite` thing (2ch, in "cool white, warm white" order), patched
-contiguously. Patch the light at DMX address `N`; the color thing gets channels
-`N/3` and the tunablewhite gets `N+3,N+4`. Example for a light at `universe = 0`,
-`address = 1`:
-
-```
-// things/neewer.things
-Bridge dmx:artnet-bridge:neewer [ address="127.0.0.1", universe=0, refreshrate=30 ] {
-    color        tl120c_rgb   [ dmxid="1/3", fadetime=0 ]
-    tunablewhite tl120c_white [ dmxid="4,5", fadetime=0 ]
-}
-```
-```
-// items/neewer.items
-Color  TL120C_Colour "Colour"          { channel="dmx:color:neewer:tl120c_rgb:color" }
-Dimmer TL120C_White  "White [%d %%]"   { channel="dmx:tunablewhite:neewer:tl120c_white:brightness" }
-Number TL120C_WTemp  "White temp"      { channel="dmx:tunablewhite:neewer:tl120c_white:color_temperature" }
-```
-
-Set the bridge's `[artnet] bind_ip` reachable from openHAB and point the thing's
-`address` at the bridge host (`127.0.0.1` if co-located; default port 6454). `refreshrate`
-is openHAB's Art-Net send rate — the bridge coalesces to `[ble] flush_hz` regardless.
-Raise `fadetime` for smooth console-side fades. (No separate master-dimmer channel; the
-color thing's own brightness scales R/G/B, tunablewhite's scales CW/WW. Use `advanced`'s
-RGBCW band if you want a single master dimmer over all five.)
-
-For **`advanced`** (the default for RGB-capable models), the Mode-select channel
-(ch1) chooses among all built-in modes via value bands, and ch3–ch10 are
-reinterpreted accordingly:
-
-| ch1 band | Mode | ch3 | ch4 | ch5 | ch6 | ch7 | ch8 | ch9 |
-|---|---|---|---|---|---|---|---|---|
-| 0–31 | CCT | CCT | GM | — | — | — | — | — |
-| 32–63 | HSI | Hue | Sat | — | — | — | — | — |
-| 64–95 | FX | FX-id (1–18) | Speed | CCT | Hue | Sat/GM | Extra | 2nd-val |
-| 128–159 | RGBCW | R | G | B | CW | WW | — | — |
-| 192–231 | XY | X | Y | — | — | — | — | — |
-
-(ch2 is always Dimmer. RGBCW (128–159) drives raw R/G/B + cool-white/warm-white
-channels — independent LED mixing HSI/XY can't do. Bands 96–127, 160–191 and 232–255
-are unimplemented and map to neutral white.)
-
-For **`pixel`** (TL-series pixel fixtures such as the TL120C, **20 channels**), the
-tube is split into **8 addressable segments**. ch1 = master Dimmer, ch2 =
-**Effect-select**, ch3 = Speed/motion, ch4 = Direction, then ch5–ch20 are 8 ×
-(Hue, Sat) pairs (seg1 Hue, seg1 Sat, seg2 Hue, …). The Effect channel picks the
-pixel effect by value band — only the **5 effects that work over direct BLE** are
-exposed (hardware-verified on the TL120C and TL60; of the 7 effect types these
-models have, the other 2 are ignored unless relayed through a 2.4G hub):
-
-| ch2 band | Effect | Segment meaning |
-|---|---|---|
-| `0–51` | ColorReplacement | all 8 segments = a spatial colour palette |
-| `52–102` | SingleColorMoving | seg1 = background, seg2 = moving colour |
-| `103–153` | TwoColorMoving | seg1 = background, seg2–3 = moving colours |
-| `154–204` | ThreeColorMoving | seg1 = background, seg2–4 = moving colours |
-| `205–255` | Fire | seg1 = background, seg2 = fire colour |
-
-⚠️ **The pixel effects are animated** — the palette flows/moves along the tube;
-Speed controls the rate (Speed 0 ≈ near-static). A **truly static** per-segment
-render is **not available over BLE on the TL120C** (every pixel effect animates and
-the firmware ignores the pause command). There is also **no per-segment brightness**
-(one master dimmer). Uses the MAC-addressed `0xB0` pixel opcode; a non-pixel light
-ignores it.
-
-**Scaling:** Dimmer/Sat → 0–100%, Hue → 0–360°, GM → −50…+50, CCT → the model's
-range (`cct_min`/`cct_max`), XY → CIE coordinate 0.0000–0.8000, RGBCW R/G/B/CW/WW →
-raw 0–255, FX-id → 1–18, Speed → 1–10.
-
-> **Hardware notes — the frame-form split (`cmd_type`):** whether the advanced-mode
-> commands (XY / RGBCW / FX) are sent as **MAC-embedded** frames (`0xB7`/`0xA9`/`0x91`)
-> or **direct** frames (`0xB9`/`0xA8`/`0x8B`) is per-model — the app's `commandType`,
-> carried in the config's `cmd_type` field (`add` fills it from the catalog).
-> - **TL120C (`cmd_type = 2`, verified 2026-07-01):** needs the MAC forms; ignores the
->   direct ones. CCT, HSI, XY, RGBCW, FX and per-segment pixel all work direct-BLE.
-> - **TL21C (`cmd_type = 1`, verified 2026-07-02):** the mirror image — ignores every
->   MAC-embedded control frame; FX renders via the direct `0x8B` only. It has **no
->   XY/RGBCW/pixel** at all (those `advanced` bands are simply inert on it; CCT
->   2500–8500K, GM, HSI and all 18 FX work). Its GM was first mis-recorded as
->   "ignored" — the ±50 tint shift is just visually subtle (see the TL97C note).
-> - **TL60 RGB (`cmd_type = 2`, verified 2026-07-03):** CCT 2500–10000K, **GM works**
->   (green/magenta tint renders over BLE), HSI, RGBCW (`0xA9`, incl. the CW/WW white
->   banks), all 18 FX (honours **both** the MAC `0x91` and direct `0x8B` forms), and
->   the same 5 pixel effects as the TL120C. **No XY** (both frame forms ignored; that
->   `advanced` band is inert on it).
-> - **TL97C (`cmd_type = 1`, verified 2026-07-04):** a TL21C capability twin — CCT
->   2500–8500K, GM, HSI and all 18 FX work (FX via the direct `0x8B` only); no
->   XY/RGBCW/pixel, and it answers **no status reads at all** (not even battery).
->
-> Other fixtures may differ — validate per model (`test --set` probes one frame at a
-> time; see the test flags above). **GM caution:** the ±50 tint swing renders subtly —
-> confirm GM on the fixture's display, not by eye (an eyeball-only probe once
-> mis-labelled the TL21C "no GM").
-
-## FX effects
-
-The `advanced` profile's FX band (ch1 = 64–95) selects one of 18 built-in effects
-on ch3 (scaled 1–18). ch4 sets speed (1–10); ch5–ch9 supply effect-specific
-parameters (CCT, hue, saturation/GM, ember/colour/mode, and a second value for
-loop effects).
-
-| ID | Effect | ID | Effect | ID | Effect |
-|---|---|---|---|---|---|
-| 1 | Lightning | 7 | HUE-flash | 13 | CCT-loop |
-| 2 | Paparazzi | 8 | CCT-pulse | 14 | INT-loop |
-| 3 | Defective bulb | 9 | HUE-pulse | 15 | TV-screen |
-| 4 | Explosion | 10 | Cop-Car | 16 | Fireworks |
-| 5 | Welding | 11 | Candlelight | 17 | Party |
-| 6 | CCT-flash | 12 | HUE-loop | 18 | Music |
-
-FX is only available on models whose catalog entry has `supports_fx` (run
-`neewer-bridge models`). All four hardware-validated models (TL120C, TL60 RGB,
-TL21C, TL97C) support all 18.
-
-## Drivers
-
-`auto` detects Neewer Home (`NH-*`) lights and otherwise assumes classic. Set
-`infinity` explicitly for newer MAC-addressed lights (auto can't detect those
-reliably), or `home` for `NH-*` devices. Most current panels use `classic` —
-the bridge connects directly over BLE, where the classic `0x78` frames work
-(XY uses a MAC-addressed frame; FX uses the MAC-embedded effect frame, both of
-which work over the direct connection).
-
-## Reliability
-
-Each light runs an independent supervisor that connects, verifies the link stays
-alive (every `probe_secs`), and reconnects automatically — so a light that's
-powered off, out of range, or briefly drops simply rejoins, still bound to its
-configured DMX channels. Fast ArtNet input is coalesced to the light's flush rate
-(`flush_hz`) to avoid overwhelming the BLE link. Validated by a 2-hour soak (zero
-drops). The failsafe controls behaviour when ArtNet stops: `hold` keeps the last
-state, `blackout` sets brightness 0, `poweroff` powers the light off — after
-`timeout_secs` of silence.
-
-Every ArtNet input socket is bound **before** anything else starts, and a bind
-failure (port already in use, bad `bind_ip`) — or any listener dying later — is a
-fatal error with a non-zero exit, so a supervisor (systemd, screen + a wrapper)
-can see and restart a bridge that isn't actually receiving. Out-of-order/duplicate
-ArtDmx datagrams are dropped using the Art-Net Sequence field (tracked per input,
-per source + port-address; senders that disable sequencing, seq = 0, are
-unaffected, and an idle source resyncs after 2 s so a restarted console is never
-locked out).
-
-**Connection health & reconnect.** These are two-chip fixtures (a BLE radio module in
-front of the LED MCU that runs the command parser), and they give no write ACK
-(`write-without-response`), so an unchecked link can look "connected" while it's actually
-half-dead. The supervisor guards against that with a cheap **GATT read every
-`probe_secs`** — the radio answers it, so a healthy light stays connected with no churn;
-three consecutive misses (or a reported disconnect) mean a dead link → reconnect.
-Reconnects use a **jittered backoff** so a fleet doesn't reconnect in lockstep. That's the
-whole liveness model — deliberately simple; the bridge doesn't try to auto-detect a
-firmware "wedge" (a detector for it proved too false-positive-prone, and a real wedge
-needs a human power-cycle anyway — see below).
-
-⚠️ **A light stuck on its last colour and ignoring commands has two possible causes —
-tell them apart by whether moving it closer helps:**
-- **Weak RX link** (the common one) — the bridge can't currently reach the fixture, so a
-  new command never lands. It **reconnects and resumes on its own** once the signal is good
-  again; **move it (or the adapter) nearer** and it recovers, no power-cycle needed. If one
-  unit does this repeatedly it's the weakest radio in the fleet. RSSI is logged per light
-  (at connect, session start, and on each probe) precisely so you can spot a marginal
-  placement.
-- **Firmware wedge** (rarer, seen on a damaged unit) — the fixture is hung: it stays
-  unresponsive/unconnectable **even with the adapter touching it**, and **only a full
-  power-cycle clears it** — RF proximity does not, and neither does reflashing the current
-  firmware. Weak RF seems to *trigger* the wedge, but once wedged it's a firmware state. So:
-  if getting close fixes it, it was a weak link; if it's still dead at touching range,
-  power-cycle it.
-
-**Discovery scanning is on-demand, not permanent.** btleplug only discovers a light while
-a scan is running, so the bridge scans to (re)find a *disconnected* fixture — but only
-then, and even then in duty-cycled bursts (`scan_window_secs` on, `scan_pause_secs` off),
-never continuously. Once every configured light is connected the adapter isn't scanning at
-all. A permanent scan competes with the active connections for the radio and makes cheap
-USB controllers (e.g. Realtek RTL8761BU) log kernel `LE Set Scan Enable` timeouts;
-scanning only when something is actually missing keeps the links stable. A light left
-powered off for days is polled in brief periodic bursts, not scanned constantly.
-
-Each supervisor also **reads device status** off the notify characteristic —
-battery %, temperature, firmware version, and power/mode — querying on connect and
-alongside each liveness probe. These are logged (at `info` when a value changes,
-`debug` otherwise), so a running bridge surfaces battery/temperature per light. TL-
-series (Infinity) fixtures only; Home (`NH-*`) lights are skipped.
-
-## Troubleshooting
-
-- **All lights show white and colour is ignored (changing RGB only changes the
-  brightness)** — the lights are almost certainly on the wrong **profile**:
-  `advanced`/`cct` map a 3-channel RGB patch onto mode-select + dimmer (i.e. white +
-  level), not R/G/B. Usually this means the bridge loaded the **wrong config file**:
-  with no `--config` it prefers `config.toml` **next to the executable** over the one
-  in your working directory (see [Configuration](#configuration)), so a stale copy
-  beside the binary can silently shadow the intended one. Run `neewer-bridge lights`
-  (same config resolution as `run`) to see the profile each light loaded — an `rgb`
-  light shows `ch → Red/Green/Blue`, an `advanced` one a 10-channel span. `run` also
-  logs `loaded config <path>` and a `configuring light … profile=… channels=…` line
-  per fixture at startup. Fix by pointing at the right file (`--config`), correcting
-  the beside-the-exe copy, or deleting it so the working-dir config is used.
-- **"no Bluetooth adapter found"** — the host has no Bluetooth radio enabled. Plug
-  in a USB BLE adapter or run on a Bluetooth-equipped machine. `neewer-bridge
-  adapters` lists what's available.
-- **`scan` finds nothing / only phones** — a Neewer light **stops advertising
-  while a phone app is connected to it**. Close the Neewer app (or disconnect it),
-  put the light in Bluetooth/pairing mode, then retry; try `--seconds 12` or
-  `--all`.
-- **`scan` doesn't show a light you know is on** — lights already bound in the
-  config are hidden (`scan` lists only new ones); the output notes how many were
-  skipped. Use `--all` to see everything, configured lights marked.
-- **A light doesn't respond to `test`/`run`** — try an explicit `--driver`
-  (`infinity` for newer lights, `home` for `NH-*`). Use `-vv` to see BLE writes.
-- **A mode does nothing** — confirm the model supports it (`neewer-bridge
-  models`); bi-colour lights ignore HSI/XY/FX. Check the Mode-select channel is in
-  the right band (see [DMX profiles](#dmx-profiles-channel-layouts)).
-- **ArtNet not received** — verify the source targets this host's IP and the
-  configured `universe`/`address`; use `neewer-bridge monitor` to watch packets,
-  and `neewer-bridge lights` to confirm the expected channel mapping.
-- **A light is stuck in an FX effect** — FX latches the fixture; power-cycle it
-  (or run `neewer-bridge test <MAC>`, which power-cycles and restores white).
 
 ## License
 
