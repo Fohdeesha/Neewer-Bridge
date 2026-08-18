@@ -16,12 +16,21 @@
 //! At `info` (the default) the console stays clean; every BLE command sent to a
 //! light is logged at `debug`, so a `debug` file level keeps a full record
 //! without cluttering stdout.
+//!
+//! Both sinks stamp lines with the **local** time as `MM-DD HH:MM:SS`
+//! (`TIME_FORMAT`) rather than the default RFC3339-in-UTC.
 
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter, Layer, Registry};
 
 use crate::config::Logging;
+
+/// Log timestamp format: local time, `MM-DD HH:MM:SS` (chrono strftime). Short and
+/// human-readable for a long-lived daemon — the default RFC3339-UTC stamp is noise
+/// when you're correlating a log line with what the lights just did.
+const TIME_FORMAT: &str = "%m-%d %H:%M:%S";
 
 /// Keep-alive guards for the non-blocking file writer(s). Dropping these flushes
 /// and stops the background writer thread, so `main` must hold them until exit.
@@ -38,6 +47,7 @@ pub fn init(cfg: &Logging, verbosity: u8) -> LogGuards {
         let level = cfg.console_level.as_deref().unwrap_or(&cfg.level);
         layers.push(
             fmt::layer()
+                .with_timer(ChronoLocal::new(TIME_FORMAT.to_string()))
                 .with_target(true)
                 .with_level(true)
                 // Console → stderr so machine-readable stdout (scan --json) stays clean.
@@ -54,6 +64,7 @@ pub fn init(cfg: &Logging, verbosity: u8) -> LogGuards {
                 let level = cfg.file_level.as_deref().unwrap_or(&cfg.level);
                 layers.push(
                     fmt::layer()
+                        .with_timer(ChronoLocal::new(TIME_FORMAT.to_string()))
                         .with_ansi(false) // no colour escapes in the file
                         .with_target(true)
                         .with_level(true)

@@ -1,6 +1,6 @@
 [package]
 name = "neewer-bridge"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 description = "ArtNet (DMX-over-UDP) to Neewer Bluetooth light control bridge"
 license = "MIT"
@@ -27,7 +27,7 @@ toml = "0.8"
 # Errors + logging (debuggability)
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 # Non-blocking file logging + size-based rotation (long-lived daemon)
 tracing-appender = "0.2"
 file-rotate = "0.7"

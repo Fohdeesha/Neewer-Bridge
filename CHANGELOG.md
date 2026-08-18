@@ -13,6 +13,15 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.1.1] — 2026-08-18
+
+### Changed
+
+- **Log timestamps are now local time in a short `MM-DD HH:MM:SS` form** (e.g.
+  `07-10 09:25:01`) instead of the RFC-3339 UTC stamp
+  (`2026-07-10T09:25:01.627109Z`). Applies to both the console and the log
+  file. Nothing else about the log lines changed.
+
 ## [1.1.0] — 2026-07-20
 
 ### Added
