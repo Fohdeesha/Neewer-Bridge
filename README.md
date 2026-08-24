@@ -20,10 +20,12 @@ Tested against real TL120C, TL21C, TL60 RGB, and TL97C fixtures.
    ```
 
    This scans, blinks the light it found so you know which one it is, asks for
-   an ArtNet universe and DMX address, and writes the entry to `config.toml`.
-   Run it once per light. The model is recognized from the Bluetooth name
-   (141 models known), so the driver, channel profile, and CCT range are filled
-   in for you. `neewer-bridge lights` shows the channel map you ended up with.
+   an ArtNet universe and DMX address, and writes the entry to `config.toml`
+   (creating it from the bundled `config.example.toml` the first time, so you
+   get the fully commented file). Run it once per light. The model is
+   recognized from the Bluetooth name (141 models known), so the driver,
+   channel profile, and CCT range are filled in for you. `neewer-bridge lights`
+   shows the channel map you ended up with.
 
 3. Start the bridge:
 
@@ -63,8 +65,18 @@ otherwise the one in the current directory.
 
 ## Configuration
 
-`add` writes light entries for you, and the shipped `config.toml` documents
-every field, so you rarely need to touch this by hand. The short version:
+The bridge reads `config.toml`. The zip ships `config.example.toml` — a
+commented template covering every field — which `add` copies for you on first
+use, or you can copy it yourself:
+
+```
+cp config.example.toml config.toml       # Linux
+copy config.example.toml config.toml     # Windows
+```
+
+Your `config.toml` is never part of a release, so unzipping a new version over
+an existing install leaves your settings alone. `add` writes light entries for
+you, so you rarely need to touch this by hand. The short version:
 
 ```toml
 [artnet]

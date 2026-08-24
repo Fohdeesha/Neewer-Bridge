@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use tracing::{error, info, warn};
 
-use neewer_bridge::config::Config;
+use neewer_bridge::config::{self, Config};
 use neewer_bridge::{bridge, commands, logging};
 
 #[derive(Parser)]
@@ -230,6 +230,55 @@ fn resolve_config_path(explicit: Option<&PathBuf>) -> PathBuf {
     PathBuf::from("config.toml")
 }
 
+/// Do two file paths live in the same directory? Canonicalised, so a relative
+/// `config.toml` and an absolute example path in the working directory compare
+/// equal. False when either side can't be resolved — the caller then falls back
+/// to printing the full path, which is never wrong, just longer.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let dir = |p: &Path| {
+        let parent = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        std::fs::canonicalize(parent).ok()
+    };
+    match (dir(a), dir(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// One-line "here's how to get a config" hint for the not-found paths. Names
+/// the shipped example when one is actually on disk (the release zips put it
+/// next to the binary) so the instruction can be copy-pasted rather than
+/// guessed at.
+fn config_hint(config_path: &Path) -> String {
+    match config::find_example(config_path) {
+        // Name the example by filename alone when it sits in the directory the
+        // config belongs in (the usual case — both come out of the release
+        // zip), so the instruction is short enough to type. Spell out the full
+        // path only when it really is somewhere else.
+        Some(example) => {
+            let shown = if same_dir(&example, config_path) {
+                Path::new(config::EXAMPLE_FILE).to_path_buf()
+            } else {
+                example
+            };
+            format!(
+                "copy {} to {} and edit it, or run `neewer-bridge add` to create one",
+                shown.display(),
+                config_path.display()
+            )
+        }
+        None => format!(
+            "create {} (see {} in the release zip), or run `neewer-bridge add` to create one",
+            config_path.display(),
+            config::EXAMPLE_FILE
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -269,7 +318,8 @@ async fn main() {
         ),
         (Err(_), false) => warn!(
             config = %config_path.display(),
-            "config file not found — using built-in defaults (no lights will be driven)"
+            "config file not found — using built-in defaults (no lights will be driven); {}",
+            config_hint(&config_path)
         ),
     }
 
@@ -299,6 +349,25 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
             commands::scan(&cfg, *seconds, *all, *json).await
         }
         Command::Add { mac, driver, profile, universe, name, blink, address, cct_min, cct_max } => {
+            // First run: start the live config off as a copy of the shipped
+            // example, so it keeps every documented default and comment instead
+            // of being a bare file holding only the light just added. Purely a
+            // convenience — if no example is on disk, `append_light` creates the
+            // file from scratch as before.
+            if !config_path.is_file() {
+                match config::seed_from_example(config_path) {
+                    Ok(Some(example)) => info!(
+                        config = %config_path.display(),
+                        from = %example.display(),
+                        "created config from the shipped example"
+                    ),
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        error = %format!("{e:#}"),
+                        "could not copy the example config; writing a fresh one instead"
+                    ),
+                }
+            }
             let cfg = load()?;
             match mac {
                 Some(mac) => {
@@ -373,8 +442,17 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
             let cfg = load()?;
             commands::monitor(&cfg.artnet).await
         }
-        // `run` requires a valid config (it defines the light bindings).
+        // `run` requires a valid config (it defines the light bindings). A
+        // missing one is the first-run case, so say how to make one rather than
+        // surfacing a bare "No such file or directory".
         Command::Run => {
+            if !config_path.is_file() {
+                anyhow::bail!(
+                    "no config file at {} — {}",
+                    config_path.display(),
+                    config_hint(config_path)
+                );
+            }
             let cfg = Config::load(config_path)
                 .with_context(|| format!("loading config {} (required for `run`)", config_path.display()))?;
             bridge::run(cfg).await

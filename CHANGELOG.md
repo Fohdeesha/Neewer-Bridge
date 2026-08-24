@@ -13,6 +13,30 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.2.0] — 2026-08-24
+
+### Changed
+
+- **The release zips now ship `config.example.toml` instead of `config.toml`.**
+  Unzipping a new version over an existing install used to overwrite the live
+  configuration — every light, address, and setting — because the archive
+  contained a file with exactly that name. The bundled file is now a template
+  the bridge never reads, so upgrading in place leaves `config.toml` alone.
+  Copy it once (`cp config.example.toml config.toml`) when setting up, or let
+  `add` do it for you.
+- The shipped template no longer contains the developer's own fixtures, which a
+  fresh install would otherwise have tried to connect to. It carries a
+  commented-out `[[lights]]` block instead.
+
+### Added
+
+- `neewer-bridge add` creates `config.toml` from the bundled
+  `config.example.toml` when there isn't one yet, so a first-run config keeps
+  every documented default and comment rather than holding only the light that
+  was just added.
+- A missing config now says how to make one — naming the example file on disk —
+  instead of `run` failing with a bare "No such file or directory".
+
 ## [1.1.2] — 2026-08-24
 
 ### Fixed

@@ -60,14 +60,17 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      # The zips are self-contained: the binary, the ready-to-edit config.toml
-      # (the bridge looks for it beside the executable first), and the license.
-      # models.toml is compiled into the binary and doesn't need to ship.
+      # The zips are self-contained: the binary, the commented
+      # config.example.toml template, and the license. The example is
+      # deliberately NOT named config.toml — that is the live file the bridge
+      # reads, so shipping it would let an unzip-over-the-old-install wipe the
+      # user's settings. models.toml is compiled into the binary and doesn't
+      # need to ship.
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir stage
-          cp target/release/neewer-bridge config.toml LICENSE stage/
+          cp target/release/neewer-bridge config.example.toml LICENSE stage/
           cd stage && zip "../neewer-bridge-$TAG-linux-x64.zip" ./*
 
       - name: Package (Windows)
@@ -75,7 +78,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory stage | Out-Null
-          Copy-Item target/release/neewer-bridge.exe, config.toml, LICENSE stage/
+          Copy-Item target/release/neewer-bridge.exe, config.example.toml, LICENSE stage/
           Compress-Archive -Path stage/* -DestinationPath "neewer-bridge-$env:TAG-windows-x64.zip"
 
       - uses: actions/upload-artifact@v4

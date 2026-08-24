@@ -13,8 +13,11 @@
 # Large reference artifact
 /artnet_protocol_specs.txt
 
-# `config.toml` is the tracked, ready-to-edit config shipped with the project —
-# NOT ignored. (Legacy alternate name kept ignored in case it's used locally.)
+# The live config is per-install and never tracked — `config.example.toml` is the
+# tracked template that ships in the release zips, so unzipping a new release
+# over an existing install can't clobber someone's settings.
+/config.toml
+# (Legacy alternate name kept ignored in case it's used locally.)
 /neewer-bridge.toml
 
 # Local scratch / personal notes

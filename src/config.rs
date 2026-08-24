@@ -1,5 +1,7 @@
-//! Bridge configuration (TOML). See the tracked, ready-to-edit `config.toml`
-//! for a fully commented worked example of the schema.
+//! Bridge configuration (TOML). See the tracked `config.example.toml` for a
+//! fully commented worked example of the schema — the live file it is copied to
+//! is always `config.toml`, which is never tracked or shipped so that unzipping
+//! a new release over an install can't clobber someone's settings.
 //!
 //! The binding identity for every light is its **MAC address** — stable across
 //! reboots and independent of power-on/discovery order. On Linux/Windows the
@@ -7,7 +9,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Config {
@@ -531,6 +533,58 @@ fn toml_escape(s: &str) -> String {
     out
 }
 
+/// Filename of the commented template that ships in the release zips. The
+/// bridge never loads it: the live config is always `config.toml`, so dropping
+/// a new release on top of an existing install leaves the user's file alone.
+pub const EXAMPLE_FILE: &str = "config.example.toml";
+
+/// Locate the shipped example config for `config_path`: beside that path first
+/// (an explicit `--config /etc/nb/config.toml` usually has it there), then
+/// beside the executable, then the working directory — the same order the
+/// config resolver itself searches, so the hint always names a real file.
+pub fn find_example(config_path: &Path) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = config_path.parent() {
+        // `parent()` of a bare filename is "" — that means the working
+        // directory, which the last candidate covers.
+        if !dir.as_os_str().is_empty() {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    dirs.push(PathBuf::from("."));
+    for dir in dirs {
+        let candidate = dir.join(EXAMPLE_FILE);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Create `path` by copying the shipped example, so a first-run config keeps
+/// every documented default and comment instead of being a bare file holding
+/// nothing but the light that was just added. `Ok(None)` = no example found
+/// (source builds, or the user moved it); the caller carries on and lets
+/// [`append_light`] create the file from scratch.
+pub fn seed_from_example(path: &Path) -> Result<Option<PathBuf>> {
+    let Some(example) = find_example(path) else {
+        return Ok(None);
+    };
+    // Never overwrite an existing config — callers check too, but this is the
+    // function that would destroy someone's settings if it were ever wrong.
+    if path.exists() {
+        return Ok(None);
+    }
+    std::fs::copy(&example, path)
+        .with_context(|| format!("copying {} to {}", example.display(), path.display()))?;
+    Ok(Some(example))
+}
+
 /// Append a `[[lights]]` block to a config file (creating it if absent),
 /// preserving any existing content/comments. The result is validated before it
 /// is written, so a bad addition can't corrupt the file. An absent/empty name
@@ -603,6 +657,54 @@ pub fn mac_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped template must always be a valid config — it is what users
+    /// copy to `config.toml`, and what `add` seeds a first-run config from, so
+    /// a typo in it would break the out-of-the-box path for everyone.
+    #[test]
+    fn example_config_is_valid() {
+        let text = include_str!("../config.example.toml");
+        let cfg: Config = toml::from_str(text).expect("config.example.toml must parse");
+        cfg.validate().expect("config.example.toml must validate");
+        // Every light block is commented out: shipping real fixtures would give
+        // a fresh install someone else's MACs to hunt for.
+        assert!(cfg.lights.is_empty(), "the example config must not define lights");
+    }
+
+    #[test]
+    fn seed_from_example_copies_then_refuses_to_clobber() {
+        let dir = std::env::temp_dir().join(format!("nb_seed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let example = dir.join(EXAMPLE_FILE);
+        let config = dir.join("config.toml");
+        std::fs::write(&example, "[artnet]
+port = 6455
+").unwrap();
+
+        let used = seed_from_example(&config).unwrap();
+        assert_eq!(used.as_deref(), Some(example.as_path()));
+        assert_eq!(Config::load(&config).unwrap().artnet.port, 6455);
+
+        // A second run must not touch the file the user has since edited.
+        std::fs::write(&config, "[artnet]
+port = 6999
+").unwrap();
+        assert_eq!(seed_from_example(&config).unwrap(), None);
+        assert_eq!(Config::load(&config).unwrap().artnet.port, 6999);
+
+        // With no example beside the target, the search falls back to the
+        // executable's directory and then the working directory (the crate root
+        // under `cargo test`), which is how a release install finds the copy
+        // sitting next to the binary.
+        std::fs::remove_file(&example).unwrap();
+        std::fs::remove_file(&config).unwrap();
+        let used = seed_from_example(&config).unwrap().expect("falls back to the CWD example");
+        assert_eq!(used.file_name().unwrap(), EXAMPLE_FILE);
+        assert!(Config::load(&config).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_mac_forms() {

@@ -1,9 +1,19 @@
-# Neewer-Bridge configuration.
+# Neewer-Bridge example configuration.
 #
-# This is the live config the bridge reads by default (launching `neewer-bridge`
-# with no --config looks for `config.toml` in the working directory; a bare
-# `neewer-bridge` with no subcommand runs the bridge). Edit it in place —
-# there's nothing to copy or rename. Lights are bound by MAC address, so the
+# This file is a TEMPLATE — the bridge never reads it. Copy (or rename) it to
+# `config.toml` next to the binary and edit that copy:
+#
+#   Linux:    cp config.example.toml config.toml
+#   Windows:  copy config.example.toml config.toml
+#
+# Keeping the example separate means unzipping a new release over an existing
+# install can't overwrite your settings. `neewer-bridge add` also creates
+# `config.toml` from this file automatically the first time you add a light, so
+# you can skip the copy if you start there.
+#
+# Launching `neewer-bridge` with no --config looks for `config.toml` beside the
+# executable first, then in the working directory (a bare `neewer-bridge` with
+# no subcommand runs the bridge). Lights are bound by MAC address, so the
 # DMX-channel -> physical-light mapping is identical on every boot regardless of
 # power-on or discovery order.
 
@@ -82,11 +92,11 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 # Easiest: run `neewer-bridge add` (interactive) or `add --mac <MAC> --universe N
 # --address N`. It identifies the light's model from its BLE name and fills in
 # driver / profile / cct_min / cct_max automatically (see `neewer-bridge models`),
-# then appends a complete [[lights]] block here.
+# then appends a complete [[lights]] block to your config.toml.
 #
-# Or fill in the template below by hand (uncomment and edit). Add one [[lights]]
-# block per fixture. With no lights configured, the bridge still runs and receives
-# ArtNet — it just drives nothing.
+# Or copy the template below into your config.toml by hand (uncomment and edit).
+# Add one [[lights]] block per fixture. With no lights configured, the bridge
+# still runs and receives ArtNet — it just drives nothing.
 
 # [[lights]]
 # mac      = "AA:BB:CC:DD:EE:FF"  # binding identity (required)
@@ -112,82 +122,3 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 # # from the catalog). 2 = Infinity fixtures (TL120C): XY/RGBCW/FX sent as the
 # # MAC-embedded frames. 0/1 = direct frames (TL21C). Default 2.
 # cmd_type = 2
-
-# All five lights use the 3ch `rgb` profile (R,G,B -> HSI internally): one openHAB
-# DMX `color` thing per light, no white channels, no rules — works on every fixture
-# incl. the TL21C/TL97C (which have no RGBCW mode). Addresses keep their old spacing
-# so switching any light back to `rgbcw` (5ch) or `advanced` (10ch) needs no re-patch.
-# DMX map (universe 0): TL120C ch1-3 · TL120C-2 ch6-8 · TL21C ch11-13 · TL60 ch21-23
-# · TL97C ch26-28.
-
-[[lights]]
-mac      = "D6:50:F2:F6:BB:1B"
-name     = "TL120C"
-driver   = "classic"
-profile  = "rgb"
-universe = 0
-address  = 1
-power_on_connect = true
-cct_min  = 25
-cct_max  = 100
-cmd_type = 2
-
-[[lights]]
-mac = "CB:33:5A:EE:5A:7C"
-name = "TL120C 2"
-driver = "classic"
-profile = "rgb"
-universe = 0
-address = 6
-power_on_connect = true
-cct_min = 25
-cct_max = 100
-cmd_type = 2
-
-# TL21C (HW-tested 2026-07-02): no RGBCW hardware (0xA8/0xA9 both ignored), so the
-# `rgb` profile is what makes 3ch RGB control possible here — it converts to HSI,
-# which the TL21C honours. (Its CCT mode + 18 FX are unreachable from a plain RGB
-# patch; switch back to `advanced` if you ever want those from openHAB.)
-[[lights]]
-mac = "FA:F8:A9:B9:41:1C"
-name = "TL21C"
-driver = "classic"
-profile = "rgb"
-universe = 0
-address = 11
-power_on_connect = true
-cct_min = 25
-cct_max = 85
-cmd_type = 1
-
-# TL60 RGB (unit "RGB-3" revision, fw 3.0.5; HW-tested 2026-07-03): CCT 2500-10000K
-# + GM + HSI + RGBCW (by-MAC 0xA9, CW/WW banks confirmed) + all 18 FX + pixel
-# effects 1/3/4/5/7. No XY. Also verified profiles: "rgbcw" (5ch), "advanced"
-# (10ch), "pixel" (20ch).
-[[lights]]
-mac = "F9:B8:B6:15:F9:8D"
-name = "TL60"
-driver = "classic"
-profile = "rgb"
-universe = 0
-address = 21
-power_on_connect = true
-cct_min = 25
-cct_max = 100
-cmd_type = 2
-
-# TL97C (HW-tested 2026-07-04): CCT 2500-8500K + GM (works — subtle render, the
-# OLED tracks it) + HSI + FX (direct 0x8B via cmd_type=1) — a TL21C capability
-# twin. No XY/RGBCW/pixel; no status-read replies. `rgb` converts R,G,B -> HSI,
-# which it honours; switch to `advanced` if CCT/GM/FX are ever wanted.
-[[lights]]
-mac = "F2:43:CF:E2:23:D2"
-name = "TL97C"
-driver = "classic"
-profile = "rgb"
-universe = 0
-address = 26
-power_on_connect = true
-cct_min = 25
-cct_max = 85
-cmd_type = 1
