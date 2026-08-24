@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
-use crate::artnet;
+use crate::artnet::{self, DMX_UNIVERSE_SIZE};
 use crate::ble;
 use crate::config::{self, parse_mac, LightCfg, KNOWN_DRIVERS, KNOWN_PROFILES};
 use crate::driver::Driver;
@@ -479,6 +479,41 @@ pub async fn add_noninteractive(
     Ok(())
 }
 
+/// Build the DMX data slot for `artnet-send`: `channels` placed at the 1-based
+/// `address`, with earlier channels zero-padded, sized to a legal ArtDmx length.
+///
+/// Rejects a patch that runs past the universe. `encode_artdmx` truncates to
+/// [`DMX_UNIVERSE_SIZE`], so without this check an out-of-range `--address`
+/// would drop the channel values on the floor and still report a successful send.
+fn dmx_payload(address: u16, channels: &[u8]) -> Result<Vec<u8>> {
+    if !(1..=DMX_UNIVERSE_SIZE).contains(&address) {
+        bail!("--address {address} out of range (1..={DMX_UNIVERSE_SIZE})");
+    }
+    if channels.is_empty() {
+        bail!("--channels needs at least one value");
+    }
+    let last = address as usize + channels.len() - 1;
+    if last > DMX_UNIVERSE_SIZE as usize {
+        bail!(
+            "{} channel value(s) starting at address {address} run to channel {last}, past the \
+             {DMX_UNIVERSE_SIZE}-channel universe — they would be silently dropped",
+            channels.len()
+        );
+    }
+
+    let start = (address - 1) as usize;
+    let mut data = vec![0u8; start + channels.len()];
+    data[start..].copy_from_slice(channels);
+    // ArtDmx's length field is 2..=512 and even.
+    if data.len() < 2 {
+        data.resize(2, 0);
+    }
+    if data.len() % 2 == 1 {
+        data.push(0);
+    }
+    Ok(data)
+}
+
 /// `artnet-send` — send ArtDmx to drive the bridge (or any node) without a
 /// physical console. One-shot by default; `--hz` streams for `--seconds`.
 /// Channels are placed starting at `address`; earlier channels are zero-padded.
@@ -491,18 +526,9 @@ pub async fn artnet_send(
     hz: Option<f64>,
     seconds: f64,
 ) -> Result<()> {
+    let data = dmx_payload(address, channels)?;
     let sock = UdpSocket::bind("0.0.0.0:0").await.context("binding sender socket")?;
     let dest = format!("{target}:{port}");
-
-    let start = (address.max(1) - 1) as usize;
-    let mut data = vec![0u8; start + channels.len()];
-    data[start..].copy_from_slice(channels);
-    if data.len() < 2 {
-        data.resize(2, 0); // ArtNet length is 2..=512
-    }
-    if data.len() % 2 == 1 {
-        data.push(0); // even length
-    }
 
     match hz {
         Some(h) if h > 0.0 => {
@@ -585,21 +611,32 @@ pub async fn monitor(artnet_cfg: &config::ArtNet) -> Result<()> {
     .await
 }
 
+/// Which optional probes a `test` run should perform. A struct rather than a row
+/// of positional `bool`s, so a call site can't silently transpose two of them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TestProbes {
+    /// Cycle HSI red→green→blue (is this fixture RGB or bi-colour?).
+    pub colors: bool,
+    /// Probe the advanced modes: XY + a few FX effects.
+    pub modes: bool,
+    /// Probe per-segment PIXEL control (`0xB0`).
+    pub pixel: bool,
+    /// Read status (firmware/battery/temperature/state) and stop — non-mutating.
+    pub status: bool,
+}
+
 /// `test` — connect to one light and prove the BLE path end to end:
 /// verify GATT, blink power (also serves as visual identify), then set a known
 /// CCT. Uses our real protocol encoders so this validates them on hardware.
-#[allow(clippy::too_many_arguments)]
 pub async fn test(
     adapter_selector: &str,
     mac: &str,
     driver: &str,
     seconds: u64,
-    colors: bool,
-    modes: bool,
-    pixel: bool,
+    probes: TestProbes,
     set: Option<&str>,
-    status: bool,
 ) -> Result<()> {
+    let TestProbes { colors, modes, pixel, status } = probes;
     let mac_bytes = parse_mac(mac)?;
     let adapter = ble::acquire_adapter(adapter_selector).await?;
 
@@ -930,12 +967,18 @@ async fn test_status(p: &Peripheral, write: &Characteristic, mac: [u8; 6]) -> Re
     Ok(())
 }
 
-/// Send one frame (or pixel palette) described by `spec` and hold it — the engine
-/// behind `test --set`, for guided one-value-at-a-time hardware testing. The light
-/// keeps the state after disconnect. Non-CCT/pixel specs first send a CCT-white
-/// frame to clear any latched pixel/FX mode (a plain CCT overrides the animation
-/// where a power-cycle does not).
-async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &str) -> Result<()> {
+/// What one `--set SPEC` resolves to: the frame(s) to send, a human description,
+/// and whether a CCT-white frame must clear a latched pixel/FX mode first.
+struct SetPlan {
+    frames: Vec<Vec<u8>>,
+    desc: String,
+    reset: bool,
+}
+
+/// Parse a `test --set` spec into the frames it means. Pure (no BLE), so every
+/// spec form and its argument validation is unit-testable — the encoders it
+/// calls are already byte-pinned by their own tests.
+fn build_set_plan(mac: [u8; 6], spec: &str) -> Result<SetPlan> {
     let parts: Vec<&str> = spec.split(':').collect();
     let get = |i: usize| parts.get(i).copied();
     let num = |i: usize, what: &str| -> Result<u32> {
@@ -944,18 +987,32 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
             .parse::<u32>()
             .with_context(|| format!("--set {spec}: {what} must be a number"))
     };
+    // Range-checked variants. Casting a parsed u32 straight to u8/u16 used to
+    // wrap silently — `bri:300` became 44 and the probe reported the value it
+    // never sent, which is the worst possible behaviour in a diagnostic tool.
+    // (`--set raw:<hex>` remains the escape hatch for deliberately out-of-spec
+    // frames.)
+    let bounded = |i: usize, what: &str, max: u32| -> Result<u32> {
+        let v = num(i, what)?;
+        if v > max {
+            bail!("--set {spec}: {what} must be 0..={max}, got {v}");
+        }
+        Ok(v)
+    };
+    let u8n = |i: usize, what: &str| -> Result<u8> { Ok(bounded(i, what, 255)? as u8) };
+    let pct = |i: usize, what: &str| -> Result<u8> { Ok(bounded(i, what, 100)? as u8) };
 
     // Build the frame(s) + a human description. `reset` = clear a pixel/FX latch first.
     let (frames, desc, reset): (Vec<Vec<u8>>, String, bool) = match parts[0] {
         "warmdim" => (vec![classic::cct2(12, 27)], "dim warm white 2700K @ 12%".into(), false),
         "cct" => {
-            let (k, bri) = (num(1, "kelvin")?, num(2, "bri")? as u8);
+            let (k, bri) = (bounded(1, "kelvin", 25_500)?, pct(2, "bri")?);
             (vec![classic::cct2(bri, (k / 100) as u8)], format!("CCT {k}K @ {bri}%"), false)
         }
         "cctgm" => {
             // GM CCT probe. Optional 4th part = frame form: 4 (default; the app's
             // cct4), 3 (GL1-family cct3) or 5 (RGB62-family cct_gm5). gm -50..=50.
-            let (k, bri) = (num(1, "kelvin")?, num(3, "bri")? as u8);
+            let (k, bri) = (bounded(1, "kelvin", 25_500)?, pct(3, "bri")?);
             let gm: i8 = get(2)
                 .with_context(|| format!("--set {spec}: missing gm"))?
                 .parse()
@@ -969,34 +1026,34 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
             (vec![frame], format!("CCT{form} {k}K gm{gm:+} @ {bri}%"), false)
         }
         "hsi" => {
-            let (hue, sat, bri) = (num(1, "hue")? as u16, num(2, "sat")? as u8, num(3, "bri")? as u8);
+            let (hue, sat, bri) = (bounded(1, "hue", 360)? as u16, pct(2, "sat")?, pct(3, "bri")?);
             (vec![classic::hsi(hue, sat, bri)], format!("HSI hue={hue} sat={sat} @ {bri}%"), true)
         }
         "xy" => {
-            let (x, y, bri) = (num(1, "x")? as u16, num(2, "y")? as u16, num(3, "bri")? as u8);
+            let (x, y, bri) = (bounded(1, "x", 8000)? as u16, bounded(2, "y", 8000)? as u16, pct(3, "bri")?);
             (vec![classic::xy_mac(mac, bri, x, y)], format!("XY by-MAC 0xB7 x={x} y={y} @ {bri}%"), true)
         }
         "xydirect" => {
             // Direct 0xB9 — ignored on commandType==2 (Infinity) fixtures like the
             // TL120C, but the form the app sends to everything else. Probe both.
-            let (x, y, bri) = (num(1, "x")? as u16, num(2, "y")? as u16, num(3, "bri")? as u8);
+            let (x, y, bri) = (bounded(1, "x", 8000)? as u16, bounded(2, "y", 8000)? as u16, pct(3, "bri")?);
             (vec![classic::xy(bri, x, y)], format!("XY direct 0xB9 x={x} y={y} @ {bri}%"), true)
         }
         "fxdirect" => {
             // Direct 0x8B — the 18-effect payload without the MAC wrapper
             // (`setRGBLightValue(EFFECT_MODE_OLD,…)`, cn.java:3458). For fixtures
             // that ignore the MAC 0x91 form.
-            let (id, bri) = (num(1, "id")? as u8, num(2, "bri")? as u8);
+            let (id, bri) = (bounded(1, "id", 18)? as u8, pct(2, "bri")?);
             (vec![fx_preset_direct(id, bri)], format!("FX direct 0x8B #{id} @ {bri}%"), true)
         }
         "scene" => {
             // Old 9-scene 0x88 — dropped by TL120C firmware; non-Infinity fixtures
             // may honour it. reset=true so an ignored frame leaves plain white.
-            let (id, bri) = (num(1, "scene id (1-9)")? as u8, num(2, "bri")? as u8);
+            let (id, bri) = (bounded(1, "scene id (1-9)", 9)? as u8, pct(2, "bri")?);
             (vec![classic::scene(bri, id)], format!("SCENE 0x88 #{id} @ {bri}%"), true)
         }
         "fx" => {
-            let (id, bri) = (num(1, "id")? as u8, num(2, "bri")? as u8);
+            let (id, bri) = (bounded(1, "id", 18)? as u8, pct(2, "bri")?);
             (vec![fx_preset(mac, id, bri)], format!("FX #{id} @ {bri}%"), true)
         }
         "pixel" => {
@@ -1005,7 +1062,7 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
                 .split(',')
                 .map(|h| Ok(Block::Hsi { hue: h.trim().parse::<u16>().context("bad hue")?, sat: 100 }))
                 .collect::<Result<_>>()?;
-            let (eff, speed) = (num(2, "effect")? as u8, num(3, "speed")? as u8);
+            let (eff, speed) = (bounded(2, "effect", 10)? as u8, pct(3, "speed")?);
             let n = blocks.len();
             // reset=true: a running pixel effect ignores a new pixel palette/effect
             // until a CCT frame clears the latch first (verified on TL120C).
@@ -1014,7 +1071,7 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
         "pixfx" => {
             // Exhaustive per-effect probe: build effect `id` (1..=10) with the app's
             // own default params from the decompile.
-            let id = num(1, "effect id")? as u8;
+            let id = bounded(1, "effect id", 10)? as u8;
             let (frames, name) = build_pixel_effect_test(mac, id);
             (frames, format!("PIXEL {name}"), true)
         }
@@ -1031,7 +1088,7 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
                     .transpose()
                     .map(|o| o.unwrap_or(dflt))
             };
-            let (r, g, b) = (num(1, "r")? as u8, num(2, "g")? as u8, num(3, "b")? as u8);
+            let (r, g, b) = (u8n(1, "r")?, u8n(2, "g")?, u8n(3, "b")?);
             let (cw, ww, bri) = (optu8(4, "cw", 0)?, optu8(5, "ww", 0)?, optu8(6, "bri", 100)?);
             let (frame, form) = if parts[0] == "rgbcwmac" {
                 (classic::rgbcw_mac(mac, bri, r, g, b, cw, ww, 0), "by-MAC 0xA9 (production form — should render)")
@@ -1063,6 +1120,16 @@ async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &s
         }
         other => bail!("--set: unknown spec kind '{other}' (cct|hsi|xy|xydirect|scene|fx|fxdirect|pixel|pixfx|warmdim|rgbcw|rgbcwmac|raw)"),
     };
+    Ok(SetPlan { frames, desc, reset })
+}
+
+/// Send one frame (or pixel palette) described by `spec` and hold it — the engine
+/// behind `test --set`, for guided one-value-at-a-time hardware testing. The light
+/// keeps the state after disconnect. Non-CCT/pixel specs first send a CCT-white
+/// frame to clear any latched pixel/FX mode (a plain CCT overrides the animation
+/// where a power-cycle does not).
+async fn test_set(p: &Peripheral, write: &Characteristic, mac: [u8; 6], spec: &str) -> Result<()> {
+    let SetPlan { frames, desc, reset } = build_set_plan(mac, spec)?;
 
     if reset {
         info!("clearing any latched pixel/FX mode with a CCT-white frame");
@@ -1489,6 +1556,96 @@ async fn ota_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_MAC: [u8; 6] = [0xD6, 0x50, 0xF2, 0xF6, 0xBB, 0x1B];
+
+    #[test]
+    fn set_specs_build_the_expected_frames() {
+        let plan = build_set_plan(TEST_MAC, "cct:5600:40").unwrap();
+        assert_eq!(plan.frames, vec![classic::cct2(40, 56)]);
+        assert!(!plan.reset, "a CCT spec needs no latch-clearing frame");
+
+        let plan = build_set_plan(TEST_MAC, "hsi:120:100:80").unwrap();
+        assert_eq!(plan.frames, vec![classic::hsi(120, 100, 80)]);
+        assert!(plan.reset, "non-CCT specs clear a latched pixel/FX mode first");
+
+        // GM CCT: the 4-byte app form by default, 3/5-byte on request.
+        assert_eq!(
+            build_set_plan(TEST_MAC, "cctgm:5600:-50:40").unwrap().frames,
+            vec![classic::cct4(40, 56, -50)]
+        );
+        assert_eq!(
+            build_set_plan(TEST_MAC, "cctgm:5600:10:40:5").unwrap().frames,
+            vec![classic::cct_gm5(40, 56, 10)]
+        );
+
+        // MAC vs direct forms stay distinct (the commandType split).
+        assert_eq!(
+            build_set_plan(TEST_MAC, "xy:3127:3290:80").unwrap().frames,
+            vec![classic::xy_mac(TEST_MAC, 80, 3127, 3290)]
+        );
+        assert_eq!(
+            build_set_plan(TEST_MAC, "xydirect:3127:3290:80").unwrap().frames,
+            vec![classic::xy(80, 3127, 3290)]
+        );
+        assert_eq!(
+            build_set_plan(TEST_MAC, "rgbcwmac:255:0:0").unwrap().frames,
+            vec![classic::rgbcw_mac(TEST_MAC, 100, 255, 0, 0, 0, 0, 0)]
+        );
+
+        // `raw` sends the given bytes verbatim, with no latch-clearing frame.
+        let plan = build_set_plan(TEST_MAC, "raw:78D00048").unwrap();
+        assert_eq!(plan.frames, vec![vec![0x78, 0xD0, 0x00, 0x48]]);
+        assert!(!plan.reset);
+
+        // Pixel emits its params frame plus palette frame(s).
+        assert_eq!(build_set_plan(TEST_MAC, "pixel:0,240:1:40").unwrap().frames.len(), 2);
+    }
+
+    #[test]
+    fn set_specs_reject_out_of_range_values() {
+        // These used to wrap silently: bri 300 became 44 and the tool logged a
+        // value it had not sent — the worst outcome for a diagnostic probe.
+        for spec in [
+            "cct:5600:300",       // brightness > 100
+            "hsi:400:100:80",     // hue > 360
+            "hsi:120:200:80",     // saturation > 100
+            "xy:9000:3290:80",    // x past the 0.8000 coordinate max
+            "fx:99:80",           // no such effect
+            "scene:20:80",        // 9-scene family only has 1..=9
+            "rgbcw:300:0:0",      // channel > 255
+        ] {
+            assert!(build_set_plan(TEST_MAC, spec).is_err(), "{spec} should be rejected");
+        }
+
+        // Malformed / unknown specs stay errors, and none of them panic.
+        for spec in ["", "nope:1", "cct", "cct:5600", "cct:abc:40", "raw:", "raw:78D0004"] {
+            assert!(build_set_plan(TEST_MAC, spec).is_err(), "{spec:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn dmx_payload_places_channels_at_the_address() {
+        // Address 1 → channels sit at the front; length padded to the 2-byte
+        // minimum / even length ArtDmx requires.
+        assert_eq!(dmx_payload(1, &[10, 20, 30]).unwrap(), vec![10, 20, 30, 0]);
+        assert_eq!(dmx_payload(1, &[255]).unwrap(), vec![255, 0]);
+        // Address 4 → three zero-padding channels first.
+        assert_eq!(dmx_payload(4, &[1, 2, 3]).unwrap(), vec![0, 0, 0, 1, 2, 3]);
+        // A patch ending exactly on the last channel is legal.
+        assert_eq!(dmx_payload(512, &[7]).unwrap().len(), 512);
+        assert_eq!(dmx_payload(510, &[1, 2, 3]).unwrap().len(), 512);
+    }
+
+    #[test]
+    fn dmx_payload_rejects_patches_past_the_universe() {
+        // These used to be encoded, truncated to 512 on the wire, and reported
+        // as a successful send — the channel values silently went nowhere.
+        assert!(dmx_payload(513, &[1]).is_err());
+        assert!(dmx_payload(0, &[1]).is_err());
+        assert!(dmx_payload(511, &[1, 2, 3]).is_err()); // runs to 513
+        assert!(dmx_payload(1, &[]).is_err());
+    }
 
     #[test]
     fn version_triplet_parses_and_rejects() {

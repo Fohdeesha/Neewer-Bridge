@@ -11,10 +11,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tracing::{debug, info, trace};
+use tracing::{info, trace};
 
 /// Standard ArtNet UDP port.
 pub const ARTNET_PORT: u16 = 6454;
+
+/// Channels in one DMX universe — the hard ceiling on an ArtDmx data slot, on a
+/// light's addressing, and on the merger's per-universe buffers.
+pub const DMX_UNIVERSE_SIZE: u16 = 512;
 
 const ARTNET_ID: &[u8; 8] = b"Art-Net\0";
 const OP_DMX: u16 = 0x5000;
@@ -24,11 +28,13 @@ const OP_DMX: u16 = 0x5000;
 pub struct ArtDmx {
     /// 0x01..=0xff packet sequence (0 = sequencing disabled).
     pub sequence: u8,
-    /// Source physical port (informational; used for merge discrimination).
+    /// Source physical port, straight off the wire. Informational only — the
+    /// merger discriminates sources by which input socket they arrived on, not
+    /// by this field.
     pub physical: u8,
     /// 15-bit Port-Address (Net/Sub-Net/Universe combined).
     pub port_address: u16,
-    /// DMX channel data, 1..=512 bytes.
+    /// DMX channel data, 1..=[`DMX_UNIVERSE_SIZE`] bytes.
     pub data: Vec<u8>,
 }
 
@@ -53,9 +59,9 @@ pub fn parse_artdmx(buf: &[u8]) -> Option<ArtDmx> {
     let physical = buf[13];
     let sub_uni = buf[14];
     let net = buf[15];
-    // Length is big-endian, must be even and in 2..=512 (we accept 1..=512).
+    // Length is big-endian; the spec says even and 2..=512 (we accept 1..=512).
     let length = u16::from_be_bytes([buf[16], buf[17]]) as usize;
-    if length == 0 || length > 512 {
+    if length == 0 || length > DMX_UNIVERSE_SIZE as usize {
         return None;
     }
     if buf.len() < HEADER + length {
@@ -67,9 +73,10 @@ pub fn parse_artdmx(buf: &[u8]) -> Option<ArtDmx> {
 }
 
 /// Encode an ArtDmx datagram for a given Port-Address. Used by the `artnet-send`
-/// test command (and the parser round-trip test). `data` is truncated to 512.
+/// test command (and the parser round-trip test). `data` is truncated to one
+/// universe ([`DMX_UNIVERSE_SIZE`]).
 pub fn encode_artdmx(port_address: u16, sequence: u8, data: &[u8]) -> Vec<u8> {
-    let len = data.len().min(512);
+    let len = data.len().min(DMX_UNIVERSE_SIZE as usize);
     let mut p = Vec::with_capacity(18 + len);
     p.extend_from_slice(ARTNET_ID);
     p.extend_from_slice(&OP_DMX.to_le_bytes()); // opcode, low byte first
@@ -92,7 +99,7 @@ pub fn split_port_address(port_address: u16) -> (u8, u8, u8) {
     (net, sub_net, universe)
 }
 
-/// Bind the ArtNet UDP socket. Split out from [`listen`] so the bridge can bind
+/// Bind the ArtNet UDP socket. Split out from [`serve`] so the bridge can bind
 /// **before** spawning anything else — a bind failure (port already in use, bad
 /// bind IP) must be a hard startup error, not a warning inside a spawned task.
 pub async fn bind(bind_ip: &str, port: u16) -> Result<UdpSocket> {
@@ -196,27 +203,10 @@ impl Default for SeqTracker {
 }
 
 /// Format the first `n` channels of a DMX buffer for log lines, e.g.
-/// `[100  50 …]`. Shared by `monitor`'s packet/merged log lines and
-/// [`log_packet`].
+/// `[100  50 …]`. Shared by `monitor`'s per-packet and merged log lines.
 pub fn preview(data: &[u8], n: usize) -> String {
     let cells: Vec<String> = data.iter().take(n).map(|b| format!("{b:3}")).collect();
     format!("[{}{}]", cells.join(" "), if data.len() > n { " …" } else { "" })
-}
-
-/// Log a one-line summary of an ArtDmx packet (debugging helper).
-pub fn log_packet(src: SocketAddr, pkt: &ArtDmx) {
-    let (net, sub_net, universe) = split_port_address(pkt.port_address);
-    debug!(
-        %src,
-        port = pkt.port_address,
-        net,
-        sub_net,
-        universe,
-        seq = pkt.sequence,
-        len = pkt.data.len(),
-        "ArtDmx {}",
-        preview(&pkt.data, 8),
-    );
 }
 
 #[cfg(test)]

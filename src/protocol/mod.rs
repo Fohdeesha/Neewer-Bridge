@@ -106,9 +106,7 @@ impl LightState {
     pub fn pixel_blocks(&self) -> &[pixel::Block] {
         &self.segments[..(self.seg_count as usize).min(8)]
     }
-}
 
-impl LightState {
     /// A concise, human-readable one-line summary for logs, e.g.
     /// `"CCT 5600K @ 50% gm+0"` or `"HSI hue=180 sat=100 @ 75%"`. Only the fields
     /// relevant to the current mode are shown. `cct` is the raw ×100K value.

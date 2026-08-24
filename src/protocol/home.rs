@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn cct_matches_capture() {
         // Doc: brr 500 (50%), cct 0x20 -> "7A 0C 06 32 00 20 00 01 00 DF"
-        assert_eq!(hex(&cct(500, 0x20)), "7A0C0632002000010 0DF".replace(' ', ""));
+        assert_eq!(hex(&cct(500, 0x20)), "7A0C06320020000100DF");
     }
 
     #[test]

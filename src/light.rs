@@ -56,6 +56,11 @@ const MAX_PROBE_FAILURES: u32 = 3;
 const FIND_POLL: Duration = Duration::from_secs(2);
 /// Backoff after a failed/ended session before reconnecting.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(4);
+/// Gap between consecutive status-query writes, so a light's reply queue isn't
+/// outrun (see [`send_status_queries`]).
+const QUERY_SPACING: Duration = Duration::from_millis(60);
+/// Gap between the sub-frames of a multi-frame (pixel) state, matching the app.
+const PIXEL_FRAME_SPACING: Duration = Duration::from_millis(80);
 
 pub struct LightActor {
     cfg: LightCfg,
@@ -266,14 +271,13 @@ impl LightActor {
                             // as the app does, so the effect registers (and, for a
                             // static render, so PLAY establishes before PAUSE).
                             let frames = driver.apply_frames(&desired);
-                            let spaced = frames.len() > 1;
-                            let n = frames.len();
-                            for (i, frame) in frames.iter().enumerate() {
+                            let mut it = frames.iter().peekable();
+                            while let Some(frame) = it.next() {
                                 ble::write_command_chunked(p, &chars.write, frame)
                                     .await
                                     .map_err(|e| anyhow::anyhow!("flush write failed: {e}"))?;
-                                if spaced && i + 1 < n {
-                                    tokio::time::sleep(Duration::from_millis(80)).await;
+                                if it.peek().is_some() {
+                                    tokio::time::sleep(PIXEL_FRAME_SPACING).await;
                                 }
                             }
                         } else if prev_power != Some(false) {
@@ -423,11 +427,17 @@ async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6
         frames.push(queries::version(mac));
         frames.push(queries::state(mac));
     }
-    for f in &frames {
+    // Spaced so the light's reply queue isn't outrun — but only BETWEEN frames.
+    // A trailing sleep would just stall this select arm (and therefore the flush
+    // arm alongside it) for no benefit.
+    let mut it = frames.iter().peekable();
+    while let Some(f) = it.next() {
         if ble::write_command(p, write, f).await.is_err() {
             debug!("status query write failed (non-fatal)");
             return;
         }
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        if it.peek().is_some() {
+            tokio::time::sleep(QUERY_SPACING).await;
+        }
     }
 }

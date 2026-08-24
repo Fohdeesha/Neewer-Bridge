@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn cct3_matches_gl1_tungsten_capture() {
         // Doc: "7887 0346 2032 9A"  (brr=0x46, cct=0x20, gm byte=0x32=50 -> gm 0)
-        assert_eq!(hex(&cct3(0x46, 0x20, 0)), "788703462032 9A".replace(' ', ""));
+        assert_eq!(hex(&cct3(0x46, 0x20, 0)), "7887034620329A");
     }
 
     #[test]

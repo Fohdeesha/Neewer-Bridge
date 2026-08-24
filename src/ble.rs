@@ -11,11 +11,12 @@ use btleplug::api::{
     CharPropFlags, Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::config::normalize_mac;
+use crate::config::{normalize_mac, parse_mac};
 use crate::protocol::uuids;
 
 /// A discovered BLE device, with the cached fields we care about.
@@ -25,6 +26,13 @@ pub struct Found {
     pub rssi: Option<i16>,
     pub is_neewer: bool,
     pub peripheral: Peripheral,
+}
+
+/// Whether a peripheral's address string is the MAC we're looking for. Compares
+/// the parsed 6 bytes, so it is separator/case agnostic without allocating a
+/// normalised `String` for every peripheral on every discovery poll.
+fn mac_matches(address: &str, target: [u8; 6]) -> bool {
+    parse_mac(address).is_ok_and(|a| a == target)
 }
 
 /// Port of NeewerLite's `isValidPeripheralName` — a heuristic name filter for
@@ -40,12 +48,14 @@ pub fn is_neewer_name(name: &str) -> bool {
         || n.starts_with("sl")
 }
 
-fn write_uuid() -> Uuid {
-    Uuid::parse_str(uuids::WRITE_CHAR).expect("valid write char uuid")
-}
-fn notify_uuid() -> Uuid {
-    Uuid::parse_str(uuids::NOTIFY_CHAR).expect("valid notify char uuid")
-}
+/// The Neewer GATT UUIDs, parsed once. They used to be re-parsed inside the
+/// characteristic-lookup closures, i.e. once per characteristic examined.
+static WRITE_UUID: LazyLock<Uuid> =
+    LazyLock::new(|| Uuid::parse_str(uuids::WRITE_CHAR).expect("valid write char uuid"));
+static NOTIFY_UUID: LazyLock<Uuid> =
+    LazyLock::new(|| Uuid::parse_str(uuids::NOTIFY_CHAR).expect("valid notify char uuid"));
+static SERVICE_UUID: LazyLock<Uuid> =
+    LazyLock::new(|| Uuid::parse_str(uuids::SERVICE).expect("valid service uuid"));
 
 /// Acquire a BLE adapter by `[ble] adapter` selector:
 ///
@@ -125,7 +135,6 @@ pub async fn scan(adapter: &Adapter, secs: u64) -> Result<Vec<Found>> {
     let peripherals = adapter.peripherals().await.context("listing peripherals")?;
     let _ = adapter.stop_scan().await;
 
-    let service_uuid = Uuid::parse_str(crate::protocol::uuids::SERVICE).ok();
     let mut out = Vec::new();
     for p in peripherals {
         match p.properties().await {
@@ -134,8 +143,7 @@ pub async fn scan(adapter: &Adapter, secs: u64) -> Result<Vec<Found>> {
                 let address = props.address.to_string();
                 let rssi = props.rssi;
                 // Definitive: advertises the Neewer service UUID. Fallback: name.
-                let advertises_service =
-                    service_uuid.map(|su| props.services.contains(&su)).unwrap_or(false);
+                let advertises_service = props.services.contains(&SERVICE_UUID);
                 let is_neewer = advertises_service || is_neewer_name(&name);
                 debug!(
                     %address, name = %name, ?rssi, is_neewer, advertises_service,
@@ -155,6 +163,7 @@ pub async fn scan(adapter: &Adapter, secs: u64) -> Result<Vec<Found>> {
 /// Scan until a peripheral with the target MAC appears, or `timeout` elapses.
 /// More responsive than a fixed-window scan when we already know what we want.
 pub async fn find_by_mac(adapter: &Adapter, target_mac: &str, timeout: Duration) -> Result<Peripheral> {
+    let target_bytes = parse_mac(target_mac)?;
     let target = normalize_mac(target_mac);
     info!(mac = %target, ?timeout, "looking for light by MAC");
     adapter
@@ -166,7 +175,7 @@ pub async fn find_by_mac(adapter: &Adapter, target_mac: &str, timeout: Duration)
     loop {
         for p in adapter.peripherals().await.context("listing peripherals")? {
             if let Ok(Some(props)) = p.properties().await {
-                if normalize_mac(&props.address.to_string()) == target {
+                if mac_matches(&props.address.to_string(), target_bytes) {
                     let _ = adapter.stop_scan().await;
                     info!(mac = %target, name = %props.local_name.unwrap_or_default(), "found light");
                     return Ok(p);
@@ -211,10 +220,10 @@ pub async fn find_scanned(
     adapter: &Adapter,
     target_mac: &str,
 ) -> Result<Option<(Peripheral, String, Option<i16>)>> {
-    let target = normalize_mac(target_mac);
+    let target = parse_mac(target_mac)?;
     for p in adapter.peripherals().await.context("listing peripherals")? {
         if let Ok(Some(props)) = p.properties().await {
-            if normalize_mac(&props.address.to_string()) == target {
+            if mac_matches(&props.address.to_string(), target) {
                 let name = props.local_name.unwrap_or_default();
                 return Ok(Some((p, name, props.rssi)));
             }
@@ -296,10 +305,10 @@ pub async fn connect_and_verify(p: &Peripheral) -> Result<NeewerChars> {
 
     let write = chars
         .iter()
-        .find(|c| c.uuid == write_uuid())
+        .find(|c| c.uuid == *WRITE_UUID)
         .cloned()
         .context("Neewer write characteristic (69400002-…) not found — not a Neewer light?")?;
-    let notify = chars.iter().find(|c| c.uuid == notify_uuid()).cloned();
+    let notify = chars.iter().find(|c| c.uuid == *NOTIFY_UUID).cloned();
     if notify.is_none() {
         warn!("Neewer notify characteristic (69400003-…) not found; continuing without notifications");
     }
@@ -328,6 +337,11 @@ pub async fn write_command(p: &Peripheral, write: &Characteristic, data: &[u8]) 
 /// header length byte (continuation chunks do NOT re-start with `0x78`).
 pub const MAX_ATT_WRITE: usize = 20;
 
+/// Settle time between the fragments of one chunked command (see
+/// [`write_command_chunked`]). The device reassembles by the frame's header
+/// length byte, and its radio→LED-MCU UART link needs a moment to keep up.
+const CHUNK_SETTLE: Duration = Duration::from_millis(10);
+
 /// Write a possibly-oversized command, splitting it into ≤`MAX_ATT_WRITE`-byte
 /// GATT writes when needed (for pixel palettes and other long frames). Short
 /// frames go out as a single write, identical to [`write_command`].
@@ -341,12 +355,17 @@ pub async fn write_command_chunked(p: &Peripheral, write: &Characteristic, data:
         WriteType::WithResponse
     };
     debug!(bytes = %hexstr(data), ?wt, "BLE write (chunked)");
-    for chunk in data.chunks(MAX_ATT_WRITE) {
+    let mut chunks = data.chunks(MAX_ATT_WRITE).peekable();
+    while let Some(chunk) = chunks.next() {
         p.write(write, chunk, wt)
             .await
             .with_context(|| format!("writing chunk of command {}", hexstr(data)))?;
-        // Small settle between fragments so the device's reassembler keeps up.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Small settle BETWEEN fragments so the device's reassembler keeps up.
+        // Not after the last one — that delay buys nothing and, at flush rates,
+        // just eats into the next tick.
+        if chunks.peek().is_some() {
+            tokio::time::sleep(CHUNK_SETTLE).await;
+        }
     }
     Ok(())
 }
@@ -473,4 +492,48 @@ pub async fn disconnect(p: &Peripheral) -> Result<()> {
 /// Lower-case spaced hex for logging, e.g. `78 81 01 01 fb`.
 pub fn hexstr(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The UUID statics `expect()` on a parse. They're compile-time constants,
+    /// so a test is the right place to prove they're well-formed — otherwise a
+    /// typo in `protocol::uuids` would only surface when a light is connected.
+    #[test]
+    fn gatt_uuids_parse_and_are_distinct() {
+        assert_eq!(WRITE_UUID.to_string(), uuids::WRITE_CHAR);
+        assert_eq!(NOTIFY_UUID.to_string(), uuids::NOTIFY_CHAR);
+        assert_eq!(SERVICE_UUID.to_string(), uuids::SERVICE);
+        assert_ne!(*WRITE_UUID, *NOTIFY_UUID);
+        assert_ne!(*WRITE_UUID, *SERVICE_UUID);
+    }
+
+    #[test]
+    fn mac_matching_ignores_case_and_separators() {
+        let target = [0xD6, 0x50, 0xF2, 0xF6, 0xBB, 0x1B];
+        assert!(mac_matches("D6:50:F2:F6:BB:1B", target));
+        assert!(mac_matches("d6-50-f2-f6-bb-1b", target));
+        assert!(mac_matches("D650F2F6BB1B", target));
+        assert!(!mac_matches("D6:50:F2:F6:BB:1C", target));
+        assert!(!mac_matches("", target));
+        assert!(!mac_matches("not-a-mac", target));
+    }
+
+    #[test]
+    fn neewer_name_heuristic() {
+        for n in ["NW-20240047&00000000", "NEEWER-TL21C", "nwr-something", "NH-PD20250030", "SL90 Pro"] {
+            assert!(is_neewer_name(n), "{n} should match");
+        }
+        for n in ["LHB-B35DA7F3", "", "iPhone"] {
+            assert!(!is_neewer_name(n), "{n} should not match");
+        }
+    }
+
+    #[test]
+    fn hexstr_formats_frames_for_logs() {
+        assert_eq!(hexstr(&[0x78, 0x81, 0x01, 0x01, 0xFB]), "78 81 01 01 fb");
+        assert_eq!(hexstr(&[]), "");
+    }
 }

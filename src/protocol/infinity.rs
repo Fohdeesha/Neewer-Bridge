@@ -127,8 +127,8 @@ mod tests {
     #[test]
     fn power_matches_captures() {
         // "788D 08F7 AC16 F158 9681 0127" / "...9681 0228"
-        assert_eq!(hex(&power(MAC, true)), "788D08F7AC16F158968101 27".replace(' ', ""));
-        assert_eq!(hex(&power(MAC, false)), "788D08F7AC16F1589681 0228".replace(' ', ""));
+        assert_eq!(hex(&power(MAC, true)), "788D08F7AC16F15896810127");
+        assert_eq!(hex(&power(MAC, false)), "788D08F7AC16F15896810228");
     }
 
     #[test]

@@ -121,10 +121,18 @@ impl Header {
     }
 
     /// Encode the `0x96` frame (with trailing checksum).
+    ///
+    /// The name is truncated to [`MAX_NAME_LEN`] so the single-byte `len` field
+    /// can always describe the real payload. LEN must equal the true payload
+    /// count on these two-chip fixtures — the radio→LED-MCU UART reassembler
+    /// reframes by the header, not by ATT boundaries — so a wrapped length byte
+    /// would corrupt the very first frame of a flash. The name is cosmetic
+    /// (the device ignores it), so trimming it is always the right trade.
     pub fn frame(&self) -> Vec<u8> {
-        let name = self.name.as_bytes();
+        let name = truncate_name(&self.name);
         // payload = 3 version + 4 size + 4 checkCode + name  (the `len` byte value)
         let payload_len = 11 + name.len();
+        debug_assert!(payload_len <= u8::MAX as usize);
         let mut f = Vec::with_capacity(payload_len + 4);
         f.push(self.header_byte);
         f.push(0x96);
@@ -135,6 +143,22 @@ impl Header {
         f.extend_from_slice(name);
         with_checksum(f)
     }
+}
+
+/// Longest name the `0x96` header can carry: the `len` field is one byte and the
+/// fixed part of the payload is 11 bytes (3 version + 4 size + 4 check-code).
+pub const MAX_NAME_LEN: usize = u8::MAX as usize - 11;
+
+/// Trim `name` to [`MAX_NAME_LEN`] **bytes**, never splitting a UTF-8 character.
+fn truncate_name(name: &str) -> &[u8] {
+    if name.len() <= MAX_NAME_LEN {
+        return name.as_bytes();
+    }
+    let mut end = MAX_NAME_LEN;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name.as_bytes()[..end]
 }
 
 /// Encode one firmware block frame for the given [`BlockKind`].
@@ -295,6 +319,43 @@ mod tests {
         let sum: u32 = f[..f.len() - 1].iter().map(|&b| b as u32).sum();
         assert_eq!(ck, sum as u8);
         assert_eq!(f.len(), 10 + 15); // name(10) + 15
+    }
+
+    /// The `len` byte is a single byte, so an over-long (cosmetic) name must be
+    /// trimmed rather than wrapped: a LEN that disagrees with the real payload
+    /// mis-frames on the two-chip UART reassembler, corrupting the first frame
+    /// of a flash. Guards the whole range, not just the observed short names.
+    #[test]
+    fn header_len_byte_always_matches_payload() {
+        for name_len in [0usize, 1, 10, MAX_NAME_LEN - 1, MAX_NAME_LEN, MAX_NAME_LEN + 1, 300, 1000] {
+            let h = Header {
+                version: [3, 0, 5],
+                size: 142_420,
+                check_code: 0x00CB_BE77,
+                name: "X".repeat(name_len),
+                header_byte: HEADER_STD,
+            };
+            let f = h.frame();
+            // frame = header byte + op + len byte + payload + checksum
+            let payload = f.len() - 4;
+            assert_eq!(f[2] as usize, payload, "LEN mismatch for a {name_len}-char name");
+            assert_eq!(payload, 11 + name_len.min(MAX_NAME_LEN));
+            assert_eq!(*f.last().unwrap(), super::super::checksum(&f[..f.len() - 1]));
+        }
+    }
+
+    /// Truncation must not split a multi-byte character (a stray partial UTF-8
+    /// sequence in the name field would still be LEN-correct, but garbage).
+    #[test]
+    fn header_name_truncation_respects_char_boundaries() {
+        let name = "é".repeat(200); // 400 bytes
+        let h = Header { version: [1, 0, 0], size: 1024, check_code: 0, name, header_byte: HEADER_STD };
+        let f = h.frame();
+        let payload = f.len() - 4;
+        assert_eq!(f[2] as usize, payload);
+        let name_bytes = &f[14..f.len() - 1];
+        assert!(name_bytes.len() <= MAX_NAME_LEN);
+        assert!(std::str::from_utf8(name_bytes).is_ok(), "truncated mid-character");
     }
 
     #[test]

@@ -151,7 +151,7 @@ pub const RUN_PLAY: u8 = 1;
 /// effects, exactly these 5 work when the `0xB0` frame is sent straight to the
 /// light; the other 5 (ColorAlternate, Colorful, ColorGradient, Trail, ColorShift)
 /// are silently ignored — they only work relayed through the 2.4G hub.
-pub const EFFECT_COLOR_REPLACEMENT_ID: u8 = 1;
+/// (ColorReplacement is [`EFFECT_COLOR_REPLACEMENT`], declared above.)
 pub const EFFECT_SINGLE_MOVING: u8 = 3;
 pub const EFFECT_TWO_MOVING: u8 = 4;
 pub const EFFECT_THREE_MOVING: u8 = 5;
@@ -233,7 +233,7 @@ mod tests {
     fn params_frame_matches_captured_app_frame() {
         // Captured (app's own checksum): 78 b0 0d cc8dbebb25b0 01 00 32 02 2e 01 01 41
         let f = effect1_params(MAC, 0x32, 0x02, 0x2e, 0x01, 0x01);
-        assert_eq!(hex(&f), "78b00dcc8dbebb25b001003202 2e0101 41".replace(' ', ""));
+        assert_eq!(hex(&f), "78b00dcc8dbebb25b0010032022e010141");
     }
 
     #[test]
@@ -257,7 +257,7 @@ mod tests {
             1,
             &[Block::Hsi { hue: 0, sat: 100 }, Block::Hsi { hue: 240, sat: 100 }],
         );
-        assert_eq!(hex(&f), "78b00ecc8dbebb25b00101100064 10f064 b7".replace(' ', ""));
+        assert_eq!(hex(&f), "78b00ecc8dbebb25b0010110006410f064b7");
     }
 
     #[test]

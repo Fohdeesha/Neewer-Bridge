@@ -13,6 +13,36 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.1.2] — 2026-08-24
+
+### Fixed
+
+- **One light silently ignored while the others work.** If a light's DMX
+  channels ran past the end of the data a console was actually sending (a wrong
+  `address`, or a console configured for a smaller universe), the bridge skipped
+  that light with nothing in the log — it just sat on its last colour, looking
+  like dead hardware. It now warns once naming the light and its channel range,
+  and logs again when the data covers it (the light still holds its last state,
+  as before).
+- **Firmware OTA header with a long device name.** The `0x96` header's
+  single-byte length field wrapped for names of 245 characters or more (the name
+  defaults to the firmware filename's stem), producing a frame whose declared
+  length disagreed with its contents — which these two-chip fixtures re-frame
+  by. The cosmetic name is now trimmed to fit.
+- **`artnet-send` with an out-of-range `--address`.** Channel values placed past
+  channel 512 were dropped when the packet was encoded, and the command still
+  reported a successful send. It now refuses the patch with a clear message.
+- **`test --set` with an out-of-range value.** Numbers wider than the field they
+  land in wrapped silently (`…:300` became `44`), so the probe reported a value
+  it never sent. Out-of-range arguments are now rejected; `--set raw:<hex>`
+  remains the escape hatch for deliberately out-of-spec frames.
+
+### Changed
+
+- `run` validates its configuration up front, so a malformed config reported by
+  a library caller is a plain startup error rather than a panic in a background
+  task. (Nothing changes for the CLI, which already validated on load.)
+
 ## [1.1.1] — 2026-08-18
 
 ### Changed

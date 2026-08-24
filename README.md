@@ -189,6 +189,10 @@ which is the easiest way to check a merge setup.
   placement. If it stays dead even right next to the adapter, power-cycle it.
 - **A light is stuck in an FX effect.** Effects latch. Power-cycle it, or run
   `neewer-bridge test <MAC>`, which resets it to white.
+- **One light never responds while the others do.** Its channels are probably
+  past the end of what your console sends — a light at channel 26 needs a source
+  sending at least 28 channels. The log warns when this happens, naming the
+  light and its channel range; `neewer-bridge lights` shows where each one sits.
 - **ArtNet isn't arriving.** Check the source targets this host's IP and the
   right universe. `neewer-bridge monitor` shows what's actually being received.
 

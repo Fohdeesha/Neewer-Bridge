@@ -35,8 +35,8 @@ use tracing::{debug, trace};
 
 use crate::artnet::{self, ArtDmx, SeqTracker};
 
-/// Channels in a DMX universe.
-const DMX_CHANNELS: usize = 512;
+/// Channels in a DMX universe (the merger's per-universe buffer size).
+const DMX_CHANNELS: usize = artnet::DMX_UNIVERSE_SIZE as usize;
 
 /// Owner sentinel for "no input owns this channel" (LTP). Config validation
 /// caps the input count far below this.

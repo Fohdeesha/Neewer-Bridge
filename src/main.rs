@@ -328,7 +328,13 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
         }
         Command::Test { mac, driver, seconds, colors, modes, pixel, set, status } => {
             let cfg = load()?;
-            commands::test(&cfg.ble.adapter, mac, driver, *seconds, *colors, *modes, *pixel, set.as_deref(), *status).await
+            let probes = commands::TestProbes {
+                colors: *colors,
+                modes: *modes,
+                pixel: *pixel,
+                status: *status,
+            };
+            commands::test(&cfg.ble.adapter, mac, driver, *seconds, probes, set.as_deref()).await
         }
         Command::Ota { mac, file, version, name, check, confirm, settle_secs, seconds, chunk_delay_ms } => {
             let cfg = load()?;

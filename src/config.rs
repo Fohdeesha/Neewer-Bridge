@@ -308,7 +308,41 @@ pub const KNOWN_PROFILES: &[&str] =
     &["cct", "cct_gm", "hsi", "rgb", "rgbcw", "full", "advanced", "pixel"];
 /// Known driver selectors.
 pub const KNOWN_DRIVERS: &[&str] = &["auto", "classic", "infinity", "home"];
-/// Known failsafe modes (only `hold` is fully implemented in v1).
+/// What lights do when ArtNet stops arriving (`[failsafe] mode`). Parsed once at
+/// startup so the run loop never re-matches a config string, and so adding a mode
+/// is a compile error everywhere it must be handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailsafeMode {
+    /// Keep the last commanded state forever (the lights hold it themselves).
+    Hold,
+    /// Force brightness to 0 (light stays powered and connected).
+    Blackout,
+    /// Send a BLE power-off.
+    PowerOff,
+}
+
+impl FailsafeMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "hold" => Some(Self::Hold),
+            "blackout" => Some(Self::Blackout),
+            "poweroff" => Some(Self::PowerOff),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FailsafeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Hold => "hold",
+            Self::Blackout => "blackout",
+            Self::PowerOff => "poweroff",
+        })
+    }
+}
+
+/// Known failsafe modes, in [`FailsafeMode`] order (config-facing names).
 pub const KNOWN_FAILSAFE_MODES: &[&str] = &["hold", "blackout", "poweroff"];
 
 impl Config {
@@ -339,7 +373,7 @@ impl Config {
 
     /// Structural validation independent of any hardware being present.
     pub fn validate(&self) -> Result<()> {
-        if !KNOWN_FAILSAFE_MODES.contains(&self.failsafe.mode.as_str()) {
+        if FailsafeMode::parse(&self.failsafe.mode).is_none() {
             bail!(
                 "failsafe.mode {:?} unknown; expected one of {KNOWN_FAILSAFE_MODES:?}",
                 self.failsafe.mode
@@ -442,14 +476,15 @@ impl Config {
             if l.universe > 32767 {
                 bail!("{who}: universe {} out of range (0..=32767)", l.universe);
             }
-            if l.address < 1 || l.address > 512 {
-                bail!("{who}: address {} out of range (1..=512)", l.address);
+            let universe_size = crate::artnet::DMX_UNIVERSE_SIZE;
+            if l.address < 1 || l.address > universe_size {
+                bail!("{who}: address {} out of range (1..={universe_size})", l.address);
             }
-            // The whole profile must fit within the 512-channel universe.
+            // The whole profile must fit within the universe.
             let last = l.address as u32 + profile.channel_count() as u32 - 1;
-            if last > 512 {
+            if last > universe_size as u32 {
                 bail!(
-                    "{who}: profile {:?} ({} ch) at address {} runs to channel {} (>512)",
+                    "{who}: profile {:?} ({} ch) at address {} runs to channel {} (>{universe_size})",
                     l.profile, profile.channel_count(), l.address, last
                 );
             }
