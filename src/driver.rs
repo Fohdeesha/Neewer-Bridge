@@ -28,6 +28,14 @@ impl Driver {
     /// auto-detected, so it must be set explicitly). `cmd_type` is the config's
     /// per-light `commandType` (2 ⇒ MAC-embedded advanced-mode frames).
     pub fn resolve(driver_cfg: &str, profile: Profile, mac: [u8; 6], ble_name: &str, cmd_type: u8) -> Driver {
+        // KNOWN SIMPLIFICATION: GM support is inferred from the PROFILE, not the
+        // model - any light on a GM-carrying profile (cct_gm/full/advanced) gets
+        // the app's 4-byte cct4 frame. Every fixture hardware-tested so far
+        // (TL120C/TL21C/TL60/TL97C) accepts cct4, but an old classic panel that
+        // only parses the 2-byte form would silently ignore CCT if configured
+        // with full/advanced. If such a fixture ever surfaces, the fix is a
+        // per-light gm/capability field fed from the models.toml catalog (which
+        // already knows supports_gm) rather than widening this guess.
         let supports_gm = matches!(profile, Profile::CctGm | Profile::Full | Profile::Advanced);
         let mac_frames = cmd_type == 2;
         match driver_cfg {

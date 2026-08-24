@@ -519,14 +519,16 @@ impl Config {
 /// backslashes and quotes are escaped, control characters become spaces. BLE
 /// names are usually tame, but a stray quote must not produce an unparsable
 /// config (append_light validates before writing, so it would fail safe — this
-/// makes it succeed instead).
+/// makes it succeed instead). TOML bans U+0000..U+0008, U+000A..U+001F AND
+/// U+007F (DEL) in basic strings, so DEL must be spaced out too, or a name
+/// carrying it would still fail validation.
 fn toml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
-            c if (c as u32) < 0x20 => out.push(' '),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => out.push(' '),
             c => out.push(c),
         }
     }
@@ -591,7 +593,20 @@ pub fn seed_from_example(path: &Path) -> Result<Option<PathBuf>> {
 /// omits the `name =` line entirely (log labels then fall back to the MAC)
 /// rather than writing a useless `name = ""`.
 pub fn append_light(path: &Path, light: &LightCfg) -> Result<()> {
-    let mut text = std::fs::read_to_string(path).unwrap_or_default();
+    // Only a genuinely-missing file may be treated as empty. Any other read
+    // failure (permissions, I/O error, non-UTF-8 content) MUST abort: falling
+    // through with an empty string would make the write below replace the
+    // user's whole config with a file holding nothing but this one light.
+    let mut text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "reading {} — refusing to append to a config that exists but cannot be read",
+                path.display()
+            )))
+        }
+    };
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
@@ -823,6 +838,58 @@ port = 6999
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.lights[0].name.as_deref(), Some("Key \"main\" \\ rig"));
         assert_eq!(loaded.lights[1].name, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_light_refuses_an_unreadable_config() {
+        // A config that EXISTS but cannot be read (here: invalid UTF-8) must be
+        // a hard error: the old `read_to_string(..).unwrap_or_default()` treated
+        // every read failure as "empty file" and the validated write below then
+        // REPLACED the user's whole config with one holding only the new light.
+        let path = std::env::temp_dir().join(format!("nb_unreadable_{}.toml", std::process::id()));
+        let original: &[u8] = &[0xFF, 0xFE, b'j', b'u', b'n', b'k'];
+        std::fs::write(&path, original).unwrap();
+        let light = LightCfg {
+            mac: "AA:BB:CC:DD:EE:03".into(),
+            name: None,
+            driver: "auto".into(),
+            profile: "full".into(),
+            universe: 0,
+            address: 1,
+            power_on_connect: true,
+            cct_min: DEFAULT_CCT_MIN,
+            cct_max: DEFAULT_CCT_MAX,
+            cmd_type: 2,
+        };
+        let err = append_light(&path, &light).expect_err("unreadable config must be an error");
+        assert!(format!("{err:#}").contains("cannot be read"), "got: {err:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the file must be left untouched");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_light_survives_a_del_in_the_name() {
+        // U+007F (DEL) is banned in TOML basic strings just like the C0 controls
+        // (it is a valid BLE-name byte); toml_escape must space it out or the
+        // validated write fails on a name the escape function exists to save.
+        let path = std::env::temp_dir().join(format!("nb_del_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let light = LightCfg {
+            mac: "AA:BB:CC:DD:EE:04".into(),
+            name: Some(format!("Key{}rig", char::from(0x7F))),
+            driver: "auto".into(),
+            profile: "full".into(),
+            universe: 0,
+            address: 1,
+            power_on_connect: true,
+            cct_min: DEFAULT_CCT_MIN,
+            cct_max: DEFAULT_CCT_MAX,
+            cmd_type: 2,
+        };
+        append_light(&path, &light).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.lights[0].name.as_deref(), Some("Key rig"));
         let _ = std::fs::remove_file(&path);
     }
 

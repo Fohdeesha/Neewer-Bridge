@@ -71,6 +71,8 @@ scan_pause_secs  = 15    # idle gap between bursts (s) so a powered-off/flaky li
 #   hold     = keep last state forever (Neewer lights hold their setting)
 #   blackout = after timeout, set brightness to 0 (light stays powered/connected)
 #   poweroff = after timeout, send BLE power-off
+# The silence clock starts at bridge startup: booting with the console already
+# down triggers the failsafe timeout_secs after start, same as losing it live.
 mode         = "hold"
 timeout_secs = 0         # 0 = never act (hold); >0 = act after N seconds of silence
 
@@ -113,7 +115,10 @@ max_files     = 5         # how many rotated files to keep (older are deleted)
 # power_on_connect = true         # power the light on at connect. Until the first
 #                                 # ArtNet packet arrives it shows a deterministic
 #                                 # baseline (CCT 3200K @ 50%); a streaming console
-#                                 # overwrites that within its refresh interval
+#                                 # overwrites that within its refresh interval.
+#                                 # false = hands-off: the bridge sends NOTHING to
+#                                 # the light (no power, no colour) until the first
+#                                 # ArtNet data for it arrives
 # # CCT scaling range, raw x100K (25 = 2500K, 100 = 10000K). Per-model — check the
 # # manual. Default 32..56 (3200..5600K); e.g. the TL120C is 25..100 (2500..10000K).
 # cct_min  = 32

@@ -65,6 +65,12 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LightState {
     pub power: bool,
+    /// True only for the bridge's initial pre-ArtNet seed of a light configured
+    /// with `power_on_connect = false`: a PASSIVE "off" — the bridge must not
+    /// touch the light's power at all (the user said hands-off at connect), as
+    /// opposed to an ACTIVE off demanded by DMX or the poweroff failsafe. The
+    /// mapper and the failsafe never set this; any real state replaces the seed.
+    pub seed: bool,
     pub mode: Mode,
     pub brightness: u8,
     pub cct: u8,
@@ -142,6 +148,7 @@ impl Default for LightState {
     fn default() -> Self {
         LightState {
             power: false,
+            seed: false,
             mode: Mode::Cct,
             brightness: 50,
             cct: 32, // 3200K

@@ -13,6 +13,39 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.2.1] — 2026-08-24
+
+### Fixed
+
+- **A single oversized UDP datagram could crash the whole bridge on Windows.**
+  `recv_from` into the old 1024-byte buffer fails with WSAEMSGSIZE there (Linux
+  silently truncates instead), and a listener error is deliberately fatal — so
+  any packet over 1024 bytes sent to the ArtNet port took the bridge down. The
+  receive buffer now covers the maximum UDP payload, and Windows' spurious
+  connection-reset notifications on UDP sockets are ignored instead of fatal.
+- **`power_on_connect = false` powered the light OFF at connect.** It now means
+  what it says: the bridge sends nothing at all to that light — no power, no
+  colour — until the first ArtNet data for it arrives. (The failsafe's poweroff
+  still applies after reconnects once the light is being driven.)
+- `add` could replace a config file it failed to read (permissions, disk error,
+  non-UTF-8 bytes) with one containing only the new light; every read failure
+  except "file does not exist" is now a hard error that leaves the file alone.
+- A crashed per-light task now brings the bridge down with a clear error
+  (restartable by a supervisor) instead of leaving that one light silently
+  dead — stuck on its last colour, never reconnecting — while the bridge
+  reported healthy.
+- Status notifications with a valid-looking header but a corrupt body are now
+  dropped: replies are checksum-verified whenever the complete frame is present
+  (truncated notifications still decode, matching the official app's behaviour).
+- The model catalog carried the CB200B Pro twice under two spellings; the
+  duplicate is folded away (140 models) and a test now rejects any future
+  case-insensitive duplicates.
+- `test --set rgbcw:` accepted a brightness up to 255 and sent it as-is; it is
+  now validated to the documented 0–100 like every other probe.
+- A light name containing the DEL control character no longer makes `add` fail.
+- `ota`: a resend request arriving before the first firmware block now re-sends
+  the OTA header (bounded retries) instead of stalling into a timeout.
+
 ## [1.2.0] — 2026-08-24
 
 ### Changed

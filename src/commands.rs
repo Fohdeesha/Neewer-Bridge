@@ -1090,6 +1090,13 @@ fn build_set_plan(mac: [u8; 6], spec: &str) -> Result<SetPlan> {
             };
             let (r, g, b) = (u8n(1, "r")?, u8n(2, "g")?, u8n(3, "b")?);
             let (cw, ww, bri) = (optu8(4, "cw", 0)?, optu8(5, "ww", 0)?, optu8(6, "bri", 100)?);
+            // bri is a percentage like every other probe's: without this check a
+            // `bri:200` would be sent verbatim and the probe would report a value
+            // outside the documented 0..=100 range ("never send what you didn't
+            // report" - the same rule the `bounded` helpers exist for).
+            if bri > 100 {
+                bail!("--set {spec}: bri must be 0..=100, got {bri}");
+            }
             let (frame, form) = if parts[0] == "rgbcwmac" {
                 (classic::rgbcw_mac(mac, bri, r, g, b, cw, ww, 0), "by-MAC 0xA9 (production form — should render)")
             } else {
@@ -1519,6 +1526,29 @@ async fn ota_transfer(
                         let frame = ota::block_frame(kind, block, ota::HEADER_STD);
                         ble::write_ota_frame(peripheral, write, &frame, chunk_delay).await?;
                     }
+                } else {
+                    // Resend before any block: the only thing sent so far is the
+                    // header, so resend that. The app itself would do NOTHING
+                    // here (its sendData() no-ops while its block counter is
+                    // still -1, verified in the decompile), so a real device is
+                    // not expected to ask - but stalling into the silence
+                    // timeout with a misleading "mid-transfer" abort is strictly
+                    // worse than a retry: re-sending a 0x96 header commits
+                    // nothing (the device validates the check-code before Done),
+                    // and op=2 Restart shows the protocol tolerates
+                    // re-initialisation. Budgeted with the same counter as the
+                    // header-timeout path so a rejecting device still aborts.
+                    header_attempts += 1;
+                    if header_attempts >= 5 {
+                        bail!(
+                            "device keeps requesting a resend of the OTA header                              ({header_attempts} attempts) — aborting (nothing was committed)"
+                        );
+                    }
+                    warn!(
+                        attempt = header_attempts,
+                        "device requested a resend before any block — resending the header"
+                    );
+                    ble::write_ota_frame(peripheral, write, &header_frame, chunk_delay).await?;
                 }
             }
             ota::Ack::Restart => {
@@ -1614,6 +1644,8 @@ mod tests {
             "fx:99:80",           // no such effect
             "scene:20:80",        // 9-scene family only has 1..=9
             "rgbcw:300:0:0",      // channel > 255
+            "rgbcw:10:10:10:0:0:200",    // bri > 100 (percentage, not a channel)
+            "rgbcwmac:10:10:10:0:0:101", // same rule on the by-MAC form
         ] {
             assert!(build_set_plan(TEST_MAC, spec).is_err(), "{spec} should be rejected");
         }

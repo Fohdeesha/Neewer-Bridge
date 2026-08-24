@@ -23,7 +23,7 @@ Tested against real TL120C, TL21C, TL60 RGB, and TL97C fixtures.
    an ArtNet universe and DMX address, and writes the entry to `config.toml`
    (creating it from the bundled `config.example.toml` the first time, so you
    get the fully commented file). Run it once per light. The model is
-   recognized from the Bluetooth name (141 models known), so the driver,
+   recognized from the Bluetooth name (140 models known), so the driver,
    channel profile, and CCT range are filled in for you. `neewer-bridge lights`
    shows the channel map you ended up with.
 

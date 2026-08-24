@@ -1082,17 +1082,6 @@ cmd_type = 2
 supports_fx = true
 
 [[model]]
-name = "CB200B Pro"
-name_matches = ["CB200B Pro"]
-driver = "classic"
-supports_rgb = false
-supports_gm = true
-cct_min = 27
-cct_max = 65
-cmd_type = 2
-supports_fx = true
-
-[[model]]
 name = "CB300"
 name_matches = ["CB300"]
 driver = "classic"

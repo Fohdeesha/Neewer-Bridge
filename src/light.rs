@@ -253,15 +253,24 @@ impl LightActor {
                 _ = flush.tick() => {
                     let desired = *self.rx.borrow();
                     if Some(desired) != last_sent {
-                        let prev_power = last_sent.map(|l| l.power);
-                        if desired.power {
-                            // Power-on only on transition (or the first send).
-                            if prev_power != Some(true) {
+                        // Power transitions first (pure decision — see
+                        // `power_command` for the seed/failsafe corners).
+                        match power_command(last_sent.map(|l| l.power), &desired) {
+                            Some(true) => {
                                 info!(light = %label, "power on");
                                 ble::write_command(p, &chars.write, &driver.power(true))
                                     .await
                                     .map_err(|e| anyhow::anyhow!("power-on write failed: {e}"))?;
                             }
+                            Some(false) => {
+                                info!(light = %label, "power off");
+                                ble::write_command(p, &chars.write, &driver.power(false))
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!("power-off write failed: {e}"))?;
+                            }
+                            None => {}
+                        }
+                        if desired.power {
                             // The state command itself is per-frame at ArtNet rates,
                             // so it's debug (kept off the info console but in the file).
                             debug!(light = %label, state = %desired.summary(), "flush");
@@ -280,12 +289,6 @@ impl LightActor {
                                     tokio::time::sleep(PIXEL_FRAME_SPACING).await;
                                 }
                             }
-                        } else if prev_power != Some(false) {
-                            // Power-off only on transition (failsafe poweroff).
-                            info!(light = %label, "power off");
-                            ble::write_command(p, &chars.write, &driver.power(false))
-                                .await
-                                .map_err(|e| anyhow::anyhow!("power-off write failed: {e}"))?;
                         }
                         last_sent = Some(desired);
                     }
@@ -367,6 +370,32 @@ impl LightActor {
     }
 }
 
+/// The power frame (if any) the flush loop should send for a state transition.
+/// `prev_power` is the power of the last state flushed THIS session (`None` =
+/// nothing flushed yet — every session starts over, because a reconnected light
+/// may have been power-cycled and its true state is unknowable over this
+/// write-only protocol).
+///
+/// - Power-ON on any transition into `power = true`, including the first flush.
+/// - Power-OFF only for an ACTIVE off (DMX- or failsafe-demanded) not already
+///   sent. The passive `seed` off — the pre-ArtNet baseline of a light with
+///   `power_on_connect = false` — sends NOTHING: the user said hands-off, and
+///   actively powering the light off at connect (as the code once did) is the
+///   opposite of that. The poweroff failsafe still lands after a reconnect:
+///   its states carry `seed = false` and `prev_power` starts as `None`, so the
+///   off frame goes out.
+fn power_command(prev_power: Option<bool>, desired: &LightState) -> Option<bool> {
+    if desired.power {
+        (prev_power != Some(true)).then_some(true)
+    } else if desired.seed {
+        None
+    } else if prev_power != Some(false) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Last-seen status values, so the actor logs battery/temp/firmware at `info` only
 /// when they change (and at `debug` otherwise) instead of on every poll.
 #[derive(Default)]
@@ -439,5 +468,62 @@ async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6
         if it.peek().is_some() {
             tokio::time::sleep(QUERY_SPACING).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(power: bool, seed: bool) -> LightState {
+        LightState { power, seed, ..LightState::default() }
+    }
+
+    #[test]
+    fn power_on_is_sent_on_first_flush_and_transitions_only() {
+        // First flush of a power_on_connect = true seed (or any on state).
+        assert_eq!(power_command(None, &state(true, false)), Some(true));
+        // Unchanged on → nothing (the flush loop's skip already handles equal
+        // states; this guards the case where only non-power fields changed).
+        assert_eq!(power_command(Some(true), &state(true, false)), None);
+        // Off → on transition (DMX resuming after a poweroff failsafe).
+        assert_eq!(power_command(Some(false), &state(true, false)), Some(true));
+    }
+
+    #[test]
+    fn passive_seed_off_sends_nothing() {
+        // power_on_connect = false: the pre-ArtNet baseline must not touch the
+        // light's power — the old code actively sent power-OFF here, switching
+        // off a light the user had turned on manually.
+        assert_eq!(power_command(None, &state(false, true)), None);
+        // ...and stays silent however often the seed state is re-examined
+        // (e.g. after a blackout failsafe mutated only its brightness).
+        assert_eq!(power_command(Some(false), &state(false, true)), None);
+    }
+
+    #[test]
+    fn active_off_is_sent_even_on_first_flush() {
+        // The poweroff failsafe fired while this light was disconnected; on
+        // reconnect the first flushed state is an ACTIVE off (seed = false)
+        // and the off frame must go out — this is the corner that forbids a
+        // plain "only send off on an observed on→off transition" rule.
+        assert_eq!(power_command(None, &state(false, false)), Some(false));
+        // On → off transition (failsafe firing mid-session).
+        assert_eq!(power_command(Some(true), &state(false, false)), Some(false));
+        // Already sent off → don't repeat.
+        assert_eq!(power_command(Some(false), &state(false, false)), None);
+    }
+
+    #[test]
+    fn mapped_dmx_states_are_never_seeds() {
+        // map_dmx output must always be an active state — if this ever regressed,
+        // a DMX-driven light could be mistaken for a hands-off seed.
+        let st = crate::profile::map_dmx(
+            Profile::Rgb,
+            &[255, 0, 0],
+            crate::profile::CctRange::default(),
+        );
+        assert!(!st.seed);
+        assert!(st.power);
     }
 }

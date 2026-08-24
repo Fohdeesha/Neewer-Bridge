@@ -5,9 +5,9 @@
 //! driver — it identifies the light from its advertised BLE name and fills those
 //! in automatically (the same idea as NeewerLite's `lights.json`).
 //!
-//! The catalog is embedded in the binary (`include_str!`) so it always ships;
-//! `Catalog::load` also allows an external override file for field updates
-//! without a rebuild.
+//! The catalog is embedded in the binary (`include_str!`) so it always ships
+//! and a release can never lose it; updating it means regenerating the file
+//! and rebuilding (there is no runtime override path).
 
 use std::sync::OnceLock;
 
@@ -212,6 +212,39 @@ mod tests {
         assert_eq!((tl21.cct_min, tl21.cct_max), (25, 85));
         // Catalog is now broad (extracted from the Android DeviceConfigInfo table).
         assert!(c.models.len() > 100, "expected the full extracted catalog");
+    }
+
+    /// The embedded catalog must be internally consistent: `identify` matches
+    /// case-insensitively, so two models whose names differ only in case are the
+    /// same model twice — the later block is unreachable dead weight and drifts
+    /// silently if only one copy gets a future correction. Same for a product ID
+    /// or name_match claimed by two models: whichever the match loop visits
+    /// first wins, invisibly. This is the regression gate for the extractor's
+    /// merge step (it once emitted both "CB200B PRO" and "CB200B Pro").
+    #[test]
+    fn catalog_has_no_case_insensitive_duplicates() {
+        let c = Catalog::builtin();
+        let mut names = std::collections::HashMap::new();
+        let mut matches = std::collections::HashMap::new();
+        let mut pids = std::collections::HashMap::new();
+        for m in &c.models {
+            if let Some(prev) = names.insert(m.name.to_uppercase(), m.name.clone()) {
+                panic!("duplicate model name (case-insensitive): {prev:?} vs {:?}", m.name);
+            }
+            for nm in &m.name_matches {
+                if let Some(prev) = matches.insert(nm.to_uppercase(), (m.name.clone(), nm.clone())) {
+                    panic!(
+                        "name_match {nm:?} of model {:?} duplicates {prev:?} (case-insensitive)",
+                        m.name
+                    );
+                }
+            }
+            for id in &m.product_ids {
+                if let Some(prev) = pids.insert(id.clone(), m.name.clone()) {
+                    panic!("product id {id:?} of model {:?} already claimed by {prev:?}", m.name);
+                }
+            }
+        }
     }
 
     #[test]

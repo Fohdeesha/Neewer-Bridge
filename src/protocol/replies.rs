@@ -49,12 +49,29 @@ impl Reply {
 }
 
 /// Decode one notification frame. Returns `None` for frames that aren't ours, are
-/// too short for their reply code, or use a code we don't decode (the caller can
-/// still surface the raw bytes). All indexing is bounds-checked via `get`, so a
-/// MTU-truncated frame degrades to `None` rather than panicking.
+/// too short for their reply code, fail their checksum, or use a code we don't
+/// decode (the caller can still surface the raw bytes). All indexing is
+/// bounds-checked via `get`, so a MTU-truncated frame degrades to `None` rather
+/// than panicking.
+///
+/// Checksum validation is OPPORTUNISTIC: verified only when the full frame its
+/// LEN byte declares (3 header + LEN payload + checksum) is present. Real
+/// notifications routinely arrive truncated at the 20-byte default-MTU boundary
+/// (the TL120C's 27-byte version reply, for one), and every hardware-proven
+/// reference decodes those leniently - the official app's handler and
+/// verygeeky's replies.py both read fixed offsets with no checksum check at
+/// all. Rejecting truncated frames would break real telemetry; rejecting a
+/// COMPLETE frame with a bad sum only drops corrupt data.
 pub fn parse(data: &[u8]) -> Option<Reply> {
-    if data.len() < 2 || data[0] != 0x78 {
+    if data.len() < 3 || data[0] != 0x78 {
         return None;
+    }
+    let full = 3 + data[2] as usize + 1;
+    if data.len() >= full {
+        let sum = data[..full - 1].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+        if sum != data[full - 1] {
+            return None;
+        }
     }
     match data[1] {
         0x00 => {
@@ -120,6 +137,39 @@ mod tests {
         // 78 04 … mode@9 power@10.
         let f = [0x78, 0x04, 0x0a, 0, 0, 0, 0, 0, 0, 0x02, 0x01];
         assert_eq!(parse(&f), Some(Reply::State { mode: 2, on: true }));
+    }
+
+    /// Append the additive checksum to a frame body, completing it per its LEN.
+    fn ck(body: &[u8]) -> Vec<u8> {
+        let mut f = body.to_vec();
+        f.push(body.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        f
+    }
+
+    #[test]
+    fn complete_frame_with_valid_checksum_decodes() {
+        // 78 05 08 <MAC6> <pct> <spare> <ck> - a full 12-byte battery reply.
+        let f = ck(&[0x78, 0x05, 0x08, 1, 2, 3, 4, 5, 6, 0x50, 0x00]);
+        assert_eq!(f.len(), 12);
+        assert_eq!(parse(&f), Some(Reply::Battery { percent: 80 }));
+    }
+
+    #[test]
+    fn complete_frame_with_bad_checksum_is_rejected() {
+        let mut f = ck(&[0x78, 0x05, 0x08, 1, 2, 3, 4, 5, 6, 0x50, 0x00]);
+        let last = f.len() - 1;
+        f[last] ^= 0xFF;
+        assert_eq!(parse(&f), None, "a corrupt complete frame must not decode");
+    }
+
+    #[test]
+    fn truncated_frames_still_decode_leniently() {
+        // MTU truncation is real on this hardware (default ATT MTU carries 20
+        // bytes; the TL120C's version reply is 27) - a frame cut short of its
+        // declared LEN cannot be checksum-verified and must still decode, as
+        // the app and every reference implementation do.
+        let f = [0x78, 0x05, 0x08, 1, 2, 3, 4, 5, 6, 0x50]; // 10 of 12 bytes
+        assert_eq!(parse(&f), Some(Reply::Battery { percent: 80 }));
     }
 
     #[test]

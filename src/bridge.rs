@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
@@ -119,6 +120,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     // listener (lookup) and the failsafe task (push to all).
     let mut universe_map: HashMap<u16, Vec<Arc<Sink>>> = HashMap::new();
     let mut all_sinks: Vec<Arc<Sink>> = Vec::new();
+    // Actor tasks are supervised (join errors surface below): a panicked actor
+    // would otherwise leave its light silently dead - holding its last colour,
+    // never reconnecting - while the bridge reports healthy. LightActor::run
+    // loops forever, so ANY join is a failure.
+    let mut actors: JoinSet<String> = JoinSet::new();
     for light in &cfg.lights {
         let profile = Profile::parse(&light.profile).expect("validated profile");
         // Log the resolved personality per light at startup so the run log alone
@@ -150,7 +156,18 @@ pub async fn run(cfg: Config) -> Result<()> {
         // startup state" decision. With a console streaming (openHAB refreshes
         // at ~1.2 Hz) the baseline is visible for well under a second; it only
         // persists if the bridge restarts while the ArtNet source is down.
-        let initial = LightState { power: light.power_on_connect, ..LightState::default() };
+        // `seed` marks the power_on_connect = false baseline as PASSIVE: the
+        // actor then leaves the light's power completely alone at connect
+        // (previously it actively sent power-OFF — turning off a light the user
+        // had switched on manually, the opposite of "don't touch it"). The
+        // first real DMX state replaces the seed and normal power handling
+        // takes over. With power_on_connect = true the seed flag stays false so
+        // every failsafe/reconnect corner behaves exactly as before.
+        let initial = LightState {
+            power: light.power_on_connect,
+            seed: !light.power_on_connect,
+            ..LightState::default()
+        };
         let (tx, rx) = watch::channel(initial);
         let cct = CctRange { min: light.cct_min, max: light.cct_max };
         let sink = Arc::new(Sink {
@@ -172,7 +189,16 @@ pub async fn run(cfg: Config) -> Result<()> {
             cfg.ble.probe_secs,
             scan.clone(),
         );
-        tokio::spawn(actor.run());
+        let actor_label = light
+            .name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&light.mac)
+            .to_string();
+        actors.spawn(async move {
+            actor.run().await;
+            actor_label
+        });
     }
 
     // Shared "last ArtNet packet" timestamp, as millis since `base`.
@@ -230,6 +256,17 @@ pub async fn run(cfg: Config) -> Result<()> {
     );
 
     tokio::select! {
+        // A light actor ending is impossible in normal operation (run() loops
+        // forever) - a join here means the task panicked or was killed. That
+        // light would be invisibly dead for the rest of the process, so treat
+        // it like a dead ArtNet listener: fatal, supervisor-visible.
+        Some(res) = actors.join_next() => {
+            let err = match res {
+                Ok(light) => anyhow::anyhow!("light actor for {light} exited unexpectedly"),
+                Err(join_err) => anyhow::Error::from(join_err).context("a light actor panicked"),
+            };
+            return Err(err);
+        }
         _ = tokio::signal::ctrl_c() => {
             info!("Ctrl-C received — shutting down");
         }
@@ -271,6 +308,14 @@ fn failsafe_action(mode: FailsafeMode) -> Option<fn(&mut LightState) -> bool> {
 /// Spawn the ArtNet-loss failsafe task, unless the mode is `hold` or no timeout
 /// is set. While idle past the timeout, it forces blackout (brightness 0) or
 /// power-off on every light; normal ArtNet resumes immediately overwrite it.
+///
+/// The idle clock starts at PROCESS START, not at the first received packet: a
+/// bridge that boots with the console already down applies the failsafe
+/// `timeout_secs` after startup, exactly as if the signal had just been lost.
+/// Deliberate - "no signal for N seconds" should mean the same thing whether
+/// the signal vanished before or after the bridge started (and a deterministic
+/// blackout beats indefinitely holding the connect-time baseline). Documented
+/// at [failsafe] in config.example.toml.
 ///
 /// The mode is parsed once here rather than re-matched per tick, so the loop
 /// can't silently no-op on an unrecognised string.

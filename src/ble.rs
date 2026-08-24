@@ -173,7 +173,19 @@ pub async fn find_by_mac(adapter: &Adapter, target_mac: &str, timeout: Duration)
 
     let start = Instant::now();
     loop {
-        for p in adapter.peripherals().await.context("listing peripherals")? {
+        // Stop the scan we started before propagating a listing error - the
+        // plain `?` here used to leak a running scan on this path (the other
+        // two exits below stop it). Tool commands exit soon after, but a
+        // scan left running is exactly the adapter load the bridge's scan
+        // coordinator exists to prevent.
+        let peripherals = match adapter.peripherals().await.context("listing peripherals") {
+            Ok(list) => list,
+            Err(e) => {
+                let _ = adapter.stop_scan().await;
+                return Err(e);
+            }
+        };
+        for p in peripherals {
             if let Ok(Some(props)) = p.properties().await {
                 if mac_matches(&props.address.to_string(), target_bytes) {
                     let _ = adapter.stop_scan().await;

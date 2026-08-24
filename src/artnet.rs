@@ -117,10 +117,29 @@ pub async fn serve<F>(sock: UdpSocket, mut on_packet: F) -> Result<()>
 where
     F: FnMut(SocketAddr, ArtDmx),
 {
-    // Max ArtDmx = 18 header + 512 data = 530 bytes; round up.
-    let mut buf = vec![0u8; 1024];
+    // Max ArtDmx = 18 header + 512 data = 530 bytes — but the buffer must cover
+    // the maximum UDP payload (65,507 B) anyway: on Linux an oversized datagram
+    // is silently truncated to the buffer, but on Windows `recv_from` FAILS with
+    // WSAEMSGSIZE (os error 10040), which with a small buffer let one junk
+    // datagram from anywhere on the LAN kill the whole listener (empirically
+    // confirmed: a single 2000-byte datagram took the bridge down). Sized to the
+    // wire maximum, oversized junk is received whole, fails ArtDmx parsing, and
+    // is skipped like any other non-ArtDmx datagram.
+    let mut buf = vec![0u8; 65_536];
     loop {
-        let (n, src) = sock.recv_from(&mut buf).await.context("recv_from")?;
+        let (n, src) = match sock.recv_from(&mut buf).await {
+            Ok(v) => v,
+            // Windows surfaces async ICMP "port unreachable" notifications as a
+            // spurious WSAECONNRESET on a later recv — connectionless noise, not
+            // socket death. Skip it; anything else (adapter gone, socket closed)
+            // is a real listener failure and must stay fatal so a supervisor
+            // sees it (the 1.0.0 fatal-listener rule).
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                trace!(error = %e, "transient recv error ignored (connection reset)");
+                continue;
+            }
+            Err(e) => return Err(e).context("recv_from"),
+        };
         match parse_artdmx(&buf[..n]) {
             Some(pkt) => on_packet(src, pkt),
             None => trace!(%src, bytes = n, "ignored non-ArtDmx datagram"),
@@ -128,9 +147,17 @@ where
     }
 }
 
-/// How long a (source, port-address) key may go quiet before its sequence
-/// tracking is reset. A restarted sender (whose sequence numbering starts over)
-/// must never be locked out by the stale-window check below.
+/// How long a (source, port-address) key may go without a FRESH packet before
+/// its sequence tracking is reset. A restarted sender (whose sequence numbering
+/// starts over) must never be locked out by the stale-window check below — its
+/// out-of-window packets are dropped for at most this long, then adopted.
+///
+/// The clock deliberately runs from the last *accepted* packet, not the last
+/// received one: refreshing it on stale packets would lock a restarted console
+/// out forever (its every packet would look stale and keep the window "busy").
+/// The flip side — a sender stuck replaying an old sequence gets adopted after
+/// this window too — is harmless: resyncing to whatever the sender now emits is
+/// always safe, and duplicate values are deduplicated by the merge/flush layers.
 const SEQ_IDLE_RESET: Duration = Duration::from_secs(2);
 
 /// Cap on tracked (source, port-address) keys — purely defensive (a scanner
@@ -343,5 +370,54 @@ mod tests {
         let mut t = SeqTracker::with_idle_reset(Duration::ZERO);
         assert!(t.is_fresh(ip(1), 0, 200));
         assert!(t.is_fresh(ip(1), 0, 1)); // would be stale, but the key had "idled"
+    }
+
+    /// Regression test for the Windows oversized-datagram bug: `recv_from` into
+    /// a too-small buffer FAILS on Windows (WSAEMSGSIZE, os error 10040) instead
+    /// of truncating like Linux, and any listener error is fatal by design — so
+    /// with the old 1024-byte buffer, one junk datagram from anywhere on the LAN
+    /// killed the whole bridge. The buffer now covers the maximum UDP payload:
+    /// `serve` must survive oversized garbage and keep processing ArtDmx.
+    #[tokio::test]
+    async fn serve_survives_oversized_datagrams() {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(serve(sock, move |_src, pkt| {
+            let _ = tx.send(pkt);
+        }));
+
+        let send = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // 2000 bytes: the size empirically confirmed to kill the old listener.
+        send.send_to(&[0u8; 2000], addr).await.unwrap();
+        // The maximum UDP payload (65,507 B): must be received whole, not error.
+        // (Guarded send: some loopback stacks cap the send size — the datagram
+        // not being sendable at all is fine, we only care that receiving one
+        // never kills the listener.)
+        let _ = send.send_to(&vec![0xAAu8; 65_507], addr).await;
+
+        // A valid ArtDmx after the garbage proves the listener is still alive.
+        // Sent in a retry loop: the 65,507-byte junk can transiently exhaust the
+        // OS receive buffer (Windows defaults to 64 KiB) and drop the next
+        // datagram — ordinary lossy UDP, not a listener death, and exactly what
+        // a real console's continuous refresh rides out.
+        let valid = encode_artdmx(0x0001, 1, &[10, 20, 30]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let received = loop {
+            assert!(
+                Instant::now() < deadline,
+                "listener must still be alive after oversized datagrams"
+            );
+            send.send_to(&valid, addr).await.unwrap();
+            if let Ok(Some(pkt)) =
+                tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+            {
+                break pkt;
+            }
+        };
+        assert_eq!(received.port_address, 0x0001);
+        assert_eq!(received.data, vec![10, 20, 30]);
+        assert!(!server.is_finished(), "serve() must not have returned");
+        server.abort();
     }
 }
