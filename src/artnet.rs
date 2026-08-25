@@ -198,10 +198,16 @@ impl SeqTracker {
             return true; // sender disabled sequencing
         }
         let now = Instant::now();
-        if self.map.len() > SEQ_MAX_KEYS {
+        // Cap the map exactly as the merger caps its universe map: only a key
+        // that would GROW it can trigger the reset. `len() > CAP` let the map
+        // reach CAP + 1, and it also cleared on packets from senders already
+        // tracked — throwing away live sequence state the cap never needed to
+        // reclaim.
+        let key = (src, port_address);
+        if !self.map.contains_key(&key) && self.map.len() >= SEQ_MAX_KEYS {
             self.map.clear();
         }
-        match self.map.get_mut(&(src, port_address)) {
+        match self.map.get_mut(&key) {
             Some((last, seen)) if now.duration_since(*seen) < self.idle_reset => {
                 // Wrapped distance from the last accepted sequence. The sender
                 // skips 0 on wrap (…, 0xFF, 0x01, …), which wrapping_sub handles
@@ -216,7 +222,7 @@ impl SeqTracker {
             }
             _ => {
                 // New key, or idle past the reset window: accept and resync.
-                self.map.insert((src, port_address), (seq, now));
+                self.map.insert(key, (seq, now));
                 true
             }
         }
@@ -370,6 +376,32 @@ mod tests {
         let mut t = SeqTracker::with_idle_reset(Duration::ZERO);
         assert!(t.is_fresh(ip(1), 0, 200));
         assert!(t.is_fresh(ip(1), 0, 1)); // would be stale, but the key had "idled"
+    }
+
+    #[test]
+    fn seq_key_cap_never_exceeds_the_limit_or_evicts_a_live_sender() {
+        // The cap is defensive (a spoofed-source flood must not grow the map
+        // without bound), so it must (a) actually hold at SEQ_MAX_KEYS — the old
+        // `len() > CAP` check let the map reach CAP + 1 — and (b) only fire for
+        // a key that would GROW the map. It used to clear on ANY packet once
+        // over the cap, discarding live sequence state for senders that were
+        // already tracked and did not need reclaiming.
+        let mut t = SeqTracker::new();
+        for i in 0..SEQ_MAX_KEYS {
+            assert!(t.is_fresh(ip(1), i as u16, 1));
+            assert!(t.map.len() <= SEQ_MAX_KEYS, "cap exceeded at key {i}");
+        }
+        assert_eq!(t.map.len(), SEQ_MAX_KEYS, "the map should be exactly full");
+
+        // Sitting exactly at the cap, an ALREADY-TRACKED key must be served from
+        // its existing state — not trigger a reset. Proof: a stale sequence is
+        // still rejected, which is only possible if its entry survived.
+        assert!(!t.is_fresh(ip(1), 0, 1), "duplicate must still be dropped");
+        assert_eq!(t.map.len(), SEQ_MAX_KEYS, "a known key must not reset the map");
+
+        // A genuinely NEW key is what reclaims: the map resets and restarts.
+        assert!(t.is_fresh(ip(2), 9999, 1));
+        assert_eq!(t.map.len(), 1);
     }
 
     /// Regression test for the Windows oversized-datagram bug: `recv_from` into

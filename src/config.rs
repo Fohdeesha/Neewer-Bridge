@@ -358,16 +358,24 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Load the config, falling back to built-in defaults ONLY when the file
-    /// does not exist (so `scan`/`test`/`monitor` work out of the box). An
-    /// existing-but-broken file is a **hard error**, never silently replaced
-    /// with defaults — a config with one bad entry must not make `ota` or
-    /// `test` quietly run with the wrong adapter/port (this project has been
-    /// bitten by silently-wrong configs before; see the "all lights white"
-    /// entry in the README's troubleshooting section).
-    pub fn load_or_default(path: &Path) -> Result<Self> {
-        if path.is_file() {
-            Self::load(path)
+    /// What a command actually gets from a config load attempt.
+    ///
+    /// A **missing** file falls back to built-in defaults, so `scan`/`test`/
+    /// `monitor` work out of the box. An **existing but broken** one is a hard
+    /// error, never silently replaced with defaults — a config with one bad
+    /// entry must not make `ota` or `test` quietly run against the wrong
+    /// adapter/port (this project has been bitten by silently-wrong configs
+    /// before; see the "all lights white" entry in the README's troubleshooting
+    /// section).
+    ///
+    /// Takes the already-performed [`Config::load`] result and whether the file
+    /// exists, rather than reading the file itself: `main` needs both facts
+    /// anyway (logging is configured from the config before any command runs),
+    /// so one invocation reads and parses the config exactly once — and the
+    /// state `main` announces is provably the same one the command acts on.
+    pub fn for_command(path: &Path, exists: bool, loaded: Result<Self>) -> Result<Self> {
+        if exists {
+            loaded.with_context(|| format!("config {} exists but is invalid", path.display()))
         } else {
             Ok(Self::default())
         }
@@ -404,13 +412,38 @@ impl Config {
                 bail!("artnet input {:?}: port must be 1..=65535", inp.label);
             }
         }
+        // Labels are how an input is identified in every log line `monitor` and
+        // `run` emit, so two inputs sharing one make those lines undiagnosable.
+        // Checked on the RESOLVED labels, which also catches a name colliding
+        // with an auto-generated one (`primary`, `input1`, …).
+        for i in 0..inputs.len() {
+            for j in (i + 1)..inputs.len() {
+                if inputs[i].label == inputs[j].label {
+                    bail!(
+                        "two artnet inputs resolve to the same log label {:?} (inputs \
+                         #{} and #{}, where #0 is the primary [artnet] block) — give each \
+                         [[artnet.inputs]] a distinct `name`, and don't reuse `primary` \
+                         or `inputN`",
+                        inputs[i].label, i, j
+                    );
+                }
+            }
+        }
         // Two inputs on the identical (bind_ip, port) would be one stream split
         // arbitrarily between two lanes — always a config mistake. The same
         // port on two *specific* IPs is fine (the multi-IP use case), but a
         // wildcard bind claims the port on every interface, so mixing it with
         // any other input on that port would fail at bind time (EADDRINUSE on
         // Linux) — reject it here with a clearer message.
-        let is_wildcard = |ip: &str| matches!(ip.trim(), "0.0.0.0" | "::" | "[::]");
+        // Every spelling of the unspecified address, not just the three common
+        // ones: `::0` and `0:0:0:0:0:0:0:0` are the same wildcard as `::` and
+        // used to slip past this check, turning a clear config error into a bare
+        // EADDRINUSE at bind time. Parsing is what makes that exhaustive.
+        let is_wildcard = |ip: &str| {
+            let t = ip.trim();
+            let t = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(t);
+            t.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_unspecified())
+        };
         for i in 0..inputs.len() {
             for j in (i + 1)..inputs.len() {
                 if inputs[i].port != inputs[j].port {
@@ -464,6 +497,20 @@ impl Config {
                 if !KNOWN_LOG_LEVELS.contains(&lvl.to_lowercase().as_str()) {
                     bail!("{field} {lvl:?} unknown; expected one of {KNOWN_LOG_LEVELS:?}");
                 }
+            }
+        }
+        // Rotation sizes only matter when a file sink is configured. Zero is a
+        // typo, not a setting — it reads as "unlimited"/"no rotations" but the
+        // writer clamps it to 1, so the user silently gets a 1 MB / 1-file log.
+        // Say so instead of quietly doing something else (the same rule the
+        // [ble] zero-value checks above exist for). The condition below is the
+        // same "is the file sink on?" test logging::init uses.
+        if self.logging.file.as_deref().is_some_and(|p| !p.is_empty()) {
+            if self.logging.max_size_mb == 0 {
+                bail!("[logging] max_size_mb must be ≥ 1 (size in MB at which the log file rotates)");
+            }
+            if self.logging.max_files == 0 {
+                bail!("[logging] max_files must be ≥ 1 (how many rotated log files to keep)");
             }
         }
         for (i, l) in self.lights.iter().enumerate() {
@@ -631,7 +678,57 @@ pub fn append_light(path: &Path, light: &LightCfg) -> Result<()> {
     // Parse + validate the whole file before committing it to disk.
     let cfg: Config = toml::from_str(&text).context("the resulting config would not parse")?;
     cfg.validate().context("the resulting config would be invalid")?;
-    std::fs::write(path, &text).with_context(|| format!("writing {}", path.display()))?;
+    write_atomic(path, &text)?;
+    Ok(())
+}
+
+/// Replace `path`'s contents atomically: fill a sibling temp file, flush it to
+/// disk, then rename it over the target.
+///
+/// A plain `fs::write` truncates the existing file *first*, so a crash or power
+/// loss mid-write leaves the config empty or half-written. This is the only code
+/// path that rewrites the live `config.toml` — the very file the
+/// `config.example.toml` split exists to protect from being destroyed — so it
+/// gets the matching guarantee: the old contents stay intact until the complete
+/// new file is on disk, and the rename is atomic (same directory ⇒ same
+/// filesystem) and overwrites on both Unix and Windows.
+///
+/// NOT covered: an fsync of the *directory entry*, which POSIX additionally
+/// requires for the rename itself to survive a power loss. The file can never be
+/// torn either way; at worst the very last `add` is lost.
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    // Any failure past this point must not leave the temp file lying next to the
+    // user's config, so every error path clears it.
+    let filled = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        // Get the bytes to the platter before the rename makes them visible.
+        f.sync_all()
+    })();
+    if let Err(e) = filled {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e)
+            .context(format!("writing the temporary file {}", tmp.display())));
+    }
+
+    // A fresh temp file carries default (umask) permissions; carry over the ones
+    // the config already had so the rename can't silently loosen them.
+    // Best-effort: an exotic filesystem must not fail the whole `add`.
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e)
+            .context(format!("replacing {} with {}", path.display(), tmp.display())));
+    }
     Ok(())
 }
 
@@ -778,22 +875,109 @@ port = 6999
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The rule every command's config resolution follows. `main` serves it from
+    /// the single parse it already performed, so this is the only place the rule
+    /// itself is pinned.
     #[test]
-    fn load_or_default_missing_vs_broken() {
+    fn for_command_missing_vs_broken() {
         // Missing file → defaults (commands work out of the box).
         let missing = std::env::temp_dir().join(format!("nb_missing_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&missing);
-        let cfg = Config::load_or_default(&missing).unwrap();
+        let cfg = Config::for_command(&missing, false, Config::load(&missing)).unwrap();
         assert_eq!(cfg.artnet.port, crate::artnet::ARTNET_PORT);
 
         // Existing-but-broken file → hard error, NOT silent defaults.
         let broken = std::env::temp_dir().join(format!("nb_broken_{}.toml", std::process::id()));
         std::fs::write(&broken, "[artnet]]").unwrap();
-        assert!(Config::load_or_default(&broken).is_err());
+        assert!(Config::for_command(&broken, true, Config::load(&broken)).is_err());
         // Valid TOML that fails validation is also a hard error.
         std::fs::write(&broken, "[ble]\nflush_hz = 0\n").unwrap();
-        assert!(Config::load_or_default(&broken).is_err());
+        assert!(Config::for_command(&broken, true, Config::load(&broken)).is_err());
+
+        // A good file is passed straight through.
+        std::fs::write(&broken, "[artnet]\nport = 6789\n").unwrap();
+        let cfg = Config::for_command(&broken, true, Config::load(&broken)).unwrap();
+        assert_eq!(cfg.artnet.port, 6789);
         let _ = std::fs::remove_file(&broken);
+    }
+
+    /// `add` must never be able to leave the live config truncated or littered
+    /// with temp files — the whole point of the example/live split.
+    #[test]
+    fn append_light_replaces_the_config_atomically() {
+        let path = std::env::temp_dir().join(format!("nb_atomic_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Pre-existing settings the user would hate to lose.
+        std::fs::write(&path, "[artnet]\nport = 6789\n\n# keep this comment\n").unwrap();
+        let light = LightCfg {
+            mac: "AA:BB:CC:DD:EE:05".into(),
+            name: None,
+            driver: "auto".into(),
+            profile: "rgb".into(),
+            universe: 0,
+            address: 1,
+            power_on_connect: true,
+            cct_min: DEFAULT_CCT_MIN,
+            cct_max: DEFAULT_CCT_MAX,
+            cmd_type: 2,
+        };
+        append_light(&path, &light).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("port = 6789"), "existing settings must survive");
+        assert!(text.contains("# keep this comment"), "comments must survive");
+        assert_eq!(Config::load(&path).unwrap().lights.len(), 1);
+        assert!(!tmp.exists(), "the temp file must not be left behind");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Guards the error path of the atomic write: a failure while producing the
+    /// new contents must leave the user's config byte-identical and say clearly
+    /// what went wrong. That is the property that makes a torn write impossible
+    /// — the target is never opened for writing until a complete new file exists
+    /// beside it — and it is the closest a unit test can get, since the failure
+    /// the rename actually defends against (a crash or power loss between
+    /// truncate and write) can't be produced deterministically here.
+    ///
+    /// The failure is induced by making the temp path un-creatable: a directory
+    /// sits where the temp FILE would go, so `File::create` fails on every
+    /// platform.
+    #[test]
+    fn a_failed_write_leaves_the_existing_config_intact() {
+        let path = std::env::temp_dir().join(format!("nb_failwrite_{}.toml", std::process::id()));
+        let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let original = "[artnet]\nport = 6789\n\n# irreplaceable\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::create_dir(&tmp).unwrap(); // blocks the temp file
+
+        let light = LightCfg {
+            mac: "AA:BB:CC:DD:EE:06".into(),
+            name: None,
+            driver: "auto".into(),
+            profile: "rgb".into(),
+            universe: 0,
+            address: 1,
+            power_on_connect: true,
+            cct_min: DEFAULT_CCT_MIN,
+            cct_max: DEFAULT_CCT_MAX,
+            cmd_type: 2,
+        };
+        let err = append_light(&path, &light).expect_err("the write must fail here");
+        assert!(format!("{err:#}").contains("temporary file"), "got: {err:#}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the existing config must survive a failed write"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -961,6 +1145,88 @@ port = 6999
             c.artnet.inputs.push(ArtNetInput { name: None, bind_ip: "0.0.0.0".into(), port: 7000 + p });
         }
         assert!(c.validate().is_err()); // more than 7 extra inputs
+    }
+
+    #[test]
+    fn every_spelling_of_the_wildcard_address_is_caught() {
+        // The check used to compare against three literal strings, so `::0` and
+        // the fully-expanded form walked past it and failed at bind time with a
+        // bare EADDRINUSE instead of this message. Each of these binds the port
+        // on every interface, so pairing it with ANY other input on that port is
+        // a config error.
+        for wildcard in ["0.0.0.0", "::", "[::]", "::0", "0:0:0:0:0:0:0:0", " 0.0.0.0 ", "0000:0000:0000:0000:0000:0000:0000:0000"] {
+            let mut c = Config::default();
+            c.artnet.bind_ip = wildcard.into();
+            c.artnet.port = 6454;
+            c.artnet.inputs.push(ArtNetInput {
+                name: Some("console".into()),
+                bind_ip: "10.0.0.1".into(),
+                port: 6454,
+            });
+            let err = c.validate().expect_err(&format!("{wildcard} must be rejected"));
+            assert!(
+                format!("{err:#}").contains("wildcard address"),
+                "{wildcard}: wrong error: {err:#}"
+            );
+        }
+        // A specific address on a shared port stays legal — that IS the multi-IP
+        // use case, and over-matching here would break it.
+        let mut c = Config::default();
+        c.artnet.bind_ip = "10.0.0.2".into();
+        c.artnet.inputs.push(ArtNetInput {
+            name: Some("console".into()),
+            bind_ip: "10.0.0.1".into(),
+            port: 6454,
+        });
+        c.validate().unwrap();
+        // …including addresses that merely start with a zero.
+        c.artnet.bind_ip = "0.0.0.1".into();
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_input_labels() {
+        // Every `monitor`/`run` log line is tagged with the input label, so two
+        // inputs sharing one make those lines impossible to attribute.
+        let mut c = Config::default();
+        c.artnet.inputs.push(ArtNetInput {
+            name: Some("console".into()),
+            bind_ip: "0.0.0.0".into(),
+            port: 6455,
+        });
+        c.artnet.inputs.push(ArtNetInput {
+            name: Some("console".into()),
+            bind_ip: "0.0.0.0".into(),
+            port: 6456,
+        });
+        assert!(c.validate().is_err(), "two inputs named 'console' must be rejected");
+
+        // A name colliding with an auto-generated label counts too.
+        c.artnet.inputs[1].name = Some("primary".into());
+        assert!(c.validate().is_err(), "a name may not collide with the primary label");
+
+        c.artnet.inputs[1].name = Some("desk".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_log_rotation_sizes() {
+        // Zero reads as "unlimited" but the writer clamps it to 1, so the user
+        // would silently get a 1 MB / 1-file log. Only checked when a file sink
+        // is actually configured.
+        let mut c = Config::default();
+        c.logging.max_size_mb = 0;
+        assert!(c.validate().is_ok(), "no file sink ⇒ rotation settings are inert");
+
+        c.logging.file = Some("bridge.log".into());
+        assert!(c.validate().is_err(), "max_size_mb = 0 with a file sink must be rejected");
+
+        c.logging.max_size_mb = 10;
+        c.logging.max_files = 0;
+        assert!(c.validate().is_err(), "max_files = 0 must be rejected");
+
+        c.logging.max_files = 5;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

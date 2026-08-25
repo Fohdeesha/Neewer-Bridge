@@ -1,9 +1,18 @@
 [package]
 name = "neewer-bridge"
-version = "1.2.1"
+version = "1.3.0"
 edition = "2021"
 description = "ArtNet (DMX-over-UDP) to Neewer Bluetooth light control bridge"
 license = "MIT"
+# Minimum supported Rust, VERIFIED by building + testing the locked tree on it
+# (not inferred). The floor comes from a transitive dependency, not our code:
+# `time@0.3.52` (via tracing-subscriber) requires 1.88, while the newest std API
+# we use ourselves is `is_multiple_of` (1.87). Declaring it means an old
+# toolchain fails with "requires rustc 1.88 or newer" instead of a pile of
+# cryptic compile errors — the release workflow uses whatever Rust the GitHub
+# runner image ships, so this is the guardrail on that. Re-verify with
+# `cargo +<ver> test --locked` if the lockfile is ever regenerated.
+rust-version = "1.88"
 
 [[bin]]
 name = "neewer-bridge"

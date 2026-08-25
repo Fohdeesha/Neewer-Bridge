@@ -31,7 +31,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::artnet::{self, ArtDmx, SeqTracker};
 
@@ -134,6 +134,13 @@ impl Merger {
 
     pub fn timeout_enabled(&self) -> bool {
         !self.timeout.is_zero()
+    }
+
+    /// How many inputs this merger was built for. [`serve_all`] checks its
+    /// socket list against this, so a mismatched pair fails at the call instead
+    /// of panicking inside a spawned task on the first packet.
+    pub fn input_count(&self) -> usize {
+        self.n_inputs
     }
 
     /// Feed one ArtDmx worth of data from `input`. Returns whether the merged
@@ -310,6 +317,31 @@ fn reassign_orphans(u: &mut UniverseMerge) -> bool {
     changed
 }
 
+/// Record which sender an input has been hearing for a universe, and report the
+/// FIRST one the moment a second, different sender appears.
+///
+/// The merger keeps one lane per **input**, not per sender, so two sources
+/// pointed at the same socket end up sharing a lane and the merge rules can no
+/// longer tell them apart (in `ltp` the "did this source change?" test starts
+/// comparing one source's value against the other's, and an override stops
+/// being sticky). Callers warn once per input; the fix is a separate
+/// `[[artnet.inputs]]` entry per source.
+///
+/// The map is capped like the merger's own universe map — a scanner spraying
+/// port-addresses must not grow it without bound.
+fn note_sender(
+    seen: &mut HashMap<(usize, u16), std::net::IpAddr>,
+    input: usize,
+    port_address: u16,
+    src: std::net::IpAddr,
+) -> Option<std::net::IpAddr> {
+    if seen.len() >= MAX_UNIVERSES && !seen.contains_key(&(input, port_address)) {
+        seen.clear();
+    }
+    let first = *seen.entry((input, port_address)).or_insert(src);
+    (first != src).then_some(first)
+}
+
 /// One bound ArtNet input socket + its log label.
 pub struct Input {
     pub sock: UdpSocket,
@@ -359,6 +391,13 @@ where
     M: FnMut(u16, &[u8], bool),
 {
     let n = inputs.len();
+    if n != merger.input_count() {
+        anyhow::bail!(
+            "internal: {n} ArtNet inputs bound but the merger was built for {} — \
+             build both with bind_inputs()",
+            merger.input_count()
+        );
+    }
     let labels: Vec<String> = inputs.iter().map(|i| i.label.clone()).collect();
     // Bounded hand-off from the listener tasks to this merge/dispatch loop. If
     // the queue ever fills (it shouldn't — merging is microseconds), dropping a
@@ -390,6 +429,18 @@ where
     // Source-expiry only matters across inputs; with one input the failsafe
     // already covers total loss, so skip the prune ticks entirely.
     let prune_enabled = merger.timeout_enabled() && n > 1;
+    // The merger keeps one lane per INPUT, not per sender — so two consoles
+    // pointed at the same socket share a lane and the merge rules can no longer
+    // tell them apart (in `ltp` the "last changed" test compares each source
+    // against the OTHER's last value, and an override stops being sticky).
+    // Detect it and say so ONCE PER INPUT for the whole run (`shared_warned`):
+    // the remedy is the same however many universes collide on that input —
+    // give it its own [[artnet.inputs]] entry — so one warning carries
+    // everything the operator needs, and a badly-wired input can't spam the log.
+    // Only meaningful while merging is actually active — with one input the
+    // merger is a pass-through.
+    let mut senders: HashMap<(usize, u16), std::net::IpAddr> = HashMap::new();
+    let mut shared_warned: Vec<bool> = vec![false; n];
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -415,6 +466,21 @@ where
                     debug!(input = %labels[idx], %src, port = pkt.port_address,
                            seq = pkt.sequence, "stale ArtDmx dropped");
                     continue;
+                }
+                if n > 1 && !shared_warned[idx] {
+                    if let Some(first) =
+                        note_sender(&mut senders, idx, pkt.port_address, src.ip())
+                    {
+                        shared_warned[idx] = true;
+                        warn!(
+                            input = %labels[idx], port = pkt.port_address,
+                            first = %first, also = %src.ip(),
+                            "two ArtNet sources are sending the same universe to ONE input — \
+                             they share a merge lane, so the merge cannot tell them apart; \
+                             give each source its own [[artnet.inputs]] entry (own port \
+                             and/or bind_ip)"
+                        );
+                    }
                 }
                 let (changed, merged) =
                     merger.ingest(idx, pkt.port_address, &pkt.data, Instant::now());
@@ -674,6 +740,51 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0], (0, vec![10, 200]));
         assert_eq!(merged[1], (0, vec![20, 200])); // HTP across the two inputs
+    }
+
+    /// `note_sender` tracks per (input, universe) and flags the first sender the
+    /// moment a second one appears on that pair. NOTE: `serve_all` additionally
+    /// latches the WARNING per input, so only the first collision an input sees
+    /// is ever logged — this covers the tracking, not the log gating.
+    #[test]
+    fn note_sender_flags_a_second_sender_per_input_and_universe() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let ip = |d| IpAddr::V4(Ipv4Addr::new(10, 0, 0, d));
+        let mut seen = HashMap::new();
+
+        // First sender for (input 0, universe 0): nothing to report.
+        assert_eq!(note_sender(&mut seen, 0, 0, ip(1)), None);
+        // Same sender again: still nothing.
+        assert_eq!(note_sender(&mut seen, 0, 0, ip(1)), None);
+        // A SECOND sender on the same input+universe: they share a merge lane.
+        assert_eq!(note_sender(&mut seen, 0, 0, ip(2)), Some(ip(1)));
+
+        // A different input is tracked separately (that IS the correct setup).
+        assert_eq!(note_sender(&mut seen, 1, 0, ip(2)), None);
+        // As is a different universe on the same input (no lane is shared).
+        assert_eq!(note_sender(&mut seen, 0, 7, ip(2)), None);
+    }
+
+    #[tokio::test]
+    async fn serve_all_rejects_a_merger_sized_for_a_different_input_count() {
+        // A mismatched (sockets, merger) pair used to panic inside a spawned
+        // listener task on the first packet — `ingest`'s bounds assert. Fail at
+        // the call instead. Both real call sites go through `bind_inputs`, so
+        // this only guards the API.
+        let (s1, _) = bind_local().await;
+        let (s2, _) = bind_local().await;
+        let err = serve_all(
+            vec![
+                Input { sock: s1, label: "primary".into() },
+                Input { sock: s2, label: "second".into() },
+            ],
+            Merger::new(MergeMode::Htp, Duration::from_secs(10), 1),
+            |_, _, _, _| {},
+            |_, _, _| {},
+        )
+        .await
+        .expect_err("2 inputs with a 1-input merger must be rejected");
+        assert!(format!("{err:#}").contains("merger was built for 1"));
     }
 
     #[tokio::test]

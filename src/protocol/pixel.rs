@@ -157,6 +157,20 @@ pub const EFFECT_TWO_MOVING: u8 = 4;
 pub const EFFECT_THREE_MOVING: u8 = 5;
 pub const EFFECT_FIRE: u8 = 7;
 
+/// The effect id [`paint`] will ACTUALLY render for `effect`: the ids that work
+/// over direct BLE pass through, anything else falls back to ColorReplacement.
+///
+/// Exposed so callers can report what really goes on the wire instead of echoing
+/// the id they were handed (`test --set pixel:…` does). Keeping the rule here
+/// rather than duplicating `paint`'s match at each call site is what stops the
+/// two drifting apart — `paint_falls_back_to_color_replacement` pins them together.
+pub fn rendered_effect(effect: u8) -> u8 {
+    match effect {
+        EFFECT_SINGLE_MOVING | EFFECT_TWO_MOVING | EFFECT_THREE_MOVING | EFFECT_FIRE => effect,
+        _ => EFFECT_COLOR_REPLACEMENT,
+    }
+}
+
 /// Build the ordered GATT-write frames to render `blocks` across the tube using
 /// pixel `effect` (one of the 5 working ids above; anything else → ColorReplacement):
 /// the params sub-frame, then the palette sub-frame(s). `bri` is master brightness
@@ -171,6 +185,8 @@ pub const EFFECT_FIRE: u8 = 7;
 pub fn paint(mac: [u8; 6], blocks: &[Block], bri: u8, effect: u8, speed: u8, dir: u8) -> Vec<Vec<u8>> {
     let blocks = &blocks[..blocks.len().min(8)];
     let bg = blocks.first().copied().unwrap_or(Block::Off);
+    // One source of truth for the fallback (see `rendered_effect`).
+    let effect = rendered_effect(effect);
     match effect {
         EFFECT_SINGLE_MOVING | EFFECT_TWO_MOVING | EFFECT_THREE_MOVING => {
             let n = (effect - 2) as usize; // 3→1, 4→2, 5→3 moving colours
@@ -303,6 +319,34 @@ mod tests {
         assert_eq!(frames[1][10], 1); // subIndex 1
         // palette effectData after [wire,sub] = bg(3) + 2×3 = 9 bytes; LEN = 6+2+9=17.
         assert_eq!(frames[1][2], (6 + 2 + 9) as u8);
+    }
+
+    /// `rendered_effect` must agree with what `paint` actually puts on the wire
+    /// for EVERY id, or the `--set pixel:` description would report an effect
+    /// the fixture never receives.
+    #[test]
+    fn paint_falls_back_to_color_replacement() {
+        let blocks = [Block::Off, Block::Hsi { hue: 0, sat: 100 }];
+        for id in 0..=12u8 {
+            let frames = paint(MAC, &blocks, 100, id, 40, 1);
+            // effectData starts after [0x78, 0xB0, LEN] + 6 MAC bytes.
+            let on_the_wire = frames[0][9];
+            assert_eq!(
+                on_the_wire,
+                rendered_effect(id),
+                "paint({id}) emitted effect {on_the_wire}, rendered_effect says {}",
+                rendered_effect(id)
+            );
+            // The palette sub-frame must carry the same id as the params frame.
+            assert_eq!(frames[1][9], on_the_wire, "params/palette id mismatch for {id}");
+        }
+        // The five that work pass through; everything else becomes 1.
+        assert_eq!(rendered_effect(3), 3);
+        assert_eq!(rendered_effect(7), 7);
+        assert_eq!(rendered_effect(1), 1);
+        for id in [0u8, 2, 6, 8, 9, 10, 200] {
+            assert_eq!(rendered_effect(id), EFFECT_COLOR_REPLACEMENT, "id {id}");
+        }
     }
 
     #[test]

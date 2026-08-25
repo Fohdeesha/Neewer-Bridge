@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use neewer_bridge::config::{self, Config};
 use neewer_bridge::{bridge, commands, logging};
@@ -59,7 +59,7 @@ enum Command {
         /// Protocol driver: auto | classic | infinity | home (default: from model).
         #[arg(long)]
         driver: Option<String>,
-        /// DMX profile: cct | cct_gm | hsi | rgbcw | full | advanced | pixel (default: from model).
+        /// DMX profile: cct | cct_gm | hsi | rgb | rgbcw | full | advanced | pixel (default: from model).
         #[arg(long)]
         profile: Option<String>,
         /// ArtNet universe / Port-Address (required with --mac).
@@ -103,10 +103,10 @@ enum Command {
         /// Comma-separated channel values, e.g. 255,128,64.
         #[arg(long, value_delimiter = ',', required = true)]
         channels: Vec<u8>,
-        /// Stream at this rate (Hz). Omit for a single packet.
+        /// Stream at this rate (0.001-10000 Hz). Omit for a single packet.
         #[arg(long)]
         hz: Option<f64>,
-        /// Stream duration in seconds (with --hz).
+        /// Stream duration in seconds, greater than 0 up to 86400 (with --hz).
         #[arg(long, default_value_t = 2.0)]
         seconds: f64,
     },
@@ -155,8 +155,10 @@ enum Command {
         ///   pixel:<hue,hue,...>:<eff>:<speed>  e.g. pixel:0,240:1:40
         ///   pixfx:<id>                    per-effect pixel probe (id 1-10, app defaults)
         ///   rgbcwmac:<r>:<g>:<b>[:cw:ww:bri] RGBCW via by-MAC 0xA9 (production form; rgbcw: = direct 0xA8, ignored)
+        ///   raw:<hex>                     send an arbitrary frame verbatim, e.g. raw:78D00048 (protocol spelunking)
         ///   warmdim                       dim warm white (safe end state)
-        /// Non-CCT/pixel specs first send a CCT-white frame to clear any pixel/FX latch.
+        /// Most specs paint a CCT-white frame first, as a known baseline: a frame the
+        /// fixture ignores then leaves it white instead of holding its previous look.
         #[arg(long)]
         set: Option<String>,
         /// Read device status (firmware version, battery, temperature, power/mode) and
@@ -212,6 +214,19 @@ enum Command {
     Run,
 }
 
+impl Command {
+    /// Whether this command reads the config file at all.
+    ///
+    /// The three that don't are exactly the ones a first-run user reaches for
+    /// *before* they have a config, so a "config file not found" warning there
+    /// is pure noise. Anything that touches BLE needs `[ble] adapter`, and
+    /// anything that listens needs `[artnet]`, so the default is `true` — a new
+    /// subcommand only opts out deliberately.
+    fn needs_config(&self) -> bool {
+        !matches!(self, Command::Adapters | Command::Models | Command::ArtnetSend { .. })
+    }
+}
+
 /// Resolve the config path. An explicit `--config` is used as-is; otherwise
 /// prefer `config.toml` next to the executable, falling back to `config.toml`
 /// in the working directory (the historical default).
@@ -247,6 +262,41 @@ fn same_dir(a: &Path, b: &Path) -> bool {
         (Some(x), Some(y)) => x == y,
         _ => false,
     }
+}
+
+/// Absolute path for display in the startup log.
+///
+/// `canonicalize` is what makes the "which config actually won?" line
+/// unambiguous — the resolver prefers a `config.toml` beside the executable over
+/// the working directory, and that line is the README's first troubleshooting
+/// step. But on Windows canonicalize returns an *extended-length* path
+/// (`\\?\C:\…`), a spelling nothing else prints — including the "exists but
+/// FAILED to load" warning about the very same file, and every error the
+/// commands raise. One run rendering one path two different ways is exactly the
+/// confusion this line exists to remove, so the prefix comes back off.
+fn display_path(path: &Path) -> PathBuf {
+    strip_verbatim(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// Undo Windows' `\\?\` extended-length prefix, where a plain equivalent exists.
+/// A no-op on other platforms and on any path without one.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let Some(s) = path.to_str() else { return path };
+    // \\?\UNC\server\share\x → \\server\share\x  (dropping the whole
+    // prefix here would leave `server\share\x`, a different path entirely).
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // Only a drive path has a plain form. The same prefix also fronts device
+        // namespaces (`\\?\Volume{…}`) that are NOT valid without it — those must
+        // be printed exactly as they are.
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return PathBuf::from(rest);
+        }
+    }
+    path
 }
 
 /// One-line "here's how to get a config" hint for the not-found paths. Names
@@ -308,40 +358,65 @@ async fn main() {
     // ignored) with nothing in the log to explain it. Print the absolute path so
     // it's unambiguous which file on disk was consulted. A file that exists but
     // fails to parse/validate must never be announced as "loaded".
-    let shown = std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
-    match (&loaded, config_path.is_file()) {
+    //
+    // Stat the file ONCE here and hand the answer to `dispatch`, so the state
+    // announced below and the state the command acts on cannot disagree.
+    let exists = config_path.is_file();
+    let needs_config = cli.command.as_ref().is_none_or(Command::needs_config);
+    let shown = display_path(&config_path);
+    match (&loaded, exists) {
         (Ok(_), _) => info!(config = %shown.display(), "loaded config"),
+        // Always surfaced, even for commands that don't read the config: a
+        // broken file also means `[logging]` silently fell back to defaults.
         (Err(e), true) => warn!(
             config = %shown.display(),
             error = %format!("{e:#}"),
             "config file exists but FAILED to load — commands that need it will refuse to run"
         ),
-        (Err(_), false) => warn!(
+        (Err(_), false) if needs_config => warn!(
             config = %config_path.display(),
             "config file not found — using built-in defaults (no lights will be driven); {}",
             config_hint(&config_path)
         ),
+        // `adapters`/`models`/`artnet-send` never read it, so having no config
+        // is simply normal for them — don't tell a new user off for it.
+        (Err(_), false) => debug!(
+            config = %config_path.display(),
+            "no config file (this command doesn't need one)"
+        ),
     }
 
-    if let Err(e) = dispatch(&cli, &config_path).await {
+    if let Err(e) = dispatch(&cli, &config_path, exists, loaded).await {
         // Print the full error chain for debuggability.
         error!("{:#}", e);
+        // Drop the logging guards explicitly: `process::exit` runs no
+        // destructors, so without this the non-blocking file writer could be
+        // torn down with this very error still queued — losing the one line
+        // that explains the exit.
+        drop(_log_guards);
         std::process::exit(1);
     }
 }
 
-async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
+/// Run the selected command. `loaded` is the single config parse `main` already
+/// performed (logging needs the config before anything else runs) and `exists`
+/// the single stat that went with it — reusing both keeps one file read per
+/// invocation instead of two or three, and keeps `main`'s announcement and the
+/// command's view of the config in lockstep.
+async fn dispatch(
+    cli: &Cli,
+    config_path: &Path,
+    exists: bool,
+    loaded: Result<Config>,
+) -> Result<()> {
     // No subcommand ⇒ run the bridge (`neewer-bridge` alone just runs).
     let command = cli.command.as_ref().unwrap_or(&Command::Run);
-    // scan/test/monitor/… don't require a config FILE — a missing one falls back
-    // to defaults so the tools work out of the box. An existing-but-invalid file
-    // is a hard error for every command (load_or_default): silently proceeding on
-    // defaults would run `ota`/`test` against the wrong adapter or `monitor` on
-    // the wrong port with nothing but a mislabelled log line to show for it.
-    let load = || {
-        Config::load_or_default(config_path)
-            .with_context(|| format!("config {} exists but is invalid", config_path.display()))
-    };
+    // The missing-vs-broken rule lives in `Config::for_command`; this just
+    // serves it from the parse `main` already did.
+    //
+    // `FnOnce`: it consumes `loaded`. Only one match arm ever runs, so calling
+    // it from several of them is fine.
+    let load = move || Config::for_command(config_path, exists, loaded);
     match command {
         Command::Adapters => commands::adapters().await,
         Command::Scan { seconds, all, json } => {
@@ -354,7 +429,7 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
             // of being a bare file holding only the light just added. Purely a
             // convenience — if no example is on disk, `append_light` creates the
             // file from scratch as before.
-            if !config_path.is_file() {
+            if !exists {
                 match config::seed_from_example(config_path) {
                     Ok(Some(example)) => info!(
                         config = %config_path.display(),
@@ -368,7 +443,15 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
                     ),
                 }
             }
-            let cfg = load()?;
+            // A config we just seeded postdates `main`'s parse, so read it back
+            // rather than serving the "no config" defaults for it.
+            let cfg = if !exists && config_path.is_file() {
+                Config::load(config_path).with_context(|| {
+                    format!("loading the config just created at {}", config_path.display())
+                })?
+            } else {
+                load()?
+            };
             match mac {
                 Some(mac) => {
                     let universe = universe.context("--universe is required with --mac")?;
@@ -383,9 +466,17 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
             }
         }
         Command::Models => commands::models(),
+        // `lights` reports the configured channel map, so — like `run` — a
+        // missing config is an error, not an empty table.
         Command::Lights => {
-            let cfg = Config::load(config_path)
-                .with_context(|| format!("loading config {} (required for `lights`)", config_path.display()))?;
+            if !exists {
+                anyhow::bail!(
+                    "no config file at {} — {}",
+                    config_path.display(),
+                    config_hint(config_path)
+                );
+            }
+            let cfg = load()?;
             commands::lights(&cfg)
         }
         Command::Inspect { mac, seconds } => {
@@ -446,16 +537,62 @@ async fn dispatch(cli: &Cli, config_path: &Path) -> Result<()> {
         // missing one is the first-run case, so say how to make one rather than
         // surfacing a bare "No such file or directory".
         Command::Run => {
-            if !config_path.is_file() {
+            if !exists {
                 anyhow::bail!(
                     "no config file at {} — {}",
                     config_path.display(),
                     config_hint(config_path)
                 );
             }
-            let cfg = Config::load(config_path)
-                .with_context(|| format!("loading config {} (required for `run`)", config_path.display()))?;
+            let cfg = load()?;
             bridge::run(cfg).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbatim_prefix_is_stripped_for_display() {
+        let s = |p: &str| strip_verbatim(PathBuf::from(p)).to_string_lossy().into_owned();
+        // What `canonicalize` actually hands back on Windows, and what used to
+        // reach the `loaded config` line while every other mention of the same
+        // file printed the plain form.
+        assert_eq!(s(r"\\?\C:\Users\me\config.toml"), r"C:\Users\me\config.toml");
+        assert_eq!(s(r"\\?\D:\"), r"D:\");
+        // A UNC path keeps its `\\server\share` form — stripping the whole
+        // prefix would silently name a different path.
+        assert_eq!(s(r"\\?\UNC\server\share\config.toml"), r"\\server\share\config.toml");
+        // Device namespaces are not valid without the prefix; leave them alone.
+        assert_eq!(s(r"\\?\Volume{9f8a}\config.toml"), r"\\?\Volume{9f8a}\config.toml");
+        // Everything already plain is returned untouched, on any platform.
+        assert_eq!(s("/root/neewer-bridge/config.toml"), "/root/neewer-bridge/config.toml");
+        assert_eq!(s(r"C:\already\plain.toml"), r"C:\already\plain.toml");
+    }
+
+    #[test]
+    fn display_path_is_absolute_and_carries_no_verbatim_prefix() {
+        // The table above compares hand-written literals against hand-written
+        // literals, so a typo in BOTH cancels out — which is exactly what
+        // happened once (every `\\?\` was written with one backslash, the test
+        // agreed with itself, and the running binary still logged the prefix).
+        // This checks the real thing instead: canonicalize a file that actually
+        // exists and assert the displayed form still names it.
+        let path = std::env::temp_dir().join("neewer-bridge-display-path.probe");
+        std::fs::write(&path, b"x").expect("temp file");
+        let shown = display_path(&path);
+        let text = shown.to_string_lossy().into_owned();
+        assert!(
+            !text.starts_with(r"\\?\"),
+            "display path still carries the verbatim prefix: {text}"
+        );
+        // …and it is still the same file, not a mangled one.
+        assert_eq!(
+            std::fs::canonicalize(&shown).expect("displayed path must still resolve"),
+            std::fs::canonicalize(&path).unwrap()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

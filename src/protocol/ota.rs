@@ -168,10 +168,28 @@ fn truncate_name(name: &str) -> &[u8] {
 ///   `cn.java:2138` — note the length field is `data.len() + 1`, little-endian).
 ///
 /// `data` must be non-empty and within the block size; callers slice the image
-/// into `kind.block_size()`-byte chunks (last one short).
+/// into `kind.block_size()`-byte chunks (last one short) with [`block_at`].
+///
+/// Over-long `data` is **clamped** to `kind.block_size()` rather than encoded,
+/// for the same reason [`Header::frame`] truncates the name: LEN must equal the
+/// true payload count on these two-chip fixtures — the radio→LED-MCU UART
+/// reassembler reframes by that length, not by ATT boundaries — and the raw
+/// cast used to wrap silently (300 bytes emitted LEN 44; a 65535-byte Pro block
+/// emitted a length field of 0), producing a malformed frame mid-flash. A
+/// clamped block instead fails the device's additive check-code at the end of
+/// the transfer, which is the protocol's own clean, retryable abort. Callers in
+/// this crate slice with `block_at` so neither path is reachable; the clamp
+/// keeps it unreachable for any future caller of this public API too.
 pub fn block_frame(kind: BlockKind, data: &[u8], header_byte: u8) -> Vec<u8> {
+    // Clamp first, then assert the post-condition — the same shape as
+    // `Header::frame`. After the clamp a Std128 length (<= 128) fits a u8 and a
+    // Pro4096 `len + 1` (<= 4097) fits a u16, so neither field below can wrap and
+    // the assert can never fire; it is there to catch a future change to the
+    // block sizes, not to police callers.
+    let data = &data[..data.len().min(kind.block_size())];
     match kind {
         BlockKind::Std128 => {
+            debug_assert!(data.len() <= u8::MAX as usize);
             let mut f = Vec::with_capacity(data.len() + 4);
             f.push(header_byte);
             f.push(0x97);
@@ -180,8 +198,10 @@ pub fn block_frame(kind: BlockKind, data: &[u8], header_byte: u8) -> Vec<u8> {
             with_checksum(f)
         }
         BlockKind::Pro4096 => {
+            // i.e. `len + 1` still fits the u16 length field.
+            debug_assert!(data.len() < u16::MAX as usize);
             let mut f = Vec::with_capacity(data.len() + 5);
-            let len_plus_1 = (data.len() as u16).wrapping_add(1);
+            let len_plus_1 = (data.len() + 1) as u16;
             f.push(header_byte);
             f.push(0xCF);
             f.extend_from_slice(&len_plus_1.to_le_bytes());
@@ -359,6 +379,24 @@ mod tests {
     }
 
     #[test]
+    fn for_image_derives_size_and_check_code_from_the_image() {
+        // `Header::for_image` is the single source of truth for the two fields
+        // the device validates the transfer against; the OTA command used to
+        // re-derive them by hand into a struct literal instead.
+        let image: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
+        let h = Header::for_image(&image, [3, 0, 5], "TL60 RGB-3");
+        assert_eq!(h.size, 5000);
+        assert_eq!(h.check_code, check_code(&image));
+        assert_eq!(h.version, [3, 0, 5]);
+        assert_eq!(h.name, "TL60 RGB-3");
+        assert_eq!(h.header_byte, HEADER_STD);
+        // …and the frame it encodes carries exactly those numbers.
+        let f = h.frame();
+        assert_eq!(&f[6..10], &h.size.to_be_bytes());
+        assert_eq!(&f[10..14], &h.check_code.to_be_bytes());
+    }
+
+    #[test]
     fn block_frame_std128() {
         let data = [0xAA, 0xBB, 0xCC];
         let f = block_frame(BlockKind::Std128, &data, HEADER_STD);
@@ -378,6 +416,34 @@ mod tests {
         let f = block_frame(BlockKind::Std128, &data, HEADER_STD);
         assert_eq!(f[2], 0x80);
         assert_eq!(f.len(), 128 + 4);
+    }
+
+    #[test]
+    fn block_frame_length_field_always_describes_the_real_payload() {
+        // The invariant the two-chip UART reassembler depends on: the declared
+        // length must equal the bytes that follow it. The raw casts this replaces
+        // wrapped silently — 300 bytes of Std128 data emitted a len byte of 44,
+        // and a 65535-byte Pro4096 block emitted a length field of 0 — which is a
+        // malformed frame in the middle of a firmware flash.
+        for kind in [BlockKind::Std128, BlockKind::Pro4096] {
+            let bs = kind.block_size();
+            for n in [1usize, 2, 127, 128, 255, 256, 300, bs, bs + 1, bs * 2, 65535, 70000] {
+                let f = block_frame(kind, &vec![0xA5u8; n], HEADER_STD);
+                // Over-long data is clamped, never encoded with a wrapped length.
+                let payload = n.min(bs);
+                let (declared, header_len) = match kind {
+                    BlockKind::Std128 => (f[2] as usize, 3),
+                    BlockKind::Pro4096 => {
+                        (u16::from_le_bytes([f[2], f[3]]) as usize - 1, 4)
+                    }
+                };
+                assert_eq!(declared, payload, "{kind:?} declared len for {n} bytes");
+                assert_eq!(f.len(), header_len + payload + 1, "{kind:?} frame size for {n}");
+                assert_eq!(&f[header_len..f.len() - 1], &vec![0xA5u8; payload][..]);
+                let sum: u32 = f[..f.len() - 1].iter().map(|&b| b as u32).sum();
+                assert_eq!(*f.last().unwrap(), sum as u8, "{kind:?} checksum for {n}");
+            }
+        }
     }
 
     #[test]

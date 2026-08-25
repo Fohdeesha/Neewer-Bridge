@@ -1,6 +1,7 @@
 //! `run` orchestration: spawn one BLE actor per configured light, start the
-//! shared scan, feed mapped ArtDmx into each light's `watch` channel, and run
-//! the ArtNet-loss failsafe.
+//! discovery-scan coordinator (which scans only while a light is missing — see
+//! `scan.rs`), feed mapped ArtDmx into each light's `watch` channel, and run the
+//! ArtNet-loss failsafe.
 //!
 //! Data flow:
 //!   ArtNet UDP → parse → per-universe lookup → map_dmx → watch::Sender
@@ -28,6 +29,11 @@ use crate::merge;
 use crate::profile::{extract_slice, map_dmx, CctRange, Profile};
 use crate::protocol::LightState;
 use crate::scan;
+
+/// Names for the supervised background tasks, used in the fatal error when one
+/// of them ends (see the `background` JoinSet in [`run`]).
+const SCAN_TASK: &str = "BLE discovery-scan coordinator";
+const FAILSAFE_TASK: &str = "ArtNet-loss failsafe";
 
 /// One DMX consumer: where a light lives in a universe and how to push to it.
 struct Sink {
@@ -103,23 +109,35 @@ pub async fn run(cfg: Config) -> Result<()> {
     // connections on a cheap USB controller and makes the kernel log
     // `LE Set Scan Enable` timeouts (see scan.rs).
     let scan = scan::ScanCoordinator::new();
-    tokio::spawn(scan::run(
-        adapter.clone(),
-        scan.clone(),
-        Duration::from_secs(cfg.ble.scan_window_secs),
-        Duration::from_secs(cfg.ble.scan_pause_secs),
-    ));
+    // Long-lived background tasks, supervised in the same select! as the light
+    // actors. Both of these loop forever, so ANY completion — a return or a
+    // panic — is a failure, and an UNSUPERVISED one would be silent: a dead scan
+    // coordinator means no light is ever discovered again (every disconnected
+    // light waits forever) and a dead failsafe means the rig never goes safe,
+    // both while the bridge carries on logging as if healthy. That is exactly the
+    // failure mode the actor and listener supervision below exists to prevent, so
+    // these get the same treatment. The payload is the task's name, for the error.
+    let mut background: JoinSet<&'static str> = JoinSet::new();
+    {
+        let adapter = adapter.clone();
+        let scan = scan.clone();
+        let window = Duration::from_secs(cfg.ble.scan_window_secs);
+        let pause = Duration::from_secs(cfg.ble.scan_pause_secs);
+        background.spawn(async move {
+            scan::run(adapter, scan, window, pause).await;
+            SCAN_TASK
+        });
+    }
     info!(
         scan_window_secs = cfg.ble.scan_window_secs,
         scan_pause_secs = cfg.ble.scan_pause_secs,
         "BLE discovery-scan coordinator started (scans only while a light is disconnected)"
     );
 
-    // Build the universe → sinks map (+ a flat list for the failsafe task) and
-    // spawn one actor per light. Sinks are shared via Arc between the ArtNet
-    // listener (lookup) and the failsafe task (push to all).
+    // Build the universe → sinks map and spawn one actor per light. Sinks are
+    // shared via Arc between the ArtNet listener (lookup) and the failsafe task
+    // (which pushes to the sinks of whichever universe went quiet).
     let mut universe_map: HashMap<u16, Vec<Arc<Sink>>> = HashMap::new();
-    let mut all_sinks: Vec<Arc<Sink>> = Vec::new();
     // Actor tasks are supervised (join errors surface below): a panicked actor
     // would otherwise leave its light silently dead - holding its last colour,
     // never reconnecting - while the bridge reports healthy. LightActor::run
@@ -171,15 +189,14 @@ pub async fn run(cfg: Config) -> Result<()> {
         let (tx, rx) = watch::channel(initial);
         let cct = CctRange { min: light.cct_min, max: light.cct_max };
         let sink = Arc::new(Sink {
-            label,
+            label: label.clone(),
             address: light.address,
             profile,
             cct,
             tx,
             starved: AtomicBool::new(false),
         });
-        universe_map.entry(light.universe).or_default().push(sink.clone());
-        all_sinks.push(sink);
+        universe_map.entry(light.universe).or_default().push(sink);
 
         let actor = LightActor::new(
             light.clone(),
@@ -189,38 +206,46 @@ pub async fn run(cfg: Config) -> Result<()> {
             cfg.ble.probe_secs,
             scan.clone(),
         );
-        let actor_label = light
-            .name
-            .as_deref()
-            .filter(|n| !n.is_empty())
-            .unwrap_or(&light.mac)
-            .to_string();
         actors.spawn(async move {
             actor.run().await;
-            actor_label
+            label
         });
     }
 
-    // Shared "last ArtNet packet" timestamp, as millis since `base`.
+    // Failsafe bookkeeping: one "last ArtDmx seen" clock per CONFIGURED
+    // universe, as millis since `base`. Per universe, not global, so a live
+    // source on one universe can't hold the failsafe off for lights patched to
+    // another; and keyed by configured universe, so foreign ArtNet on a shared
+    // lighting LAN (a console broadcasting universes we drive nothing on) is
+    // ignored entirely rather than counting as "signal present".
     let base = Instant::now();
-    let last_artnet = Arc::new(AtomicU64::new(0));
+    let clocks: HashMap<u16, Arc<AtomicU64>> =
+        universe_map.keys().map(|&u| (u, Arc::new(AtomicU64::new(0)))).collect();
+    let failsafe_universes: Vec<UniverseClock> = universe_map
+        .iter()
+        .map(|(&universe, sinks)| UniverseClock {
+            universe,
+            last_seen: clocks[&universe].clone(),
+            sinks: sinks.clone(),
+        })
+        .collect();
 
-    spawn_failsafe(&cfg, base, last_artnet.clone(), all_sinks);
+    spawn_failsafe(&mut background, &cfg, base, failsafe_universes);
 
     // ArtNet listeners + merge/dispatch pump (merge.rs) — receives on every
     // input, sequence-filters per input, merges per channel, and pushes the
     // merged universes into the light sinks. The sockets were bound above, so
     // the only way this task ends is a receive error — which the select! below
     // treats as fatal.
-    let last_for_listener = last_artnet.clone();
     let listener = tokio::spawn(async move {
         merge::serve_all(
             bound,
             merger,
-            // Any ArtDmx on any input (even a stale one) proves a source is
-            // alive, so it feeds the failsafe timer before the sequence check.
-            move |_idx, _label, _src, _pkt| {
-                last_for_listener.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
+            // ArtDmx on any input (even a stale one) proves that universe's
+            // source is alive, so it feeds the failsafe clock before the
+            // sequence check.
+            move |_idx, _label, _src, pkt| {
+                note_artnet(&clocks, pkt.port_address, base.elapsed().as_millis() as u64);
             },
             move |port_address, data, _changed| {
                 // Dispatch even when the merge is unchanged: the failsafe task
@@ -267,6 +292,17 @@ pub async fn run(cfg: Config) -> Result<()> {
             };
             return Err(err);
         }
+        // Same rule for the background tasks (scan coordinator, failsafe): both
+        // loop forever, so any join is a panic or an impossible early return.
+        // Left unsupervised these die silently — no discovery ever again, or a
+        // rig that never goes safe — while everything else keeps running.
+        Some(res) = background.join_next() => {
+            let err = match res {
+                Ok(name) => anyhow::anyhow!("{name} task exited unexpectedly"),
+                Err(join_err) => anyhow::Error::from(join_err).context("a background task panicked"),
+            };
+            return Err(err);
+        }
         _ = tokio::signal::ctrl_c() => {
             info!("Ctrl-C received — shutting down");
         }
@@ -305,12 +341,35 @@ fn failsafe_action(mode: FailsafeMode) -> Option<fn(&mut LightState) -> bool> {
     }
 }
 
-/// Spawn the ArtNet-loss failsafe task, unless the mode is `hold` or no timeout
-/// is set. While idle past the timeout, it forces blackout (brightness 0) or
-/// power-off on every light; normal ArtNet resumes immediately overwrite it.
+/// One configured universe's failsafe bookkeeping: when ArtDmx for it was last
+/// seen (millis since the bridge's `base` instant) and the lights it drives.
+struct UniverseClock {
+    universe: u16,
+    last_seen: Arc<AtomicU64>,
+    sinks: Vec<Arc<Sink>>,
+}
+
+/// Record the arrival of ArtDmx for `port_address` against the per-universe
+/// failsafe clocks.
 ///
-/// The idle clock starts at PROCESS START, not at the first received packet: a
-/// bridge that boots with the console already down applies the failsafe
+/// Traffic for a universe no light is patched to is **ignored**: ArtNet is
+/// routinely broadcast, so on a shared lighting LAN a console streaming
+/// universes this bridge drives nothing on would otherwise hold the failsafe
+/// off forever — the failsafe would simply never fire.
+fn note_artnet(clocks: &HashMap<u16, Arc<AtomicU64>>, port_address: u16, elapsed_ms: u64) {
+    if let Some(clock) = clocks.get(&port_address) {
+        clock.store(elapsed_ms, Ordering::Relaxed);
+    }
+}
+
+/// Spawn the ArtNet-loss failsafe task, unless the mode is `hold`, no timeout is
+/// set, or no lights are configured. Each universe is timed independently: when
+/// one goes quiet past the timeout, the lights patched to *that* universe are
+/// forced to blackout (brightness 0) or power-off, while universes still
+/// receiving data carry on untouched. Resumed ArtNet immediately overwrites it.
+///
+/// Each universe's idle clock starts at PROCESS START, not at its first received
+/// packet: a bridge that boots with the console already down applies the failsafe
 /// `timeout_secs` after startup, exactly as if the signal had just been lost.
 /// Deliberate - "no signal for N seconds" should mean the same thing whether
 /// the signal vanished before or after the bridge started (and a deterministic
@@ -319,7 +378,17 @@ fn failsafe_action(mode: FailsafeMode) -> Option<fn(&mut LightState) -> bool> {
 ///
 /// The mode is parsed once here rather than re-matched per tick, so the loop
 /// can't silently no-op on an unrecognised string.
-fn spawn_failsafe(cfg: &Config, base: Instant, last_artnet: Arc<AtomicU64>, sinks: Vec<Arc<Sink>>) {
+///
+/// Spawned into `tasks` rather than detached, so a panic in the loop is fatal and
+/// supervisor-visible instead of silently disarming the failsafe for the rest of
+/// the process (see the `background` JoinSet in [`run`]). The three early returns
+/// below are the legitimate "nothing to run" cases and spawn no task at all.
+fn spawn_failsafe(
+    tasks: &mut JoinSet<&'static str>,
+    cfg: &Config,
+    base: Instant,
+    universes: Vec<UniverseClock>,
+) {
     // Validated at config load; `hold` is also the right fallback for anything
     // unexpected (do nothing rather than blackout a rig on a typo).
     let mode = FailsafeMode::parse(&cfg.failsafe.mode).unwrap_or(FailsafeMode::Hold);
@@ -329,30 +398,54 @@ fn spawn_failsafe(cfg: &Config, base: Instant, last_artnet: Arc<AtomicU64>, sink
         warn!(%mode, "failsafe.timeout_secs = 0 → behaves like 'hold'");
         return;
     }
+    if universes.is_empty() {
+        return; // no lights ⇒ nothing to fail safe
+    }
 
-    tokio::spawn(async move {
-        let mut tick = interval(Duration::from_millis(500));
-        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut announced = false;
-        loop {
-            tick.tick().await;
-            let idle_ms = (base.elapsed().as_millis() as u64)
-                .saturating_sub(last_artnet.load(Ordering::Relaxed));
+    tasks.spawn(async move {
+        failsafe_loop(mode, timeout_ms, base, universes, action).await;
+        FAILSAFE_TASK
+    });
+}
+
+/// The failsafe tick loop. Never returns — extracted from [`spawn_failsafe`] so
+/// the spawned future has a concrete `&'static str` output for the supervisor.
+async fn failsafe_loop(
+    mode: FailsafeMode,
+    timeout_ms: u64,
+    base: Instant,
+    universes: Vec<UniverseClock>,
+    action: fn(&mut LightState) -> bool,
+) {
+    let mut tick = interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut announced = vec![false; universes.len()];
+    loop {
+        tick.tick().await;
+        let now_ms = base.elapsed().as_millis() as u64;
+        for (i, u) in universes.iter().enumerate() {
+            let idle_ms = now_ms.saturating_sub(u.last_seen.load(Ordering::Relaxed));
             if idle_ms < timeout_ms {
-                announced = false;
+                announced[i] = false;
                 continue;
             }
-            if !announced {
-                warn!(%mode, idle_secs = idle_ms / 1000, "ArtNet lost — applying failsafe");
-                announced = true;
+            if !announced[i] {
+                warn!(
+                    %mode,
+                    universe = u.universe,
+                    lights = u.sinks.len(),
+                    idle_secs = idle_ms / 1000,
+                    "ArtNet lost for this universe — applying failsafe"
+                );
+                announced[i] = true;
             }
-            for s in &sinks {
+            for s in &u.sinks {
                 // send_if_modified only notifies the actor on an actual change,
                 // so a held failsafe costs nothing after the first tick.
                 s.tx.send_if_modified(action);
             }
         }
-    });
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +500,35 @@ mod tests {
     }
 
     #[test]
+    fn artnet_for_an_unconfigured_universe_does_not_feed_the_failsafe() {
+        // ArtNet is routinely broadcast. Before this, ANY ArtDmx reaching the
+        // port reset the (then global) idle clock, so a console streaming
+        // universes we drive nothing on kept the failsafe from ever firing.
+        let clocks: HashMap<u16, Arc<AtomicU64>> =
+            [(0u16, Arc::new(AtomicU64::new(0)))].into_iter().collect();
+
+        note_artnet(&clocks, 0, 5_000);
+        assert_eq!(clocks[&0].load(Ordering::Relaxed), 5_000);
+
+        note_artnet(&clocks, 9999, 9_000);
+        assert_eq!(clocks[&0].load(Ordering::Relaxed), 5_000, "foreign universe must not count");
+        assert_eq!(clocks.len(), 1, "an unconfigured universe must not be tracked");
+    }
+
+    #[test]
+    fn each_universe_keeps_its_own_idle_clock() {
+        // Lights on two universes: traffic on one must not vouch for the other.
+        let clocks: HashMap<u16, Arc<AtomicU64>> =
+            [(0u16, Arc::new(AtomicU64::new(0))), (1u16, Arc::new(AtomicU64::new(0)))]
+                .into_iter()
+                .collect();
+
+        note_artnet(&clocks, 0, 7_000);
+        assert_eq!(clocks[&0].load(Ordering::Relaxed), 7_000);
+        assert_eq!(clocks[&1].load(Ordering::Relaxed), 0, "universe 1 has heard nothing");
+    }
+
+    #[test]
     fn failsafe_actions_are_edge_triggered() {
         // The mutators must report "changed" only on the first application, so a
         // failsafe that is already applied stops waking the per-light actor.
@@ -425,6 +547,79 @@ mod tests {
         assert!(!st.power);
         assert!(!poweroff(&mut st));
         assert_eq!(st.brightness, 80, "poweroff must not touch brightness");
+    }
+
+    #[tokio::test]
+    async fn failsafe_fires_per_universe_not_globally() {
+        // Two universes, one still receiving and one gone quiet. The live one
+        // must NOT vouch for the dead one: only the dead universe's lights
+        // black out. (Real time — the task reads std::time::Instant, which
+        // tokio's clock control does not drive.)
+        let mut cfg = Config::default();
+        cfg.failsafe.mode = "blackout".into();
+        cfg.failsafe.timeout_secs = 1;
+
+        let (live, live_rx) = sink(1, Profile::Rgb);
+        let (dead, dead_rx) = sink(1, Profile::Rgb);
+        // Start both lit, as a mapped DMX state would.
+        live.tx.send(LightState { brightness: 80, power: true, ..LightState::default() }).unwrap();
+        dead.tx.send(LightState { brightness: 80, power: true, ..LightState::default() }).unwrap();
+
+        let base = Instant::now();
+        let live_clock = Arc::new(AtomicU64::new(0));
+        let universes = vec![
+            UniverseClock { universe: 0, last_seen: live_clock.clone(), sinks: vec![Arc::new(live)] },
+            UniverseClock {
+                universe: 1,
+                last_seen: Arc::new(AtomicU64::new(0)),
+                sinks: vec![Arc::new(dead)],
+            },
+        ];
+        let mut tasks: JoinSet<&'static str> = JoinSet::new();
+        spawn_failsafe(&mut tasks, &cfg, base, universes);
+
+        // Keep universe 0's source "alive" for well past the timeout.
+        for _ in 0..18 {
+            note_artnet(
+                &[(0u16, live_clock.clone())].into_iter().collect(),
+                0,
+                base.elapsed().as_millis() as u64,
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(live_rx.borrow().brightness, 80, "a universe still receiving must be untouched");
+        assert_eq!(dead_rx.borrow().brightness, 0, "the silent universe's lights must black out");
+    }
+
+    #[tokio::test]
+    async fn spawn_failsafe_registers_a_supervised_task_only_when_armed() {
+        // The failsafe must be SUPERVISED, not detached: a panic in a detached
+        // task silently disarms the failsafe for the rest of the process while
+        // the bridge keeps reporting healthy. Pinning that it lands in the
+        // caller's JoinSet is what keeps it inside `run`'s fatal select!.
+        // The three "nothing to do" cases must still spawn nothing at all.
+        let base = Instant::now();
+        let count = |mode: &str, timeout_secs: u64, universes: usize| {
+            let mut cfg = Config::default();
+            cfg.failsafe.mode = mode.into();
+            cfg.failsafe.timeout_secs = timeout_secs;
+            let clocks: Vec<UniverseClock> = (0..universes)
+                .map(|i| UniverseClock {
+                    universe: i as u16,
+                    last_seen: Arc::new(AtomicU64::new(0)),
+                    sinks: vec![Arc::new(sink(1, Profile::Rgb).0)],
+                })
+                .collect();
+            let mut tasks: JoinSet<&'static str> = JoinSet::new();
+            spawn_failsafe(&mut tasks, &cfg, base, clocks);
+            tasks.len()
+        };
+        assert_eq!(count("blackout", 5, 1), 1, "an armed failsafe must be supervised");
+        assert_eq!(count("poweroff", 5, 2), 1, "one task covers every universe");
+        assert_eq!(count("hold", 5, 1), 0, "hold has nothing to run");
+        assert_eq!(count("blackout", 0, 1), 0, "timeout_secs = 0 behaves like hold");
+        assert_eq!(count("blackout", 5, 0), 0, "no lights ⇒ nothing to fail safe");
     }
 
     #[tokio::test]

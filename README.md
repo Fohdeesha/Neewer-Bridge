@@ -87,7 +87,7 @@ port    = 6454
 adapter  = "default"    # or an index ("0") or a name substring
 flush_hz = 15           # max BLE updates per light per second
 
-[failsafe]              # what to do when ArtNet stops arriving
+[failsafe]              # what to do when ArtNet for a universe stops arriving
 mode         = "hold"   # hold | blackout | poweroff
 timeout_secs = 0        # 0 = hold the last state forever
 
@@ -182,6 +182,12 @@ source goes silent its channels fall back to the remaining sources.
 `neewer-bridge monitor` prints each input's packets plus the merged result,
 which is the easiest way to check a merge setup.
 
+Give every source its own input block. Merging works per *input*, not per
+sender, so two sources pointed at the same port share one lane and the merge
+can no longer tell them apart. The bridge warns if it spots this, but the fix
+is a separate `[[artnet.inputs]]` entry (its own port, or its own `bind_ip`)
+for each source.
+
 ## Troubleshooting
 
 - **Everything is white and colour changes only the brightness.** The lights
@@ -190,6 +196,10 @@ which is the easiest way to check a merge setup.
   one in your working directory. Run `neewer-bridge lights` to see which
   profile each light actually loaded, and check the `loaded config` line in the
   startup log.
+- **A light never connects and the log says nothing about it.** Check for a
+  `still not discovered` warning — that means the bridge has never seen the
+  light advertise at all, so it is powered off, out of range, or the `mac` in
+  the config is wrong.
 - **`scan` finds nothing, or only phones.** A Neewer light stops advertising
   while the phone app is connected to it. Close the app, put the light in
   Bluetooth mode, retry.
@@ -210,7 +220,7 @@ which is the easiest way to check a merge setup.
 
 ## Building from source
 
-Needs the [Rust toolchain](https://rustup.rs). On Linux, also
+Needs the [Rust toolchain](https://rustup.rs), 1.88 or newer. On Linux, also
 `libdbus-1-dev` and `pkg-config`. On Windows, the MSVC build tools.
 
 ```sh

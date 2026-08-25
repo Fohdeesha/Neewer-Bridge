@@ -35,7 +35,11 @@ merge = "ltp"
 # overrides expire on their own). 0 = never drop.
 merge_timeout_secs = 10
 # Each [[artnet.inputs]] block adds another listener (the bind_ip/port above is
-# always input 0, labelled "primary" in logs). Up to 8 listeners total.
+# always input 0, labelled "primary" in logs). Up to 8 listeners total; each
+# needs its own name, and its own port and/or bind_ip.
+# GIVE EVERY SOURCE ITS OWN INPUT BLOCK: merging works per input, not per
+# sender, so two sources aimed at the same port share one lane and the merge
+# can no longer tell them apart. The bridge warns when it sees this happen.
 # [[artnet.inputs]]
 # name    = "console"   # optional label used in logs
 # bind_ip = "0.0.0.0"
@@ -67,10 +71,14 @@ scan_pause_secs  = 15    # idle gap between bursts (s) so a powered-off/flaky li
 # Distinguish them by whether moving it closer recovers it. See README "Troubleshooting".
 
 [failsafe]
-# What lights do when ArtNet data stops arriving.
+# What lights do when ArtNet data for their universe stops arriving.
 #   hold     = keep last state forever (Neewer lights hold their setting)
 #   blackout = after timeout, set brightness to 0 (light stays powered/connected)
 #   poweroff = after timeout, send BLE power-off
+# Timed PER UNIVERSE: only the lights on a universe that went quiet are acted on,
+# and only ArtDmx for a universe you actually have lights on counts as signal —
+# ArtNet is usually broadcast, so foreign traffic on the wire must not be able to
+# hold the failsafe off forever.
 # The silence clock starts at bridge startup: booting with the console already
 # down triggers the failsafe timeout_secs after start, same as losing it live.
 mode         = "hold"
@@ -87,8 +95,8 @@ console       = true      # log to the console (stderr; stdout stays clean for -
 # file          = "neewer-bridge.log"  # path; omit/empty = no file logging
 # file_level    = "debug" # optional per-file override — keep a full debug record
                           # on disk while the console stays at info
-max_size_mb   = 10        # rotate the log file once it passes this size
-max_files     = 5         # how many rotated files to keep (older are deleted)
+max_size_mb   = 10        # rotate the log file once it passes this size (min 1)
+max_files     = 5         # how many rotated files to keep, older are deleted (min 1)
 
 # --- Lights -----------------------------------------------------------------
 # Easiest: run `neewer-bridge add` (interactive) or `add --mac <MAC> --universe N

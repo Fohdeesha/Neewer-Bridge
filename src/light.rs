@@ -46,6 +46,15 @@ use crate::protocol::replies::{self, Reply};
 use crate::protocol::{queries, LightState};
 use crate::scan::ScanCoordinator;
 
+/// Whether a rate-limited repeat is due: nothing reported yet, or `every` has
+/// elapsed since the last report. `now` is a parameter rather than read inside,
+/// so the throttle is testable without sleeping — the same convention `Merger`
+/// follows. Uses `duration_since`, which saturates instead of panicking if the
+/// clock ever appears to run backwards.
+fn report_due(last: Option<std::time::Instant>, now: std::time::Instant, every: Duration) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= every)
+}
+
 /// How long a liveness probe may take before it counts as a failure (§5).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 /// Consecutive GATT-read failures before we declare the *link* dead and recycle.
@@ -54,6 +63,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_PROBE_FAILURES: u32 = 3;
 /// How often to poll the shared scan while waiting for the light to appear.
 const FIND_POLL: Duration = Duration::from_secs(2);
+/// How often to re-report a light that has never been discovered (see [`LightActor::find`]).
+const MISSING_REPORT: Duration = Duration::from_secs(60);
 /// Backoff after a failed/ended session before reconnecting.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(4);
 /// Gap between consecutive status-query writes, so a light's reply queue isn't
@@ -164,13 +175,82 @@ impl LightActor {
     /// Poll the shared scan until our light appears. Returns the peripheral, its
     /// advertised name, and the discovery-time RSSI (the freshest signal reading
     /// this session will get — BlueZ clears the property once connected).
+    ///
+    /// A light that is never discovered at all (powered off, out of range, typo'd
+    /// MAC) used to be completely silent at `info` — unlike a light that IS found
+    /// but fails to connect, which warns on every attempt. So the wait is
+    /// announced once, then re-reported at `warn` every [`MISSING_REPORT`] while
+    /// it continues, on the same principle as the starved-channel warning: a
+    /// light the bridge is not driving must never be invisible in the log.
+    ///
+    /// Errors from the listing itself are rate-limited to the same interval:
+    /// this loop runs every [`FIND_POLL`] per disconnected light, so an adapter
+    /// that has gone away must not turn into a permanent ~30-lines-a-minute
+    /// warn stream (times the number of missing lights).
     async fn find(&self) -> (Peripheral, String, Option<i16>) {
         let label = self.label();
+        let since = std::time::Instant::now();
+        let mut announced = false;
+        let mut next_report = MISSING_REPORT;
+        // Independent rate limit for peripheral-listing errors — see the `Err`
+        // arm below. Local to this call, so every fresh search starts by
+        // reporting immediately.
+        let mut last_err_report: Option<std::time::Instant> = None;
+        let mut err_suppressed: u64 = 0;
         loop {
             match ble::find_scanned(&self.adapter, &self.cfg.mac).await {
-                Ok(Some(found)) => return found,
-                Ok(None) => debug!(light = %label, "not discovered yet; waiting"),
-                Err(e) => warn!(light = %label, error = %e, "error listing peripherals"),
+                Ok(Some(found)) => {
+                    if announced {
+                        info!(
+                            light = %label,
+                            missing_secs = since.elapsed().as_secs(),
+                            "found after waiting"
+                        );
+                    }
+                    return found;
+                }
+                Ok(None) => {
+                    if !announced {
+                        announced = true;
+                        info!(
+                            light = %label, mac = %self.cfg.mac,
+                            "not discovered yet — waiting for it to advertise \
+                             (is it powered on and in range?)"
+                        );
+                    } else if since.elapsed() >= next_report {
+                        next_report += MISSING_REPORT;
+                        warn!(
+                            light = %label, mac = %self.cfg.mac,
+                            missing_secs = since.elapsed().as_secs(),
+                            "still not discovered — this light is not being driven"
+                        );
+                    } else {
+                        debug!(light = %label, "not discovered yet; waiting");
+                    }
+                }
+                // Rate-limited. This arm is reached every FIND_POLL (2 s) per
+                // disconnected light, so a persistent adapter failure (dongle
+                // unplugged, D-Bus gone, adapter powered off) would otherwise
+                // emit ~30 warn lines a minute PER LIGHT for as long as it
+                // lasts, churning the rotating file sink. Warn on the first
+                // error, then at most once per MISSING_REPORT, carrying the
+                // suppressed count so the true rate stays visible — a cap, not
+                // a mute (the same rule the re-report above follows, and the
+                // reason nothing here drops to silence).
+                Err(e) => {
+                    let now = std::time::Instant::now();
+                    if report_due(last_err_report, now, MISSING_REPORT) {
+                        warn!(
+                            light = %label, error = %e, suppressed = err_suppressed,
+                            "error listing peripherals"
+                        );
+                        last_err_report = Some(now);
+                        err_suppressed = 0;
+                    } else {
+                        err_suppressed += 1;
+                        debug!(light = %label, error = %e, "error listing peripherals");
+                    }
+                }
             }
             tokio::time::sleep(FIND_POLL).await;
         }
@@ -512,6 +592,26 @@ mod tests {
         assert_eq!(power_command(Some(true), &state(false, false)), Some(false));
         // Already sent off → don't repeat.
         assert_eq!(power_command(Some(false), &state(false, false)), None);
+    }
+
+    #[test]
+    fn rate_limited_repeats_are_due_only_after_the_interval() {
+        // Guards the peripheral-listing error throttle in `find`: that arm runs
+        // every FIND_POLL (2 s) per disconnected light, so a dead adapter used to
+        // warn ~30 times a minute per light for as long as it stayed dead.
+        use std::time::Instant;
+        let t0 = Instant::now();
+        assert!(report_due(None, t0, MISSING_REPORT), "the first report is always due");
+        assert!(!report_due(Some(t0), t0 + Duration::from_secs(2), MISSING_REPORT));
+        assert!(!report_due(Some(t0), t0 + Duration::from_secs(59), MISSING_REPORT));
+        assert!(
+            report_due(Some(t0), t0 + MISSING_REPORT, MISSING_REPORT),
+            "the interval boundary is inclusive — a repeat must not need 60 s + ε"
+        );
+        assert!(report_due(Some(t0), t0 + Duration::from_secs(3600), MISSING_REPORT));
+        // A `now` that appears to precede the last report saturates to zero
+        // rather than panicking, and simply isn't due.
+        assert!(!report_due(Some(t0 + Duration::from_secs(10)), t0, MISSING_REPORT));
     }
 
     #[test]

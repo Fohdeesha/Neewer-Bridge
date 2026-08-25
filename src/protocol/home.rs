@@ -37,6 +37,11 @@ pub fn cct(brr1000: u16, cct: u8) -> Vec<u8> {
 }
 
 /// Brightness-only: `7A 0B 03 00 <brr_hi> <brr_lo> <ck>`.
+///
+/// Not used by the bridge itself — every state it sends carries brightness
+/// inside its `cct`/`hsi` frame, so a separate dim command would be a second
+/// write for no gain. It is part of the `0x7A` command set this module exists to
+/// encode, and is byte-pinned by its own test like the rest of them.
 pub fn brightness(brr1000: u16) -> Vec<u8> {
     let (hi, lo) = bcd(brr1000);
     with_checksum(vec![PREFIX, ID_BRIGHTNESS, 0x03, 0x00, hi, lo])
@@ -85,6 +90,19 @@ mod tests {
     fn cct_matches_capture() {
         // Doc: brr 500 (50%), cct 0x20 -> "7A 0C 06 32 00 20 00 01 00 DF"
         assert_eq!(hex(&cct(500, 0x20)), "7A0C06320020000100DF");
+    }
+
+    #[test]
+    fn brightness_frames() {
+        // The one 0x7A encoder the bridge does not call, so nothing else would
+        // catch it drifting. Layout: 7A 0B 03 00 <brr_hi> <brr_lo> <ck>.
+        assert_eq!(hex(&brightness(0)), "7A0B0300000088");
+        assert_eq!(hex(&brightness(500)), "7A0B03003200BA");
+        assert_eq!(hex(&brightness(1000)), "7A0B03006400EC");
+        assert_eq!(hex(&brightness(2000)), "7A0B03006400EC", "clamps at 1000");
+        // Length byte describes the real payload, as every 0x7A frame must.
+        let f = brightness(500);
+        assert_eq!(f[2] as usize, f.len() - 4);
     }
 
     #[test]

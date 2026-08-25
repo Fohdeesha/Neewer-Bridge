@@ -8,7 +8,8 @@
 
 use anyhow::{bail, Context, Result};
 use btleplug::api::{
-    CharPropFlags, Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
+    BDAddr, CharPropFlags, Central, Characteristic, Manager as _, Peripheral as _, ScanFilter,
+    WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use std::sync::LazyLock;
@@ -28,11 +29,17 @@ pub struct Found {
     pub peripheral: Peripheral,
 }
 
-/// Whether a peripheral's address string is the MAC we're looking for. Compares
-/// the parsed 6 bytes, so it is separator/case agnostic without allocating a
-/// normalised `String` for every peripheral on every discovery poll.
-fn mac_matches(address: &str, target: [u8; 6]) -> bool {
-    parse_mac(address).is_ok_and(|a| a == target)
+/// Whether a discovered peripheral's address is the MAC we're looking for.
+///
+/// Compares the six raw address bytes, which is both separator/case-proof and —
+/// crucially — **free**. `Peripheral::address()` returns a field the adapter's
+/// own device listing already populated, whereas `Peripheral::properties()` is a
+/// D-Bus round trip *per device* on BlueZ (`session.get_device_info`). The
+/// per-MAC lookups below poll repeatedly over every discovered device, so they
+/// must filter on this before asking anything for its properties — see
+/// [`find_scanned`].
+fn addr_matches(address: BDAddr, target: [u8; 6]) -> bool {
+    address.into_inner() == target
 }
 
 /// Port of NeewerLite's `isValidPeripheralName` — a heuristic name filter for
@@ -132,8 +139,13 @@ pub async fn scan(adapter: &Adapter, secs: u64) -> Result<Vec<Found>> {
         .await
         .context("start_scan failed (check Bluetooth permissions / adapter power)")?;
     tokio::time::sleep(Duration::from_secs(secs)).await;
-    let peripherals = adapter.peripherals().await.context("listing peripherals")?;
+    // Stop the scan we started before propagating a listing error. A plain `?`
+    // here leaked a running scan on this path — the identical bug that was fixed
+    // in `find_by_mac` below, for the reason recorded there: a scan left running
+    // is exactly the adapter load the bridge's scan coordinator exists to avoid.
+    let listed = adapter.peripherals().await.context("listing peripherals");
     let _ = adapter.stop_scan().await;
+    let peripherals = listed?;
 
     let mut out = Vec::new();
     for p in peripherals {
@@ -186,13 +198,18 @@ pub async fn find_by_mac(adapter: &Adapter, target_mac: &str, timeout: Duration)
             }
         };
         for p in peripherals {
-            if let Ok(Some(props)) = p.properties().await {
-                if mac_matches(&props.address.to_string(), target_bytes) {
-                    let _ = adapter.stop_scan().await;
-                    info!(mac = %target, name = %props.local_name.unwrap_or_default(), "found light");
-                    return Ok(p);
-                }
+            // Address first (a free field read); only the match pays for a
+            // properties() call, which on BlueZ is a D-Bus round trip.
+            if !addr_matches(p.address(), target_bytes) {
+                continue;
             }
+            // Read the name while the scan is still up, as the old code did —
+            // BlueZ reaps discovered device objects some time after discovery
+            // stops, and there is no reason to race it for a log field.
+            let name = peripheral_name(&p).await;
+            let _ = adapter.stop_scan().await;
+            info!(mac = %target, %name, "found light");
+            return Ok(p);
         }
         if start.elapsed() >= timeout {
             let _ = adapter.stop_scan().await;
@@ -202,9 +219,16 @@ pub async fn find_by_mac(adapter: &Adapter, target_mac: &str, timeout: Duration)
     }
 }
 
-/// Start a continuous scan (idempotent-ish). The bridge runs ONE shared scan and
-/// each light actor finds its peripheral from the discovered set — avoids the
-/// per-actor `start_scan`/`stop_scan` churn that can fight on one adapter.
+/// Start a discovery scan.
+///
+/// In the bridge this is driven ONLY by the [`crate::scan`] coordinator, which
+/// runs it in duty-cycled bursts while at least one light is disconnected and
+/// stops it entirely once the fleet is connected. Do NOT reintroduce an
+/// always-on scan: a continuous scan alongside active connections starves the
+/// radio on cheap USB controllers (the RTL8761BU test rig logged kernel
+/// `LE Set Scan Enable` timeouts until this became on-demand). Light actors find
+/// their peripheral among whatever the current burst has discovered
+/// ([`find_scanned`]).
 pub async fn start_scan(adapter: &Adapter) -> Result<()> {
     adapter
         .start_scan(ScanFilter::default())
@@ -221,7 +245,15 @@ pub async fn stop_scan(adapter: &Adapter) -> Result<()> {
 }
 
 /// Look for a peripheral with `target_mac` among those already discovered by the
-/// shared scan. Returns `(peripheral, ble_name, rssi)` or `None` if not seen yet.
+/// coordinated scan. Returns `(peripheral, ble_name, rssi)` or `None` if not
+/// seen yet.
+///
+/// Every disconnected light polls this every couple of seconds, so it matches on
+/// the cached address ([`addr_matches`]) and asks only the ONE matching
+/// peripheral for its properties. Asking every device instead cost a D-Bus round
+/// trip per device per poll on BlueZ — with a fleet down in a busy RF
+/// environment that is hundreds of round trips every two seconds, on the exact
+/// adapter the duty-cycled scan exists to keep unloaded.
 ///
 /// The RSSI is captured HERE, at discovery time, because it is advertisement
 /// RSSI: BlueZ clears the property the moment the device connects, so reading it
@@ -234,12 +266,19 @@ pub async fn find_scanned(
 ) -> Result<Option<(Peripheral, String, Option<i16>)>> {
     let target = parse_mac(target_mac)?;
     for p in adapter.peripherals().await.context("listing peripherals")? {
-        if let Ok(Some(props)) = p.properties().await {
-            if mac_matches(&props.address.to_string(), target) {
-                let name = props.local_name.unwrap_or_default();
-                return Ok(Some((p, name, props.rssi)));
-            }
+        if !addr_matches(p.address(), target) {
+            continue;
         }
+        // Unreadable properties are no reason to discard a peripheral already
+        // matched by MAC — that used to make the light invisible and the actor
+        // wait forever. An empty name is handled by the caller (it falls back to
+        // the configured name for `driver = "auto"` resolution) and the RSSI is
+        // diagnostics only.
+        let (name, rssi) = match p.properties().await {
+            Ok(Some(props)) => (props.local_name.unwrap_or_default(), props.rssi),
+            _ => (String::new(), None),
+        };
+        return Ok(Some((p, name, rssi)));
     }
     Ok(None)
 }
@@ -523,14 +562,21 @@ mod tests {
     }
 
     #[test]
-    fn mac_matching_ignores_case_and_separators() {
+    fn addr_matching_compares_every_byte() {
         let target = [0xD6, 0x50, 0xF2, 0xF6, 0xBB, 0x1B];
-        assert!(mac_matches("D6:50:F2:F6:BB:1B", target));
-        assert!(mac_matches("d6-50-f2-f6-bb-1b", target));
-        assert!(mac_matches("D650F2F6BB1B", target));
-        assert!(!mac_matches("D6:50:F2:F6:BB:1C", target));
-        assert!(!mac_matches("", target));
-        assert!(!mac_matches("not-a-mac", target));
+        assert!(addr_matches(BDAddr::from(target), target));
+        // A difference in ANY byte must fail — a near-miss MAC binding a light
+        // to the wrong fixture is the one thing this must never do.
+        for i in 0..6 {
+            let mut other = target;
+            other[i] ^= 0xFF;
+            assert!(!addr_matches(BDAddr::from(other), target), "byte {i} ignored");
+        }
+        // Separator/case tolerance now lives entirely in `parse_mac` (the config
+        // side); the platform hands us bytes. Pin that the two agree.
+        for written in ["D6:50:F2:F6:BB:1B", "d6-50-f2-f6-bb-1b", "D650F2F6BB1B"] {
+            assert!(addr_matches(BDAddr::from(target), parse_mac(written).unwrap()), "{written}");
+        }
     }
 
     #[test]
