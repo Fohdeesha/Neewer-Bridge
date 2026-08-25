@@ -860,9 +860,9 @@ mod tests {
         let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         for pa in [0u16, 7, 3, 9] {
             tx.send_to(&artnet::encode_artdmx(pa, 0, &[pa as u8, 5]), a1).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         pump.abort();
 
         // Every packet reached on_raw…

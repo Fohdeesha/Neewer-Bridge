@@ -413,6 +413,38 @@ fn spawn_failsafe(
     });
 }
 
+/// What the failsafe does for one universe on one tick.
+///
+/// Split out as a value so the announce/release EDGES are unit-testable without
+/// a clock, a subscriber, or a three-second sleep — the same convention as
+/// `light::report_due`, `commands::stream_timing` and `logging::filter_directive`.
+/// (An earlier version of this test captured the tracing output instead; that is
+/// unreliable in a parallel suite, because `tracing` caches callsite interest
+/// GLOBALLY — a sibling test that reaches the same `warn!` with no subscriber
+/// installed poisons the callsite for everyone. It passed on Windows and failed
+/// on Linux CI purely on test-scheduling order.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailsafeEdge {
+    /// Signal present and nothing latched — do nothing at all.
+    Idle,
+    /// Signal is back after the failsafe had been announced — log the release.
+    Released,
+    /// Newly timed out — warn, then apply.
+    Announce,
+    /// Still timed out and already announced — keep applying, silently.
+    Applied,
+}
+
+/// Decide one universe's tick. Pure.
+fn failsafe_edge(idle_ms: u64, timeout_ms: u64, announced: bool) -> FailsafeEdge {
+    match (idle_ms >= timeout_ms, announced) {
+        (false, true) => FailsafeEdge::Released,
+        (false, false) => FailsafeEdge::Idle,
+        (true, false) => FailsafeEdge::Announce,
+        (true, true) => FailsafeEdge::Applied,
+    }
+}
+
 /// The failsafe tick loop. Never returns — extracted from [`spawn_failsafe`] so
 /// the spawned future has a concrete `&'static str` output for the supervisor.
 async fn failsafe_loop(
@@ -430,7 +462,9 @@ async fn failsafe_loop(
         let now_ms = base.elapsed().as_millis() as u64;
         for (i, u) in universes.iter().enumerate() {
             let idle_ms = now_ms.saturating_sub(u.last_seen.load(Ordering::Relaxed));
-            if idle_ms < timeout_ms {
+            let edge = failsafe_edge(idle_ms, timeout_ms, announced[i]);
+            match edge {
+                FailsafeEdge::Idle => continue,
                 // Say so when it comes back. A latched warning with no matching
                 // recovery line leaves the log claiming a fault that has since
                 // cleared, and the failsafe was the only one in the bridge
@@ -438,26 +472,27 @@ async fn failsafe_loop(
                 // warning and `LightActor::find`'s "still not discovered" both
                 // announce recovery). The `run` loop keeps going for weeks, so
                 // a stale last-word warning is genuinely misleading.
-                if announced[i] {
+                FailsafeEdge::Released => {
                     info!(
                         %mode,
                         universe = u.universe,
                         lights = u.sinks.len(),
                         "ArtNet resumed for this universe — failsafe released"
                     );
+                    announced[i] = false;
+                    continue;
                 }
-                announced[i] = false;
-                continue;
-            }
-            if !announced[i] {
-                warn!(
-                    %mode,
-                    universe = u.universe,
-                    lights = u.sinks.len(),
-                    idle_secs = idle_ms / 1000,
-                    "ArtNet lost for this universe — applying failsafe"
-                );
-                announced[i] = true;
+                FailsafeEdge::Announce => {
+                    warn!(
+                        %mode,
+                        universe = u.universe,
+                        lights = u.sinks.len(),
+                        idle_secs = idle_ms / 1000,
+                        "ArtNet lost for this universe — applying failsafe"
+                    );
+                    announced[i] = true;
+                }
+                FailsafeEdge::Applied => {}
             }
             for s in &u.sinks {
                 // send_if_modified only notifies the actor on an actual change,
@@ -612,108 +647,46 @@ mod tests {
         assert_eq!(dead_rx.borrow().brightness, 0, "the silent universe's lights must black out");
     }
 
-    /// A `MakeWriter` that collects formatted log lines, so a test can assert on
-    /// what was actually logged rather than on internal state.
-    #[derive(Clone, Default)]
-    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    #[test]
+    fn failsafe_announces_recovery_as_well_as_loss() {
+        use FailsafeEdge::*;
+        // The failsafe warned on entering blackout/poweroff and then said
+        // NOTHING when ArtNet came back, so a log left running for weeks kept a
+        // "signal lost" warning as its last word on a universe that had long
+        // since recovered. It was the only latched warning in the bridge without
+        // a recovery line (`Sink::dispatch` and `LightActor::find` both have
+        // one). `Released` is that missing edge.
 
-    impl std::io::Write for Capture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
+        // Signal present, nothing latched — silent, and no action applied.
+        assert_eq!(failsafe_edge(0, 1000, false), Idle);
+        assert_eq!(failsafe_edge(999, 1000, false), Idle);
+        // Signal present after the failsafe fired — announce the release ONCE.
+        assert_eq!(failsafe_edge(0, 1000, true), Released);
+        assert_eq!(failsafe_edge(999, 1000, true), Released);
+        // Newly timed out — warn, then apply. The boundary is inclusive: at
+        // exactly `timeout_ms` the failsafe fires (matches the old `<` test).
+        assert_eq!(failsafe_edge(1000, 1000, false), Announce);
+        assert_eq!(failsafe_edge(5000, 1000, false), Announce);
+        // Still timed out — keep applying, but don't repeat the warning.
+        assert_eq!(failsafe_edge(1000, 1000, true), Applied);
+        assert_eq!(failsafe_edge(u64::MAX, 1000, true), Applied);
+
+        // Every edge except Idle is one the loop acts on, and only Announce and
+        // Released log. Walk a full loss→recovery→loss cycle to prove the latch
+        // flips both ways: without the recovery edge the second loss would never
+        // re-warn either.
+        let mut announced = false;
+        let mut seen = Vec::new();
+        for idle in [0u64, 500, 1200, 2000, 100, 50, 1500] {
+            let e = failsafe_edge(idle, 1000, announced);
+            match e {
+                Announce => announced = true,
+                Released => announced = false,
+                _ => {}
+            }
+            seen.push(e);
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-        type Writer = Capture;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    #[tokio::test]
-    async fn failsafe_announces_recovery_as_well_as_loss() {
-        // The failsafe warned on entry and then said nothing when ArtNet came
-        // back, so a log that runs for weeks kept a "signal lost" warning as its
-        // last word on a universe that had long since recovered. Every other
-        // latched warning in the bridge has a matching recovery line; assert on
-        // the LOG, since the log is the whole point of the fix.
-        //
-        // Real time: the loop reads std::time::Instant, which tokio's clock
-        // control does not drive. `#[tokio::test]` is a current-thread runtime,
-        // so the thread-local subscriber below covers the loop.
-        let cap = Capture::default();
-        let sub = tracing_subscriber::fmt()
-            .with_writer(cap.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let _guard = tracing::subscriber::set_default(sub);
-
-        let (s, rx) = sink(1, Profile::Rgb);
-        s.tx.send(LightState { brightness: 80, power: true, ..LightState::default() }).unwrap();
-        let clock = Arc::new(AtomicU64::new(0));
-        let base = Instant::now();
-        let universes = vec![UniverseClock {
-            universe: 4,
-            last_seen: clock.clone(),
-            sinks: vec![Arc::new(s)],
-        }];
-
-        // Start feeding the clock again only once the loss warning has actually
-        // been observed — waiting on the event instead of a fixed sleep, so a
-        // loaded machine that delays a tick can't make the feed arrive first and
-        // suppress the very warning the test is waiting for.
-        let feeder = {
-            let clock = clock.clone();
-            let cap = cap.clone();
-            tokio::spawn(async move {
-                let saw_loss = loop {
-                    let seen = String::from_utf8_lossy(&cap.0.lock().unwrap().clone()).to_string();
-                    if seen.contains("ArtNet lost") {
-                        break true;
-                    }
-                    if base.elapsed() > Duration::from_secs(4) {
-                        break false;
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                };
-                if saw_loss {
-                    for _ in 0..20 {
-                        clock.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                }
-            })
-        };
-
-        let action = failsafe_action(FailsafeMode::Blackout).unwrap();
-        // Never returns; run it for long enough to see loss then recovery.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(3000),
-            failsafe_loop(FailsafeMode::Blackout, 1000, base, universes, action),
-        )
-        .await;
-        feeder.await.unwrap();
-
-        let log = String::from_utf8(cap.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            log.contains("ArtNet lost for this universe"),
-            "expected the loss warning; got:\n{log}"
-        );
-        assert!(
-            log.contains("ArtNet resumed for this universe"),
-            "expected a recovery line once the clock was fed again; got:\n{log}"
-        );
-        // Both name the universe, so a multi-universe rig can tell them apart.
-        assert!(log.contains("universe=4"), "got:\n{log}");
-        // The loss really did act (this is a blackout failsafe), and the
-        // recovery line is a log event only — releasing the failsafe is the
-        // resumed DMX stream's job, not the loop's.
-        assert_eq!(rx.borrow().brightness, 0);
+        assert_eq!(seen, vec![Idle, Idle, Announce, Applied, Released, Idle, Announce]);
     }
 
     #[tokio::test]
