@@ -82,18 +82,52 @@ pub fn init(cfg: &Logging, verbosity: u8) -> LogGuards {
     LogGuards(guards)
 }
 
+/// Level names ordered low → high verbosity; the index is the rank used to
+/// compare a configured level against the floor `-v` imposes.
+const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+const RANK_DEBUG: usize = 3;
+const RANK_TRACE: usize = 4;
+
+/// Rank a level name. Unrecognised names rank lowest so they can never hold a
+/// sink *above* what `-v` asked for (config validation rejects them anyway —
+/// see `KNOWN_LOG_LEVELS`).
+fn level_rank(level: &str) -> usize {
+    let lower = level.to_ascii_lowercase();
+    LEVELS.iter().position(|&l| l == lower).unwrap_or(0)
+}
+
 /// Build the level filter for one sink. `RUST_LOG` overrides everything; else the
 /// `-v` count raises the level above the configured `level`.
 fn make_filter(level: &str, verbosity: u8) -> EnvFilter {
     if let Ok(f) = EnvFilter::try_from_default_env() {
         return f;
     }
-    let directive = match verbosity {
-        0 => format!("warn,neewer_bridge={}", level.to_lowercase()),
-        1 => "warn,neewer_bridge=debug".to_string(),
-        _ => "info,neewer_bridge=trace,btleplug=debug".to_string(),
+    EnvFilter::new(filter_directive(level, verbosity))
+}
+
+/// The filter directive for one sink — pure, so the `-v` interaction is testable
+/// without building a subscriber.
+///
+/// `-v` **raises** verbosity and must never lower a sink below what the config
+/// asked for. It used to replace the level outright, so a sink configured
+/// `file_level = "trace"` was silently demoted to `debug` the moment anyone
+/// passed `-v` — the flag documented as "increase verbosity" *removed* records
+/// from the file, and `-v` on a `trace` console lost every trace line (the
+/// dropped-non-ArtDmx-datagram trace, for one). Now the floor `-v` imposes is
+/// combined with the configured level by taking the more verbose of the two.
+fn filter_directive(level: &str, verbosity: u8) -> String {
+    // No `-v`: the config alone decides (unchanged — including handing an
+    // unrecognised name straight to EnvFilter, which ignores bad directives).
+    if verbosity == 0 {
+        return format!("warn,neewer_bridge={}", level.to_lowercase());
+    }
+    let (floor, external, extra) = if verbosity == 1 {
+        (RANK_DEBUG, "warn", "")
+    } else {
+        (RANK_TRACE, "info", ",btleplug=debug")
     };
-    EnvFilter::new(directive)
+    let crate_level = LEVELS[level_rank(level).max(floor)];
+    format!("{external},neewer_bridge={crate_level}{extra}")
 }
 
 /// A size-rotating, non-blocking file writer. `max_size_mb`/`max_files` cap total
@@ -132,4 +166,43 @@ fn build_file_writer(
     );
 
     Ok(tracing_appender::non_blocking(rotate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbosity_never_lowers_a_configured_level() {
+        // Without -v the config alone decides (unchanged behaviour).
+        assert_eq!(filter_directive("info", 0), "warn,neewer_bridge=info");
+        assert_eq!(filter_directive("trace", 0), "warn,neewer_bridge=trace");
+        assert_eq!(filter_directive("WARN", 0), "warn,neewer_bridge=warn");
+
+        // -v raises a quieter sink to debug...
+        assert_eq!(filter_directive("info", 1), "warn,neewer_bridge=debug");
+        assert_eq!(filter_directive("error", 1), "warn,neewer_bridge=debug");
+        // ...but must NOT demote one already above it. This is the bug: a
+        // `file_level = "trace"` sink used to drop to debug on -v, so the flag
+        // meant to add detail silently removed records.
+        assert_eq!(filter_directive("trace", 1), "warn,neewer_bridge=trace");
+        assert_eq!(filter_directive("debug", 1), "warn,neewer_bridge=debug");
+
+        // -vv is trace for us plus the BLE wire logs, whatever was configured.
+        assert_eq!(filter_directive("error", 2), "info,neewer_bridge=trace,btleplug=debug");
+        assert_eq!(filter_directive("trace", 2), "info,neewer_bridge=trace,btleplug=debug");
+        assert_eq!(filter_directive("info", 9), "info,neewer_bridge=trace,btleplug=debug");
+    }
+
+    #[test]
+    fn level_rank_orders_levels_and_floors_unknown_names() {
+        assert!(level_rank("error") < level_rank("warn"));
+        assert!(level_rank("warn") < level_rank("info"));
+        assert!(level_rank("info") < level_rank("debug"));
+        assert!(level_rank("debug") < level_rank("trace"));
+        assert_eq!(level_rank("TRACE"), RANK_TRACE);
+        // Unknown ranks lowest, so it can never hold a sink above -v's floor.
+        assert_eq!(level_rank("nonsense"), 0);
+        assert_eq!(filter_directive("nonsense", 1), "warn,neewer_bridge=debug");
+    }
 }

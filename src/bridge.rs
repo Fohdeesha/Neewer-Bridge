@@ -237,10 +237,15 @@ pub async fn run(cfg: Config) -> Result<()> {
     // merged universes into the light sinks. The sockets were bound above, so
     // the only way this task ends is a receive error — which the select! below
     // treats as fatal.
+    // Merge only the universes something is actually patched to. Foreign
+    // broadcast traffic still reaches `on_raw` below (where `note_artnet`
+    // ignores it) but never builds merge state — see `merge::Interest`.
+    let interest = merge::Interest::only(universe_map.keys());
     let listener = tokio::spawn(async move {
         merge::serve_all(
             bound,
             merger,
+            interest,
             // ArtDmx on any input (even a stale one) proves that universe's
             // source is alive, so it feeds the failsafe clock before the
             // sequence check.
@@ -426,6 +431,21 @@ async fn failsafe_loop(
         for (i, u) in universes.iter().enumerate() {
             let idle_ms = now_ms.saturating_sub(u.last_seen.load(Ordering::Relaxed));
             if idle_ms < timeout_ms {
+                // Say so when it comes back. A latched warning with no matching
+                // recovery line leaves the log claiming a fault that has since
+                // cleared, and the failsafe was the only one in the bridge
+                // missing its pair (`Sink::dispatch`'s channel-starvation
+                // warning and `LightActor::find`'s "still not discovered" both
+                // announce recovery). The `run` loop keeps going for weeks, so
+                // a stale last-word warning is genuinely misleading.
+                if announced[i] {
+                    info!(
+                        %mode,
+                        universe = u.universe,
+                        lights = u.sinks.len(),
+                        "ArtNet resumed for this universe — failsafe released"
+                    );
+                }
                 announced[i] = false;
                 continue;
             }
@@ -590,6 +610,110 @@ mod tests {
 
         assert_eq!(live_rx.borrow().brightness, 80, "a universe still receiving must be untouched");
         assert_eq!(dead_rx.borrow().brightness, 0, "the silent universe's lights must black out");
+    }
+
+    /// A `MakeWriter` that collects formatted log lines, so a test can assert on
+    /// what was actually logged rather than on internal state.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn failsafe_announces_recovery_as_well_as_loss() {
+        // The failsafe warned on entry and then said nothing when ArtNet came
+        // back, so a log that runs for weeks kept a "signal lost" warning as its
+        // last word on a universe that had long since recovered. Every other
+        // latched warning in the bridge has a matching recovery line; assert on
+        // the LOG, since the log is the whole point of the fix.
+        //
+        // Real time: the loop reads std::time::Instant, which tokio's clock
+        // control does not drive. `#[tokio::test]` is a current-thread runtime,
+        // so the thread-local subscriber below covers the loop.
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        let (s, rx) = sink(1, Profile::Rgb);
+        s.tx.send(LightState { brightness: 80, power: true, ..LightState::default() }).unwrap();
+        let clock = Arc::new(AtomicU64::new(0));
+        let base = Instant::now();
+        let universes = vec![UniverseClock {
+            universe: 4,
+            last_seen: clock.clone(),
+            sinks: vec![Arc::new(s)],
+        }];
+
+        // Start feeding the clock again only once the loss warning has actually
+        // been observed — waiting on the event instead of a fixed sleep, so a
+        // loaded machine that delays a tick can't make the feed arrive first and
+        // suppress the very warning the test is waiting for.
+        let feeder = {
+            let clock = clock.clone();
+            let cap = cap.clone();
+            tokio::spawn(async move {
+                let saw_loss = loop {
+                    let seen = String::from_utf8_lossy(&cap.0.lock().unwrap().clone()).to_string();
+                    if seen.contains("ArtNet lost") {
+                        break true;
+                    }
+                    if base.elapsed() > Duration::from_secs(4) {
+                        break false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                };
+                if saw_loss {
+                    for _ in 0..20 {
+                        clock.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            })
+        };
+
+        let action = failsafe_action(FailsafeMode::Blackout).unwrap();
+        // Never returns; run it for long enough to see loss then recovery.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(3000),
+            failsafe_loop(FailsafeMode::Blackout, 1000, base, universes, action),
+        )
+        .await;
+        feeder.await.unwrap();
+
+        let log = String::from_utf8(cap.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("ArtNet lost for this universe"),
+            "expected the loss warning; got:\n{log}"
+        );
+        assert!(
+            log.contains("ArtNet resumed for this universe"),
+            "expected a recovery line once the clock was fed again; got:\n{log}"
+        );
+        // Both name the universe, so a multi-universe rig can tell them apart.
+        assert!(log.contains("universe=4"), "got:\n{log}");
+        // The loss really did act (this is a blackout failsafe), and the
+        // recovery line is a log event only — releasing the failsafe is the
+        // resumed DMX stream's job, not the loop's.
+        assert_eq!(rx.borrow().brightness, 0);
     }
 
     #[tokio::test]

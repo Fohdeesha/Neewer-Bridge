@@ -54,7 +54,14 @@ enum Command {
     /// driver/profile/CCT-range are filled automatically — any flag overrides.
     Add {
         /// Light MAC. If given, runs non-interactively.
-        #[arg(long)]
+        ///
+        /// `requires`: --mac is the switch into non-interactive mode, and that
+        /// mode cannot proceed without a universe + address. Enforced by clap so
+        /// the command fails at argument parsing — BEFORE the first-run config
+        /// seeding below, which would otherwise leave a `config.toml` behind for
+        /// an invocation that added nothing (and turn the next `run`'s
+        /// actionable "no config file" hint into a bare "no [[lights]]").
+        #[arg(long, requires = "universe", requires = "address")]
         mac: Option<String>,
         /// Protocol driver: auto | classic | infinity | home (default: from model).
         #[arg(long)]
@@ -159,11 +166,21 @@ enum Command {
         ///   warmdim                       dim warm white (safe end state)
         /// Most specs paint a CCT-white frame first, as a known baseline: a frame the
         /// fixture ignores then leaves it white instead of holding its previous look.
-        #[arg(long)]
+        ///
+        /// `conflicts_with_all`: --set short-circuits before the blink/CCT
+        /// sequence and the visual probes, so combining it with one of those
+        /// silently ran only the --set. Rejecting the combination is the same
+        /// rule --driver already follows: fail on a request we cannot honour
+        /// rather than quietly doing something else.
+        #[arg(long, conflicts_with_all = ["colors", "modes", "pixel"])]
         set: Option<String>,
         /// Read device status (firmware version, battery, temperature, power/mode) and
         /// print the decoded replies. Non-mutating — no blink, no colour change.
-        #[arg(long)]
+        ///
+        /// `conflicts_with_all`: --status short-circuits before everything else,
+        /// so it silently discarded a --set (having already validated and
+        /// rejected a bad one it would never send) and every probe flag.
+        #[arg(long, conflicts_with_all = ["set", "colors", "modes", "pixel"])]
         status: bool,
     },
     /// Flash a firmware image to a light over the custom 0x78 OTA block protocol.
@@ -454,6 +471,9 @@ async fn dispatch(
             };
             match mac {
                 Some(mac) => {
+                    // clap's `requires` on --mac already rejected a missing
+                    // flag before we got here (and before the seeding above);
+                    // these keep the unwrap honest if that ever changes.
                     let universe = universe.context("--universe is required with --mac")?;
                     let address = address.context("--address is required with --mac")?;
                     commands::add_noninteractive(

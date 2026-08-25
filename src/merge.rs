@@ -22,7 +22,7 @@
 //! With a single input the merger is an identity pass-through and none of the
 //! merge settings have any effect, so the feature costs nothing when unused.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -370,19 +370,58 @@ pub async fn bind_inputs(artnet_cfg: &crate::config::ArtNet) -> Result<(Vec<Inpu
     Ok((bound, merger))
 }
 
+/// Which port-addresses [`serve_all`] should actually merge.
+///
+/// ArtNet is routinely **broadcast** on a lighting LAN, so a bridge driving one
+/// universe can easily see traffic for a dozen it has no light patched to. Every
+/// such packet used to allocate a lane set and run a full 512-channel merge for
+/// a universe whose result nothing would ever read (up to the 1024-universe cap:
+/// ~1 KB of merged buffer plus 536 B per input, each). `run` therefore declares
+/// the universes it maps and the rest are dropped straight after `on_raw`.
+///
+/// This mirrors the rule `bridge::note_artnet` already applies to the failsafe
+/// clocks — foreign universes must not count as signal — and applies it to the
+/// merge state as well.
+#[derive(Debug, Clone)]
+pub enum Interest {
+    /// Merge every universe that arrives. `monitor` uses this: it exists to
+    /// show what is actually on the wire, so it must not hide anything.
+    All,
+    /// Merge only these port-addresses.
+    Only(HashSet<u16>),
+}
+
+impl Interest {
+    /// Universes drawn from a configured universe→sinks map.
+    pub fn only<'a>(universes: impl IntoIterator<Item = &'a u16>) -> Self {
+        Interest::Only(universes.into_iter().copied().collect())
+    }
+
+    /// Should `port_address` be merged?
+    pub fn wants(&self, port_address: u16) -> bool {
+        match self {
+            Interest::All => true,
+            Interest::Only(set) => set.contains(&port_address),
+        }
+    }
+}
+
 /// Receive on every input, sequence-filter per input, merge, and hand the
 /// merged per-universe data to `on_merged` (with a changed flag, so callers
 /// can skip work when a refresh didn't move the output). `on_raw` fires for
-/// **every** valid ArtDmx (before the stale-sequence drop) — the bridge feeds
-/// its failsafe timer from it, `monitor` its per-packet log. Any listener
-/// socket dying is fatal (returns `Err`), matching the single-listener
-/// behaviour.
+/// **every** valid ArtDmx (before the stale-sequence drop AND before the
+/// `interest` filter) — the bridge feeds its failsafe timer from it, `monitor`
+/// its per-packet log. Any listener socket dying is fatal (returns `Err`),
+/// matching the single-listener behaviour.
+///
+/// `interest` limits which universes are merged at all; see [`Interest`].
 ///
 /// Used by both `run` and `monitor`, so the monitor exercises and displays the
 /// exact merge pipeline the bridge runs.
 pub async fn serve_all<R, M>(
     inputs: Vec<Input>,
     mut merger: Merger,
+    interest: Interest,
     mut on_raw: R,
     mut on_merged: M,
 ) -> Result<()>
@@ -458,6 +497,16 @@ where
                     });
                 };
                 on_raw(idx, &labels[idx], src, &pkt);
+                // Foreign universe (nothing patched to it) — `on_raw` has had
+                // it for the failsafe/monitor, and everything past this point
+                // is merge state we would build and never read. Dropped before
+                // the sequence check too, so foreign senders can't consume
+                // SeqTracker capacity that belongs to the real ones.
+                if !interest.wants(pkt.port_address) {
+                    trace!(input = %labels[idx], port = pkt.port_address,
+                           "ArtDmx for an unmapped universe ignored");
+                    continue;
+                }
                 // Drop out-of-order/duplicate packets (Art-Net Sequence field) so
                 // a late datagram can't briefly re-apply an old state. Tracked
                 // per input: the same console feeding two inputs runs an
@@ -722,6 +771,7 @@ mod tests {
                 Input { sock: s2, label: "second".into() },
             ],
             Merger::new(MergeMode::Htp, Duration::from_secs(10), 2),
+            Interest::All,
             move |_idx, label, _src, _pkt| raw2.lock().unwrap().push(label.to_string()),
             move |pa, data, _changed| merged2.lock().unwrap().push((pa, data.to_vec())),
         ));
@@ -779,12 +829,61 @@ mod tests {
                 Input { sock: s2, label: "second".into() },
             ],
             Merger::new(MergeMode::Htp, Duration::from_secs(10), 1),
+            Interest::All,
             |_, _, _, _| {},
             |_, _, _| {},
         )
         .await
         .expect_err("2 inputs with a 1-input merger must be rejected");
         assert!(format!("{err:#}").contains("merger was built for 1"));
+    }
+
+    #[tokio::test]
+    async fn serve_all_merges_only_the_universes_of_interest() {
+        // ArtNet is routinely broadcast, so a bridge driving universe 0 sees
+        // traffic for universes nothing is patched to. Those must not build
+        // merge state — but they MUST still reach `on_raw`, which is what feeds
+        // the failsafe clock and the monitor log.
+        let (s1, a1) = bind_local().await;
+        let raw_log: Arc<Mutex<Vec<u16>>> = Arc::default();
+        let merged_log: MergedLog = Arc::default();
+        let raw2 = raw_log.clone();
+        let merged2 = merged_log.clone();
+        let pump = tokio::spawn(serve_all(
+            vec![Input { sock: s1, label: "primary".into() }],
+            Merger::new(MergeMode::Ltp, Duration::from_secs(10), 1),
+            Interest::only([0u16, 3].iter()),
+            move |_idx, _label, _src, pkt| raw2.lock().unwrap().push(pkt.port_address),
+            move |pa, data, _changed| merged2.lock().unwrap().push((pa, data.to_vec())),
+        ));
+
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for pa in [0u16, 7, 3, 9] {
+            tx.send_to(&artnet::encode_artdmx(pa, 0, &[pa as u8, 5]), a1).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        pump.abort();
+
+        // Every packet reached on_raw…
+        assert_eq!(*raw_log.lock().unwrap(), vec![0, 7, 3, 9]);
+        // …but only the mapped universes were merged.
+        let merged = merged_log.lock().unwrap();
+        assert_eq!(*merged, vec![(0, vec![0, 5]), (3, vec![3, 5])]);
+    }
+
+    #[test]
+    fn interest_all_wants_everything_and_only_is_exact() {
+        assert!(Interest::All.wants(0));
+        assert!(Interest::All.wants(32_767));
+        let only = Interest::only([0u16, 4].iter());
+        assert!(only.wants(0));
+        assert!(only.wants(4));
+        assert!(!only.wants(1));
+        assert!(!only.wants(32_767));
+        // An empty interest set merges nothing (a config with no lights never
+        // reaches `run`, but the type must not silently mean "everything").
+        assert!(!Interest::only(std::iter::empty()).wants(0));
     }
 
     #[tokio::test]
@@ -795,6 +894,7 @@ mod tests {
         let pump = tokio::spawn(serve_all(
             vec![Input { sock: s1, label: "primary".into() }],
             Merger::new(MergeMode::Ltp, Duration::from_secs(10), 1),
+            Interest::All,
             |_, _, _, _| {},
             move |_pa, data, _changed| merged2.lock().unwrap().push(data.to_vec()),
         ));

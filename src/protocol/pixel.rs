@@ -71,12 +71,37 @@ impl Block {
     }
 }
 
+/// Longest `effect_data` the single-byte LEN field can describe: LEN counts the
+/// 6 MAC bytes too, so `6 + effect_data.len()` must fit a `u8`.
+///
+/// For scale, the largest frame this module builds is a 6-block palette
+/// (`2 + 6*3` = 20 bytes of effect data), so real callers sit an order of
+/// magnitude below the cap.
+pub const MAX_EFFECT_DATA: usize = u8::MAX as usize - 6;
+
 /// Wrap one `effectData` array into a full `78 B0 <LEN> <MAC6> <effectData> <ck>`
 /// frame. `LEN = 6 + effect_data.len()` (MAC bytes + the effect-data bytes),
 /// matching NEEWER Studio's own captured frames.
+///
+/// Over-long `effect_data` is **clamped** to [`MAX_EFFECT_DATA`], for exactly the
+/// reason [`super::ota::block_frame`] clamps a block and [`super::ota::Header::frame`]
+/// truncates its name: LEN must equal the true payload count on these two-chip
+/// fixtures — the radio→LED-MCU UART reassembler reframes by that byte, not by ATT
+/// boundaries — and the raw cast used to wrap silently (83 palette blocks declared
+/// LEN 1 for a 257-byte payload), producing a frame the fixture mis-frames or drops
+/// with no error anywhere. A clamped frame is at worst a short palette, which the
+/// firmware renders. Callers in this crate cap at 8 blocks so the path is
+/// unreachable; the clamp keeps it unreachable for any future caller of the public
+/// [`palette`] / [`raw_frame`] API too.
 fn frame(mac: [u8; 6], effect_data: &[u8]) -> Vec<u8> {
-    let len = (6 + effect_data.len()) as u8;
-    let mut f = vec![PREFIX, TAG_PIXEL, len];
+    // Clamp first, then assert the post-condition — the same shape as
+    // `ota::block_frame`. After the clamp `6 + len` is <= 255, so the cast below
+    // can never wrap and the assert can never fire; it is there to catch a future
+    // change to the constant, not to police callers.
+    let effect_data = &effect_data[..effect_data.len().min(MAX_EFFECT_DATA)];
+    let len = 6 + effect_data.len();
+    debug_assert!(len <= u8::MAX as usize);
+    let mut f = vec![PREFIX, TAG_PIXEL, len as u8];
     f.extend_from_slice(&mac);
     f.extend_from_slice(effect_data);
     with_checksum(f)
@@ -283,6 +308,37 @@ mod tests {
         assert_eq!(p[2], 0x0d);
         let q = palette(MAC, 1, 1, &[Block::Off]); // effectData = 2 + 3 = 5 bytes
         assert_eq!(q[2], 0x0b);
+    }
+
+    #[test]
+    fn len_field_always_describes_the_real_payload() {
+        // The invariant the two-chip UART reassembler depends on: the declared
+        // length must equal the bytes that follow it. The raw cast this replaces
+        // wrapped silently — an 83-block palette (257 bytes of effect data)
+        // declared LEN 1, and a 300-byte `raw_frame` declared 50 — a frame the
+        // fixture mis-frames or drops with nothing logged anywhere.
+        //
+        // Walk both public entry points across the u8 boundary. `n` is the
+        // effect-data length; the cap is on effect data, so LEN tops out at 255.
+        for n in [0usize, 1, 2, 20, 248, MAX_EFFECT_DATA, MAX_EFFECT_DATA + 1, 250, 255, 256, 300, 1000] {
+            let clamped = n.min(MAX_EFFECT_DATA);
+
+            let f = raw_frame(MAC, &vec![0xA5u8; n]);
+            assert_eq!(f[2] as usize, 6 + clamped, "raw_frame declared len for {n} bytes");
+            assert_eq!(f.len(), 3 + 6 + clamped + 1, "raw_frame frame size for {n}");
+            assert_eq!(&f[9..f.len() - 1], &vec![0xA5u8; clamped][..]);
+            let sum: u32 = f[..f.len() - 1].iter().map(|&b| b as u32).sum();
+            assert_eq!(*f.last().unwrap(), sum as u8, "raw_frame checksum for {n}");
+
+            // …and via `palette`, whose effect data is `2 + 3*blocks`.
+            let blocks = vec![Block::Hsi { hue: 200, sat: 100 }; n];
+            let g = palette(MAC, 1, 1, &blocks);
+            let want = (2 + 3 * n).min(MAX_EFFECT_DATA);
+            assert_eq!(g[2] as usize, 6 + want, "palette declared len for {n} blocks");
+            assert_eq!(g.len(), 3 + 6 + want + 1, "palette frame size for {n} blocks");
+            let sum: u32 = g[..g.len() - 1].iter().map(|&b| b as u32).sum();
+            assert_eq!(*g.last().unwrap(), sum as u8, "palette checksum for {n} blocks");
+        }
     }
 
     #[test]

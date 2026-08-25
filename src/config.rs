@@ -452,17 +452,31 @@ impl Config {
         // ones: `::0` and `0:0:0:0:0:0:0:0` are the same wildcard as `::` and
         // used to slip past this check, turning a clear config error into a bare
         // EADDRINUSE at bind time. Parsing is what makes that exhaustive.
-        let is_wildcard = |ip: &str| {
+        //
+        // Comparing two inputs for "same address" needs the same treatment, and
+        // for the same reason: `::1` and `0:0:0:0:0:0:0:1` are one address, and
+        // a raw string compare called them different, passed validation, and
+        // then died at bind with a bare `EADDRINUSE` / `os error 10048`. So
+        // compare PARSED addresses whenever both parse, and fall back to the
+        // trimmed strings when one doesn't (an interface name or a hostname —
+        // `artnet::bind` resolves those, and the identical text is still an
+        // identical bind).
+        let parse_ip = |ip: &str| {
             let t = ip.trim();
             let t = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(t);
-            t.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_unspecified())
+            t.parse::<std::net::IpAddr>()
+        };
+        let is_wildcard = |ip: &str| parse_ip(ip).is_ok_and(|a| a.is_unspecified());
+        let same_addr = |a: &str, b: &str| match (parse_ip(a), parse_ip(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a.trim() == b.trim(),
         };
         for i in 0..inputs.len() {
             for j in (i + 1)..inputs.len() {
                 if inputs[i].port != inputs[j].port {
                     continue;
                 }
-                if inputs[i].bind_ip == inputs[j].bind_ip {
+                if same_addr(&inputs[i].bind_ip, &inputs[j].bind_ip) {
                     bail!(
                         "artnet inputs {:?} and {:?} both bind {}:{} — each input needs its own \
                          bind_ip/port combination",
@@ -1224,6 +1238,61 @@ port = 6999
         // …including addresses that merely start with a zero.
         c.artnet.bind_ip = "0.0.0.1".into();
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn duplicate_bind_addresses_are_caught_however_they_are_spelled() {
+        // The duplicate-input check compared bind_ip as raw TEXT, so two
+        // spellings of ONE address passed validation and then died at bind with
+        // a bare `EADDRINUSE` / `os error 10048` — the exact gap the wildcard
+        // check above already closed by parsing.
+        for (a, b) in [
+            ("::1", "0:0:0:0:0:0:0:1"),
+            ("::1", "[::1]"),
+            ("10.0.0.1", " 10.0.0.1 "),
+            ("::ffff:10.0.0.1", "::ffff:10.0.0.1"),
+            ("fe80::1", "FE80::1"), // IPv6 literals are case-insensitive
+        ] {
+            let mut c = Config::default();
+            c.artnet.bind_ip = a.into();
+            c.artnet.port = 6454;
+            c.artnet.inputs.push(ArtNetInput {
+                name: Some("console".into()),
+                bind_ip: b.into(),
+                port: 6454,
+            });
+            let err = c.validate().expect_err(&format!("{a} vs {b} must be rejected"));
+            assert!(
+                format!("{err:#}").contains("each input needs its own"),
+                "{a} vs {b}: wrong error: {err:#}"
+            );
+        }
+
+        // Genuinely different addresses on one port stay legal — that IS the
+        // multi-IP use case, and over-matching here would break it.
+        for (a, b) in [("10.0.0.1", "10.0.0.2"), ("::1", "::2"), ("10.0.0.1", "::1")] {
+            let mut c = Config::default();
+            c.artnet.bind_ip = a.into();
+            c.artnet.port = 6454;
+            c.artnet.inputs.push(ArtNetInput {
+                name: Some("console".into()),
+                bind_ip: b.into(),
+                port: 6454,
+            });
+            c.validate().unwrap_or_else(|e| panic!("{a} vs {b} must be allowed: {e:#}"));
+        }
+
+        // A name that doesn't parse as an IP falls back to a text compare —
+        // identical text is still an identical bind.
+        let mut c = Config::default();
+        c.artnet.bind_ip = "my-host.local".into();
+        c.artnet.port = 6454;
+        c.artnet.inputs.push(ArtNetInput {
+            name: Some("console".into()),
+            bind_ip: "my-host.local".into(),
+            port: 6454,
+        });
+        assert!(c.validate().is_err(), "identical hostnames on one port must be rejected");
     }
 
     #[test]

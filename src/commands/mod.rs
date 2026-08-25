@@ -552,9 +552,38 @@ fn stream_timing(hz: Option<f64>, seconds: f64) -> Result<Option<(Duration, Dura
     )))
 }
 
+/// Pick the destination to send to from everything `--target` resolved to,
+/// **preferring IPv4**.
+///
+/// Art-Net is an IPv4 protocol (the spec's whole addressing model is 2./10.
+/// IPv4), and the bridge's own default `bind_ip` is the IPv4 wildcard
+/// `0.0.0.0` — so when a name resolves to both families, the v4 address is the
+/// one that can actually reach a listener. This matters for the most obvious
+/// invocation there is: on a dual-stack host `localhost` resolves to `::1`
+/// first, and taking that first result would send every packet somewhere the
+/// default bridge is not listening. An IPv6-only name (or an explicit `::1`)
+/// still works — it is just no longer allowed to shadow a usable v4 address.
+fn pick_dest(addrs: impl Iterator<Item = std::net::SocketAddr>) -> Option<std::net::SocketAddr> {
+    let mut first = None;
+    for a in addrs {
+        if a.is_ipv4() {
+            return Some(a);
+        }
+        first.get_or_insert(a);
+    }
+    first
+}
+
 /// `artnet-send` — send ArtDmx to drive the bridge (or any node) without a
 /// physical console. One-shot by default; `--hz` streams for `--seconds`.
 /// Channels are placed starting at `address`; earlier channels are zero-padded.
+///
+/// `--target` is resolved **once**, up front (see [`pick_dest`]), and the sender
+/// socket is bound to the matching address family. Both of those used to be
+/// wrong: the socket was hard-bound to `0.0.0.0:0`, so any IPv6 destination —
+/// including `localhost` on a dual-stack box — failed at `send_to` with a bare
+/// `os error 10047` / `EAFNOSUPPORT`, and a hostname was re-resolved for every
+/// single packet of a stream.
 pub async fn artnet_send(
     target: &str,
     port: u16,
@@ -567,8 +596,35 @@ pub async fn artnet_send(
     let data = dmx_payload(address, channels)?;
     // Validated before the socket is bound, so a bad flag fails immediately.
     let timing = stream_timing(hz, seconds)?;
-    let sock = UdpSocket::bind("0.0.0.0:0").await.context("binding sender socket")?;
-    let dest = format!("{target}:{port}");
+
+    let resolved = tokio::net::lookup_host((target, port))
+        .await
+        .with_context(|| format!("resolving --target {target}"))?;
+    let dest = pick_dest(resolved)
+        .with_context(|| format!("--target {target} resolved to no usable address"))?;
+
+    // Bind the same family as the destination, or send_to fails with
+    // EAFNOSUPPORT on every packet.
+    let bind: std::net::SocketAddr = if dest.is_ipv4() {
+        ([0, 0, 0, 0], 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let sock = UdpSocket::bind(bind).await.context("binding sender socket")?;
+
+    // Broadcast is ordinary Art-Net addressing, and the OS refuses a broadcast
+    // send outright without SO_BROADCAST (`255.255.255.255` → `os error 10013`
+    // / `EACCES`; POSIX requires the flag for a subnet-directed address too, so
+    // Linux — the deployment platform — rejects `10.0.0.255` as well). The
+    // option is purely a permission gate on this socket: it changes nothing
+    // about unicast sends, so enabling it for every IPv4 destination is safe and
+    // saves guessing a netmask we cannot know. Best-effort: if a platform
+    // refuses it, unicast still works, so warn rather than abort.
+    if dest.is_ipv4() {
+        if let Err(e) = sock.set_broadcast(true) {
+            warn!(error = %e, "could not enable broadcast on the sender socket; unicast still works");
+        }
+    }
 
     match timing {
         Some((period, total, rate)) => {
@@ -577,7 +633,7 @@ pub async fn artnet_send(
             let mut count = 0u64;
             while Instant::now() < end {
                 let pkt = artnet::encode_artdmx(universe, seq, &data);
-                sock.send_to(&pkt, &dest).await.context("sending")?;
+                sock.send_to(&pkt, dest).await.context("sending")?;
                 seq = seq.wrapping_add(1);
                 if seq == 0 {
                     seq = 1;
@@ -589,7 +645,7 @@ pub async fn artnet_send(
         }
         None => {
             let pkt = artnet::encode_artdmx(universe, 1, &data);
-            sock.send_to(&pkt, &dest).await.context("sending")?;
+            sock.send_to(&pkt, dest).await.context("sending")?;
             info!(target = %dest, universe, address, channels = ?channels, "sent 1 ArtDmx packet");
         }
     }
@@ -618,6 +674,9 @@ pub async fn monitor(artnet_cfg: &config::ArtNet) -> Result<()> {
     crate::merge::serve_all(
         bound,
         merger,
+        // A diagnostic tool must not hide traffic: `monitor` merges and reports
+        // every universe on the wire, including ones no light is patched to.
+        crate::merge::Interest::All,
         |_idx, label, src, pkt| {
             let (net, sub_net, universe) = artnet::split_port_address(pkt.port_address);
             info!(
@@ -707,6 +766,26 @@ mod tests {
         // Both limits are inclusive.
         assert!(stream_timing(Some(MIN_SEND_HZ), MAX_SEND_SECONDS).unwrap().is_some());
         assert!(stream_timing(Some(MAX_SEND_HZ), 0.001).unwrap().is_some());
+    }
+
+    #[test]
+    fn pick_dest_prefers_ipv4_over_ipv6() {
+        use std::net::SocketAddr;
+        let v4: SocketAddr = "127.0.0.1:6454".parse().unwrap();
+        let v6: SocketAddr = "[::1]:6454".parse().unwrap();
+        let v4b: SocketAddr = "10.0.0.5:6454".parse().unwrap();
+
+        // The `localhost` case that used to break: getaddrinfo hands back ::1
+        // first, the socket was bound IPv4, and every send_to failed with
+        // EAFNOSUPPORT. The v4 address wins regardless of order.
+        assert_eq!(pick_dest([v6, v4].into_iter()), Some(v4));
+        assert_eq!(pick_dest([v4, v6].into_iter()), Some(v4));
+        // Ties among v4 keep resolution order.
+        assert_eq!(pick_dest([v4b, v4].into_iter()), Some(v4b));
+        // IPv6-only still resolves — preferring v4 must not mean requiring it.
+        assert_eq!(pick_dest([v6].into_iter()), Some(v6));
+        // Nothing resolved is an error the caller reports, not a panic.
+        assert_eq!(pick_dest(std::iter::empty()), None);
     }
 
     #[test]

@@ -13,6 +13,62 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.5.0] — 2026-08-25
+
+### Fixed
+
+- **`artnet-send` could not reach an IPv6 or a broadcast target.** The sender
+  socket was hard-bound to IPv4 and never enabled broadcast, so `--target
+  localhost` on a dual-stack machine (where the name resolves to `::1` first)
+  and `--target ::1` both died with a bare `os error 10047` /
+  `EAFNOSUPPORT`, and `--target 255.255.255.255` with `os error 10013` /
+  `EACCES` — broadcast being ordinary Art-Net addressing. The target is now
+  resolved once, up front, IPv4 preferred (Art-Net is an IPv4 protocol and the
+  bridge's own default bind is `0.0.0.0`); the socket is bound to the matching
+  family; and broadcast is enabled for IPv4 destinations. A hostname is also no
+  longer re-resolved for every packet of a stream.
+- **`-v` could make a log sink *less* verbose.** The flag replaced the
+  configured level outright, so a sink set to `file_level = "trace"` was
+  silently demoted to `debug` the moment `-v` was passed — the flag documented
+  as "increase verbosity" removed records. `-v`/`-vv` now raise the level and
+  never lower it.
+- **The failsafe never said when ArtNet came back.** It warned once on entering
+  `blackout`/`poweroff` and then went quiet, so a log left running for weeks
+  kept a "signal lost" warning as its last word on a universe that had long
+  since recovered. It now logs a matching "ArtNet resumed … failsafe released"
+  line, as every other latched warning in the bridge already did.
+- **Two spellings of one bind address passed config validation and then failed
+  at bind.** `::1` and `0:0:0:0:0:0:0:1` on the same port were compared as text,
+  so the duplicate-input check missed them and the bridge died with a bare
+  `EADDRINUSE` instead of naming the two inputs. Addresses are compared parsed
+  now, matching what the wildcard check already did.
+- A pixel frame built with an over-long palette through the public
+  `pixel::palette` / `pixel::raw_frame` API would declare a wrapped length byte
+  (83 colour blocks declared LEN 1 for a 257-byte payload). Over-long effect
+  data is clamped, so the declared length always describes the real payload —
+  the same guard `ota::block_frame` and the OTA header already carry. Not
+  reachable through the bridge or any profile, which cap the palette at 8.
+
+### Changed
+
+- **`add --mac` now requires `--universe` and `--address` at argument parsing.**
+  It reported the missing flag before, but only *after* creating `config.toml`
+  from the shipped example — so a failed `add` left a config behind that turned
+  the next run's actionable "no config file" hint into a confusing "no
+  `[[lights]]` configured".
+- **`test` rejects flag combinations it cannot honour** instead of silently
+  ignoring one. `--status` short-circuits before everything else and `--set`
+  before the probes, so `--status --set …` ran only the status read (having
+  already validated and rejected a bad spec it would never send) and `--set …
+  --colors` ran only the `--set`. `--status`, `--set`, and the visual probes
+  (`--colors`/`--modes`/`--pixel`) are now mutually exclusive; the probes still
+  combine freely with each other.
+- The bridge no longer builds merge state for universes nothing is patched to.
+  ArtNet is routinely broadcast, so `run` could allocate a lane set and run a
+  full 512-channel merge for every foreign universe on the wire, up to its
+  1024-universe cap, for results nothing would ever read. `monitor` still shows
+  every universe — it exists to report what is actually arriving.
+
 ## [1.4.0] — 2026-08-25
 
 ### Changed
