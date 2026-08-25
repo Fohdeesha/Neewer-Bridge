@@ -12,6 +12,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+// Unknown keys are a hard error, at every level. A mistyped field used to be
+// silently ignored and the default used in its place, so `flush_hzz = 40` ran at
+// 15 Hz, `adress = 26` left a light on channel 1, and nothing in the log said
+// so — the same class of invisible-misconfiguration bug as the "all lights
+// white, wrong profile loaded" story that made the startup log announce which
+// config it read. Refusing the file is the only outcome the user can act on.
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub artnet: ArtNet,
@@ -26,6 +33,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtNet {
     /// Local IP to bind the ArtNet UDP listener to. `0.0.0.0` = all interfaces.
     #[serde(default = "default_bind_ip")]
@@ -52,6 +60,7 @@ pub struct ArtNet {
 
 /// One extra ArtNet listener (see `ArtNet::inputs`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtNetInput {
     /// Optional label used in logs (defaults to `input1`, `input2`, …).
     #[serde(default)]
@@ -93,6 +102,7 @@ impl ArtNet {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ble {
     /// Adapter selector. `"default"` = first adapter reported by the OS.
     #[serde(default = "default_adapter")]
@@ -121,6 +131,7 @@ pub struct Ble {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Failsafe {
     /// Behaviour when ArtNet data stops. v1 implements `"hold"` only.
     #[serde(default = "default_failsafe_mode")]
@@ -131,6 +142,7 @@ pub struct Failsafe {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Logging {
     /// Global default level: `trace` | `debug` | `info` | `warn` | `error`.
     /// Per-destination overrides fall back to this. `debug` includes every BLE
@@ -160,6 +172,7 @@ pub struct Logging {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LightCfg {
     /// Binding identity — the hardware MAC, e.g. `"AA:BB:CC:DD:EE:FF"`.
     pub mac: String,
@@ -1145,6 +1158,35 @@ port = 6999
             c.artnet.inputs.push(ArtNetInput { name: None, bind_ip: "0.0.0.0".into(), port: 7000 + p });
         }
         assert!(c.validate().is_err()); // more than 7 extra inputs
+    }
+
+    #[test]
+    fn unknown_config_keys_are_rejected_at_every_level() {
+        // A mistyped key used to be dropped on the floor and the default used
+        // instead, silently: `flush_hzz = 40` ran at 15 Hz and `adress = 26` left
+        // the light on channel 1, with nothing in the log to say so. Every
+        // deserialized struct now denies unknown fields, and serde names the
+        // offender plus the valid keys, so the message is actionable.
+        let cases = [
+            ("[artnetx]\nport = 1\n", "artnetx"),
+            ("[artnet]\nprot = 6454\n", "prot"),
+            ("[ble]\nflush_hzz = 40\n", "flush_hzz"),
+            ("[failsafe]\ntimeout_sec = 5\n", "timeout_sec"),
+            ("[logging]\nlvl = \"info\"\n", "lvl"),
+            ("[[artnet.inputs]]\nbindip = \"0.0.0.0\"\n", "bindip"),
+            ("[[lights]]\nmac = \"AA:BB:CC:DD:EE:FF\"\nadress = 26\n", "adress"),
+        ];
+        for (text, offender) in cases {
+            let err = toml::from_str::<Config>(text)
+                .expect_err(&format!("{offender} must be rejected, not ignored"));
+            let msg = err.to_string();
+            assert!(msg.contains(offender), "message must name the bad key: {msg}");
+            assert!(msg.contains("unknown field"), "{msg}");
+        }
+        // …and a correct file still parses, including every optional block being
+        // absent (over-strict denial would break a minimal config).
+        toml::from_str::<Config>("").unwrap();
+        toml::from_str::<Config>("[ble]\nflush_hz = 40\n").unwrap();
     }
 
     #[test]

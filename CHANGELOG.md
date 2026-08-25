@@ -13,6 +13,17 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.4.0] — 2026-08-25
+
+### Changed
+
+- **A key the config doesn't recognise is now a hard error.** A typo was
+  silently dropped and the default used in its place, so `flush_hzz = 40` ran
+  the bridge at 15 Hz and `adress = 26` left a light on channel 1, with nothing
+  in the log to say why. Every section rejects unknown keys now, naming the bad
+  one and listing the valid ones. A config carrying a stray key that used to
+  load will need it removed or corrected.
+
 ## [1.3.0] — 2026-08-25
 
 ### Fixed

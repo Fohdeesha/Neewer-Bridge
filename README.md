@@ -105,7 +105,9 @@ address  = 1            # 1-based DMX start channel
 ```
 
 A broken config is a hard error; the bridge never silently falls back to
-defaults. The startup log prints the absolute path of the config it loaded.
+defaults. That includes a key it doesn't recognise — a typo like `flush_hzz`
+is refused, naming the bad key and the valid ones, rather than quietly running
+on the default. The startup log prints the absolute path of the config it loaded.
 
 ## DMX profiles
 
