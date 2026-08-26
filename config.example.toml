@@ -85,14 +85,17 @@ mode         = "hold"
 timeout_secs = 0         # 0 = never act (hold); >0 = act after N seconds of silence
 
 [logging]
-# Log verbosity + destinations. Console and file are independent — enable either,
-# both, or neither. Activity (connects, reconnects, power on/off, failsafe) logs at
-# `info`; every BLE command sent to a light logs at `debug`.
+# Log verbosity + destinations. Console and file are independent — enable either
+# or both, but NOT neither: `console = false` with no `file` set installs no log
+# destination at all, so even fatal errors would be silent, and the config is
+# refused rather than quietly going dark. Activity (connects, reconnects, power
+# on/off, failsafe) logs at `info`; every BLE command sent to a light at `debug`.
 # Level precedence: RUST_LOG env var wins outright; otherwise -v/-vv RAISE these
 # settings (-v = at least debug, -vv = trace + BLE wire logs) and never lower
 # them, so a sink already set to `trace` keeps it.
 level         = "info"    # trace | debug | info | warn | error (global default)
-console       = true      # log to the console (stderr; stdout stays clean for --json)
+console       = true      # log to the console (stderr; stdout stays clean for --json).
+                          # Turning this off requires setting `file` below.
 # console_level = "info"  # optional per-console override (defaults to `level`)
 # file          = "neewer-bridge.log"  # path; omit/empty = no file logging
 # file_level    = "debug" # optional per-file override — keep a full debug record

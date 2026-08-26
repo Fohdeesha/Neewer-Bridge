@@ -44,9 +44,14 @@ Writes a `[[lights]]` block. (`--blink` would also blink it; skip if step 1 did.
 ```sh
 neewer-bridge -v run --config bringup.toml > bringup.log 2>&1 &
 ```
-Expect in the log: adapter selected, `BLE scan started`, the actor `connecting`,
-then `session active`. The light powers on (power_on_connect) and shows the
-initial 50% / 3200K state.
+Expect in the log, in order: `using BLE adapter`, `ArtNet listener bound`,
+`BLE discovery-scan coordinator started`, one `configuring light` line per
+fixture (naming its profile, channels and the **label** every later line for
+that light is tagged with), then `connecting` → `connected` → `session active`.
+The light powers on (power_on_connect) and shows the initial 50% / 3200K state.
+
+Note the discovery scan is on-demand and duty-cycled, so it is not running once
+every light is connected; its per-burst lines are at `debug` (`-v`).
 
 ## 4. Drive it and verify the exact bytes
 
@@ -76,12 +81,18 @@ and none while the value is constant.
 - **Reconnect:** power-cycle the light (or move it out of range). The log should
   show the session end, retries, and a clean reconnect — still bound to the same
   DMX channels. Confirm control resumes.
-- **Liveness probe:** with `-vv`, idle the light (no ArtNet); every `probe_secs`
-  you should see the read-probe activity; killing the link should trip the
-  stale-session recycle after the configured failures.
+- **Liveness probe:** a healthy probe is deliberately silent — it must cost
+  nothing on a good link. With `-v`, idle the light (no ArtNet) and every
+  `probe_secs` you should see the status-query BLE writes (battery `78 95 …`,
+  temperature `78 b3 …`). Degrade the link and you get
+  `connection probe failed (GATT read)` with a rising `failures` count;
+  it either clears with `connection probe recovered` or, at 3 in a row, ends the
+  session (`session ended; will reconnect`) and reconnects.
 - **Failsafe:** set `[failsafe] mode="poweroff"` / `timeout_secs=3`, run, send one
-  packet, then stop. After ~3 s the log shows `ArtNet lost — applying failsafe`
-  and a power-off write; resume sending → it powers back on.
+  packet, then stop. After ~3 s the log shows
+  `ArtNet lost for this universe — applying failsafe` and a power-off write;
+  resume sending → `ArtNet resumed for this universe — failsafe released` and it
+  powers back on.
 
 ## What to capture for the record
 

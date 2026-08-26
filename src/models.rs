@@ -247,6 +247,46 @@ mod tests {
         }
     }
 
+    /// `add` builds a `[[lights]]` entry straight out of a catalog row and then
+    /// validates the whole file before writing it, so a model whose fields the
+    /// validator rejects is a light that simply **cannot be added** — and in the
+    /// interactive path that failure lands after the scan, the blink and every
+    /// prompt, naming a field the user never typed.
+    ///
+    /// That happened: `ZRP` carries the app's `commandType = 3` while the
+    /// validator capped `cmd_type` at 2. This is the gate that keeps the catalog
+    /// and `Config::validate` in step — including if `models.toml` is ever
+    /// regenerated with a wider `commandType`, which must fail HERE (loudly, in
+    /// CI) rather than in a user's `add`.
+    #[test]
+    fn every_model_produces_a_config_the_validator_accepts() {
+        use crate::config::{Config, LightCfg};
+        let mut rejected = Vec::new();
+        for m in &Catalog::builtin().models {
+            let mut cfg = Config::default();
+            cfg.lights.push(LightCfg {
+                mac: "AA:BB:CC:DD:EE:FF".into(),
+                name: Some(m.name.clone()),
+                driver: m.driver.clone(),
+                profile: m.profile().as_str().to_string(),
+                universe: 0,
+                address: 1,
+                power_on_connect: true,
+                cct_min: m.cct_min,
+                cct_max: m.cct_max,
+                cmd_type: m.cmd_type,
+            });
+            if let Err(e) = cfg.validate() {
+                rejected.push(format!("  {}: {e}", m.name));
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "these catalog models build a config `add` would refuse to write:\n{}",
+            rejected.join("\n")
+        );
+    }
+
     #[test]
     fn unknown_returns_none() {
         let c = Catalog::builtin();

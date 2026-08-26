@@ -370,7 +370,13 @@ pub async fn add(config_path: &Path, adapter_selector: &str) -> Result<()> {
 pub async fn inspect(adapter_selector: &str, mac: &str, seconds: u64) -> Result<()> {
     let adapter = ble::acquire_adapter(adapter_selector).await?;
     let peripheral = ble::find_by_mac(&adapter, mac, Duration::from_secs(seconds)).await?;
-    let infos = ble::inspect(&peripheral).await?;
+    // Release the light before anything can return: `ble::inspect` connects
+    // first and can then fail in service discovery, and a plain `?` there left
+    // the connection open, so the fixture didn't re-advertise until the process
+    // was reaped. Same rule `test`/`ota` follow.
+    let res = ble::inspect(&peripheral).await;
+    let _ = ble::disconnect(&peripheral).await;
+    let infos = res?;
     println!("\nConnected to {mac} — {} characteristics:\n", infos.len());
     for ci in &infos {
         print!("  {}  {}", ci.uuid, ci.props);
@@ -381,7 +387,6 @@ pub async fn inspect(adapter_selector: &str, mac: &str, seconds: u64) -> Result<
         }
         println!();
     }
-    let _ = ble::disconnect(&peripheral).await;
     Ok(())
 }
 
@@ -480,6 +485,31 @@ pub async fn add_noninteractive(
     Ok(())
 }
 
+/// Reject a `--universe` that cannot be transmitted.
+///
+/// The Port-Address field is 15 bits, so [`artnet::encode_artdmx`] masks `Net`
+/// down to its 7 bits — a `--universe` above [`artnet::MAX_PORT_ADDRESS`] is
+/// silently rewritten on the wire while the success line still echoes what was
+/// asked for. Measured: `--universe 40000` arrived as port-address 7232, and
+/// `--universe 32768` — one past the maximum, the likeliest typo there is —
+/// arrived as **port-address 0**, i.e. it drove whatever is patched to universe
+/// 0 while reporting 32768.
+///
+/// This is the same rule [`dmx_payload`] already applies to `--address`, and the
+/// one `Config::validate` applies to a light's `universe`; `artnet-send` was the
+/// only path that skipped it. Pure, so the boundary is unit-tested.
+fn check_universe(universe: u16) -> Result<()> {
+    let max = artnet::MAX_PORT_ADDRESS;
+    if universe > max {
+        bail!(
+            "--universe {universe} out of range (0..={max}) — the ArtNet Port-Address is \
+             15 bits, so this would be sent as universe {} instead",
+            universe & max
+        );
+    }
+    Ok(())
+}
+
 /// Build the DMX data slot for `artnet-send`: `channels` placed at the 1-based
 /// `address`, with earlier channels zero-padded, sized to a legal ArtDmx length.
 ///
@@ -552,6 +582,21 @@ fn stream_timing(hz: Option<f64>, seconds: f64) -> Result<Option<(Duration, Dura
     )))
 }
 
+/// How long the stream loop should sleep after a packet, or `None` to stop.
+///
+/// The loop used to sleep a whole `period` unconditionally, so `--seconds` did
+/// not bound the runtime whenever the packet period was longer than the window:
+/// `--hz 0.001 --seconds 1` sent its one packet and then sat for ~17 minutes.
+/// Clamping the wait to whatever is left of the window makes `--seconds` mean
+/// what it says, and never shortens a normal stream (there, `period` is far
+/// smaller than `remaining` until the very last tick).
+fn next_send_delay(period: Duration, remaining: Duration) -> Option<Duration> {
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(period.min(remaining))
+}
+
 /// Pick the destination to send to from everything `--target` resolved to,
 /// **preferring IPv4**.
 ///
@@ -593,8 +638,10 @@ pub async fn artnet_send(
     hz: Option<f64>,
     seconds: f64,
 ) -> Result<()> {
+    // Every flag is validated before the socket is bound, so a bad one fails
+    // immediately instead of after a resolve + bind.
+    check_universe(universe)?;
     let data = dmx_payload(address, channels)?;
-    // Validated before the socket is bound, so a bad flag fails immediately.
     let timing = stream_timing(hz, seconds)?;
 
     let resolved = tokio::net::lookup_host((target, port))
@@ -639,7 +686,12 @@ pub async fn artnet_send(
                     seq = 1;
                 }
                 count += 1;
-                tokio::time::sleep(period).await;
+                // Never sleep past the end of the requested window.
+                let Some(delay) = next_send_delay(period, end.saturating_duration_since(Instant::now()))
+                else {
+                    break;
+                };
+                tokio::time::sleep(delay).await;
             }
             info!(target = %dest, universe, address, packets = count, "streamed ArtDmx @ {rate}Hz for {seconds}s");
         }
@@ -799,6 +851,50 @@ mod tests {
         // A patch ending exactly on the last channel is legal.
         assert_eq!(dmx_payload(512, &[7]).unwrap().len(), 512);
         assert_eq!(dmx_payload(510, &[1, 2, 3]).unwrap().len(), 512);
+    }
+
+    #[test]
+    fn check_universe_rejects_what_the_wire_cannot_carry() {
+        // The Port-Address field is 15 bits, so anything above it is masked by
+        // `encode_artdmx` and lands somewhere else while the success line still
+        // echoes the requested number. Measured before the fix: 40000 arrived as
+        // 7232, and 32768 — one past the maximum — arrived as universe 0, i.e.
+        // it drove whatever is patched there.
+        assert!(check_universe(0).is_ok());
+        assert!(check_universe(artnet::MAX_PORT_ADDRESS).is_ok());
+        for bad in [artnet::MAX_PORT_ADDRESS + 1, 40_000, u16::MAX] {
+            let err = check_universe(bad).expect_err("must be rejected");
+            assert!(format!("{err:#}").contains("out of range"), "{bad}: {err:#}");
+        }
+        // The message must name the universe it WOULD have gone to, and that
+        // number must be what `encode_artdmx` actually puts on the wire.
+        for bad in [32_768u16, 40_000, u16::MAX] {
+            let msg = format!("{:#}", check_universe(bad).unwrap_err());
+            let landed = artnet::parse_artdmx(&artnet::encode_artdmx(bad, 1, &[1, 2]))
+                .expect("a valid ArtDmx packet")
+                .port_address;
+            assert!(
+                msg.contains(&format!("universe {landed} instead")),
+                "message must name the real destination ({landed}): {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_send_delay_never_overruns_the_window() {
+        let ms = Duration::from_millis;
+        // Normal streaming: the period is far shorter than what's left.
+        assert_eq!(next_send_delay(ms(25), Duration::from_secs(2)), Some(ms(25)));
+        // The last tick is clipped to the window instead of overshooting it.
+        assert_eq!(next_send_delay(ms(25), ms(10)), Some(ms(10)));
+        // The pathological case: a period longer than the whole window used to
+        // make `--seconds 1 --hz 0.001` sit for ~17 minutes after its one packet.
+        assert_eq!(
+            next_send_delay(Duration::from_secs(1000), Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
+        );
+        // Window exhausted ⇒ stop, don't sleep.
+        assert_eq!(next_send_delay(ms(25), Duration::ZERO), None);
     }
 
     #[test]

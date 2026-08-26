@@ -75,6 +75,17 @@ async fn ota_next_frame(stream: &mut ble::NotifyStream, timeout: Duration) -> Op
 /// Hold the live connection for `settle` and confirm it stays up, issuing a cheap
 /// GATT read each second. Returns an error if the link drops — the go/no-go gate
 /// before committing to a multi-minute firmware transfer over a marginal link.
+///
+/// The connectivity check runs **at least once**, whatever `settle` is. As a
+/// plain `while start.elapsed() < settle` loop, a zero window ran the body zero
+/// times — `is_connected` was never called — and the function still announced
+/// "link held steady — OK to proceed". That is the one safety gate standing
+/// between a marginal link and a multi-minute firmware write, and it was
+/// reporting a check it had not performed. `--settle-secs` is separately capped
+/// below 1 at the CLI, so this is defence in depth for any other caller.
+///
+/// The elapsed time is now read from the clock rather than counted in ticks, so
+/// the number in the log is what actually happened.
 async fn ota_link_precheck(
     p: &Peripheral,
     write: &Characteristic,
@@ -82,8 +93,8 @@ async fn ota_link_precheck(
     settle: Duration,
 ) -> Result<()> {
     let start = Instant::now();
-    let mut ticks = 0u32;
-    while start.elapsed() < settle {
+    let mut checks = 0u32;
+    loop {
         if !ble::is_connected(p).await {
             bail!(
                 "link dropped after {:.1}s of the {:.0}s stability check — move the light \
@@ -94,10 +105,17 @@ async fn ota_link_precheck(
         }
         // A non-mutating version read as a keepalive / liveness poke.
         ble::write_command(p, write, &queries::version(mac)).await.ok();
-        ticks += 1;
+        checks += 1;
+        if start.elapsed() >= settle {
+            break;
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    info!(held_secs = ticks, "link held steady — OK to proceed");
+    info!(
+        held_secs = start.elapsed().as_secs(),
+        checks,
+        "link held steady — OK to proceed"
+    );
     Ok(())
 }
 
@@ -172,93 +190,106 @@ pub async fn ota(
     info!(ble_name = %adv_name, ?rssi, "found; connecting");
     let chars = ble::connect_and_verify(&peripheral).await?;
     let write = chars.write.clone();
-    // Which write mode we get matters a lot on a marginal link: write-WITH-response
-    // ATT-acks every fragment (dropped chunks surface as errors we can act on),
-    // write-WITHOUT-response is fire-and-forget (drops are silent → device resends).
-    info!(
-        props = ?write.properties,
-        with_response = write.properties.contains(btleplug::api::CharPropFlags::WRITE),
-        chunk_delay_ms,
-        "write characteristic"
-    );
-    let notify = chars
-        .notify
-        .clone()
-        .context("OTA needs the notify characteristic (69400003-…); not found on this light")?;
-    let mut stream = ble::subscribe_notify(&peripheral, &notify).await?;
-
-    // 3. Read current firmware version (best-effort, for the record).
-    ble::write_command(&peripheral, &write, &queries::version(mac_bytes)).await.ok();
-    if let Some(frame) = ota_next_frame(&mut stream, Duration::from_secs(2)).await {
-        if let Some(reply) = replies::parse(&frame) {
-            info!(current = %reply.summary(), "device reports");
-        }
-    }
-
-    // 4. Link-stability precheck — the go/no-go gate for a marginal link.
-    info!(secs = settle_secs, "checking link stability before flashing…");
-    ota_link_precheck(&peripheral, &write, mac_bytes, Duration::from_secs(settle_secs)).await?;
-
-    // The precheck's keepalive version reads elicit notify replies nothing has
-    // consumed — up to ~settle_secs of them sit buffered in the stream. Drain
-    // them now so the type probe below reads fresh frames; otherwise the stale
-    // replies can exhaust its window and the 0x1A reply is never seen (the
-    // block kind would silently default — wrong for an OTA_PRO fixture).
-    let mut drained = 0u32;
-    while ota_next_frame(&mut stream, Duration::from_millis(250)).await.is_some() {
-        drained += 1;
-    }
-    if drained > 0 {
-        info!(frames = drained, "drained stale notify frames from the precheck");
-    }
-
-    // 5. Probe the OTA block type (0xD0 → 0x1A). Non-type frames (status pushes)
-    // don't consume the budget — only time does. Default to 128-byte blocks if
-    // the device never answers (both our fixtures are Std128; an OTA_PRO device
-    // would reject the header cleanly).
-    ble::write_command(&peripheral, &write, &ota::probe_frame(ota::HEADER_STD)).await?;
-    let mut kind = None;
-    let probe_deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < probe_deadline {
-        match ota_next_frame(&mut stream, Duration::from_millis(600)).await {
-            Some(f) => {
-                if let Some(k) = ota::parse_type_reply(&f) {
-                    kind = Some(k);
-                    break;
-                }
-            }
-            None => break, // 600 ms of post-drain silence: no reply is coming
-        }
-    }
-    let kind = kind.unwrap_or_else(|| {
-        warn!("no 0x1A OTA-type reply from the device — defaulting to 128-byte blocks");
-        ota::BlockKind::Std128
-    });
-    let total_blocks = ota::block_count(image.len(), kind);
-    info!(ota_type = ?kind, block_size = kind.block_size(), total_blocks, "OTA type resolved");
-
-    if check_only {
-        info!("--check only: NOT flashing. Link + OTA type verified above.");
-        let _ = ble::disconnect(&peripheral).await;
-        return Ok(());
-    }
-    if !confirm {
-        let _ = ble::disconnect(&peripheral).await;
-        bail!(
-            "refusing to flash without --confirm (this rewrites the LED-MCU firmware). \
-             The link held and the device is ready — re-run with --confirm to proceed."
+    // Everything from here holds the light, so it runs inside one block with a
+    // SINGLE exit that always releases it. `--check` and the missing-`--confirm`
+    // refusal each disconnected by hand, but every `?` between the connect and
+    // them — a light with no notify characteristic, a failed subscribe, the link
+    // precheck failing, the type-probe write failing — returned with the
+    // connection still open, so the fixture did not re-advertise until the OS
+    // reaped the process. `Ok(true)` = flashed, so the post-flash read-back below
+    // should run; `Ok(false)` = a clean stop without flashing (`--check`).
+    let res: Result<bool> = async {
+        // Which write mode we get matters a lot on a marginal link: write-WITH-response
+        // ATT-acks every fragment (dropped chunks surface as errors we can act on),
+        // write-WITHOUT-response is fire-and-forget (drops are silent → device resends).
+        info!(
+            props = ?write.properties,
+            with_response = write.properties.contains(btleplug::api::CharPropFlags::WRITE),
+            chunk_delay_ms,
+            "write characteristic"
         );
-    }
+        let notify = chars
+            .notify
+            .clone()
+            .context("OTA needs the notify characteristic (69400003-…); not found on this light")?;
+        let mut stream = ble::subscribe_notify(&peripheral, &notify).await?;
 
-    // 6. Run the header + block transfer. Whatever the outcome, disconnect cleanly
-    //    first — a failed flash must not leave a half-open link that keeps the radio
-    //    from re-advertising (mirror of the "always release the light" cleanup rule).
-    let result = ota_transfer(
-        &peripheral, &write, &mut stream, &image, kind, chunk_delay, total_blocks, &header,
-    )
+        // 3. Read current firmware version (best-effort, for the record).
+        ble::write_command(&peripheral, &write, &queries::version(mac_bytes)).await.ok();
+        if let Some(frame) = ota_next_frame(&mut stream, Duration::from_secs(2)).await {
+            if let Some(reply) = replies::parse(&frame) {
+                info!(current = %reply.summary(), "device reports");
+            }
+        }
+
+        // 4. Link-stability precheck — the go/no-go gate for a marginal link.
+        info!(secs = settle_secs, "checking link stability before flashing…");
+        ota_link_precheck(&peripheral, &write, mac_bytes, Duration::from_secs(settle_secs)).await?;
+
+        // The precheck's keepalive version reads elicit notify replies nothing has
+        // consumed — up to ~settle_secs of them sit buffered in the stream. Drain
+        // them now so the type probe below reads fresh frames; otherwise the stale
+        // replies can exhaust its window and the 0x1A reply is never seen (the
+        // block kind would silently default — wrong for an OTA_PRO fixture).
+        let mut drained = 0u32;
+        while ota_next_frame(&mut stream, Duration::from_millis(250)).await.is_some() {
+            drained += 1;
+        }
+        if drained > 0 {
+            info!(frames = drained, "drained stale notify frames from the precheck");
+        }
+
+        // 5. Probe the OTA block type (0xD0 → 0x1A). Non-type frames (status pushes)
+        // don't consume the budget — only time does. Default to 128-byte blocks if
+        // the device never answers (both our fixtures are Std128; an OTA_PRO device
+        // would reject the header cleanly).
+        ble::write_command(&peripheral, &write, &ota::probe_frame(ota::HEADER_STD)).await?;
+        let mut kind = None;
+        let probe_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < probe_deadline {
+            match ota_next_frame(&mut stream, Duration::from_millis(600)).await {
+                Some(f) => {
+                    if let Some(k) = ota::parse_type_reply(&f) {
+                        kind = Some(k);
+                        break;
+                    }
+                }
+                None => break, // 600 ms of post-drain silence: no reply is coming
+            }
+        }
+        let kind = kind.unwrap_or_else(|| {
+            warn!("no 0x1A OTA-type reply from the device — defaulting to 128-byte blocks");
+            ota::BlockKind::Std128
+        });
+        let total_blocks = ota::block_count(image.len(), kind);
+        info!(ota_type = ?kind, block_size = kind.block_size(), total_blocks, "OTA type resolved");
+
+        if check_only {
+            info!("--check only: NOT flashing. Link + OTA type verified above.");
+            return Ok(false);
+        }
+        if !confirm {
+            bail!(
+                "refusing to flash without --confirm (this rewrites the LED-MCU firmware). \
+                 The link held and the device is ready — re-run with --confirm to proceed."
+            );
+        }
+
+        // 6. Run the header + block transfer. The single release point below
+        //    covers every outcome — a failed flash must not leave a half-open
+        //    link that keeps the radio from re-advertising.
+        ota_transfer(
+            &peripheral, &write, &mut stream, &image, kind, chunk_delay, total_blocks, &header,
+        )
+        .await?;
+        Ok(true)
+    }
     .await;
+    // The one release point for the whole connected phase.
     let _ = ble::disconnect(&peripheral).await;
-    result?;
+    if !res? {
+        return Ok(()); // --check: probed only, nothing flashed.
+    }
 
     // 7. Let the device reboot, then reconnect and read back the version. This is
     // entirely best-effort reporting: the flash already committed (the device sent

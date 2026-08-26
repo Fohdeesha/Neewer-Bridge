@@ -26,7 +26,7 @@ use std::time::Duration;
 use btleplug::platform::Adapter;
 use tokio::sync::Notify;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::ble;
 
@@ -92,8 +92,35 @@ pub async fn run(adapter: Adapter, coord: Arc<ScanCoordinator>, window: Duration
         }
 
         // At least one light needs discovery: one scan burst.
-        if let Err(e) = ble::start_scan(&adapter).await {
-            warn!(error = %e, "discovery scan failed to start; will retry");
+        //
+        // If a scan session is somehow already active — ours, left behind by a
+        // `stop_scan` that didn't take, or a stale one in the BLE backend —
+        // BlueZ answers `Operation already in progress` and this used to just
+        // warn and retry, forever: the coordinator could NEVER get back in
+        // sync, so the adapter sat scanning continuously (the exact load this
+        // whole module exists to prevent on a cheap controller) while the log
+        // took ~4 warnings a minute indefinitely, each one saying "will retry"
+        // as though it were transient.
+        //
+        // HARDWARE-PROVEN on the test rig (2026-08-26), where a live bridge had
+        // been in that state for 15+ hours with zero successful discoveries: a
+        // 4-call probe showed start_scan #1 OK, #2/#3/#4 `Operation already in
+        // progress`, then ONE `stop_scan` → the next `start_scan` OK. So clear
+        // it and retry once before giving up on this burst.
+        let mut started = ble::start_scan(&adapter).await;
+        if started.is_err() {
+            let _ = ble::stop_scan(&adapter).await;
+            started = ble::start_scan(&adapter).await;
+            if started.is_ok() {
+                info!("discovery scan recovered by clearing a stale scan session");
+            }
+        }
+        if let Err(e) = started {
+            // `{e:#}` prints the anyhow CHAIN. Plain `%e` showed only the
+            // context — "start_scan failed (check Bluetooth permissions /
+            // adapter power)" — and hid the actual cause, which is why the live
+            // failure above needed a hardware session to diagnose at all.
+            warn!(error = %format!("{e:#}"), "discovery scan failed to start; will retry");
             wait(&coord, pause.max(IDLE_RECHECK)).await;
             continue;
         }

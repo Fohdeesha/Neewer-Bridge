@@ -13,6 +13,97 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.6.0] — 2026-08-26
+
+Fixes from a further full-source audit. MINOR rather than PATCH because three
+of them **reject input that used to be accepted** (see *Changed* below).
+
+### Fixed
+
+- **The discovery-scan coordinator could wedge permanently, leaving the adapter
+  scanning continuously forever.** If a scan session was already active — ours,
+  left behind by a `stop_scan` that didn't take, or stale in the BLE backend —
+  BlueZ answers `Operation already in progress`, and the coordinator only warned
+  and retried, so it could never get back in sync. Found on the test rig, where
+  a live bridge had been in exactly that state for **15+ hours**: zero
+  successful discoveries for the whole run, ~4 warnings a minute (each claiming
+  "will retry" as though transient), and the adapter scanning non-stop — the
+  precise load this module exists to prevent on a cheap controller. The failure
+  path now clears the stale session and retries once, which a hardware
+  reproduction proves recovers it (3 plain retries stay wedged; `stop_scan` then
+  `start_scan` succeeds).
+- **Log lines hid the cause of the errors they reported.** `error = %e` on an
+  `anyhow` chain prints only the outermost context, so the wedge above surfaced
+  as `start_scan failed (check Bluetooth permissions / adapter power)` with the
+  actual `Operation already in progress` discarded — which is why it took a
+  hardware session to diagnose at all. The scan-start failure and the four
+  per-light failures that carry a context chain (`session ended`,
+  `connect/verify failed`, `error listing peripherals`, `notify subscribe
+  failed`) now print `{e:#}`.
+- **`artnet-send --universe` was not range-checked, so it sent to a different
+  universe than it reported.** The Art-Net Port-Address is 15 bits, so the
+  encoder masks the `Net` byte — `--universe 40000` went out as universe 7232,
+  and `--universe 32768` (one past the maximum, the likeliest typo there is)
+  went out as **universe 0**, driving whatever is patched there while the
+  success line still said 32768. Measured with a live `monitor`, not inferred.
+  `--address` already had this check, as does a light's `universe` in config;
+  this was the one path that skipped it. The error now names the universe the
+  packet would actually have reached.
+- **A model in the shipped catalog could not be added at all.** `ZRP` carries
+  the app's `commandType = 3` while config validation capped `cmd_type` at 2, so
+  `add` built an entry and then refused to write it — in the interactive path
+  after the scan, the blink and every prompt, complaining about a field the user
+  never typed. Only `cmd_type == 2` is special to the driver (MAC-embedded
+  advanced frames), so the bound was simply wrong; it is now the catalog's real
+  range, and a new test walks every catalog model through the validator so the
+  two can never drift apart again.
+- **`ota --settle-secs 0` skipped the pre-flash link check and still announced
+  "link held steady — OK to proceed".** The check loop ran zero times, so
+  `is_connected` was never called, on the one safety gate before a multi-minute
+  firmware write. The connectivity check now runs at least once whatever the
+  window is, and reports the elapsed time from the clock rather than a tick
+  count.
+- **A connection probe that recovered said so only at `debug`.** Every probe
+  failure warns, so at the default `info` level a link blip that cleared after
+  one or two misses left a `connection probe failed` warning standing with
+  nothing after it — on exactly the marginal-RSSI fixtures where it fires most.
+  The probe decision is now an explicit state machine (`Healthy` / `Recovered` /
+  `Failed` / `Dead`) and the recovery edge logs at `info`. Same treatment for a
+  notify stream that comes back after a subscribe failure warned about it.
+- **Two lights sharing a name were indistinguishable in the log.** `add` fills
+  the name from the model catalog, so adding two TL120Cs names **both** of them
+  `TL120C`, and every per-light line (`connecting`, `session active`, `power
+  on`, the starved-channel warning) carries only that name. Colliding labels now
+  gain a MAC suffix — the short form where that separates them, the full MAC
+  where it does not — and the `configuring light` startup line prints the label
+  each fixture ended up with. Unique names are untouched.
+- **`--seconds` did not bound `artnet-send`'s runtime.** The loop slept a whole
+  packet period after its last send, so `--hz 0.001 --seconds 1` sent one packet
+  and then sat for ~17 minutes. The wait is now clipped to what is left of the
+  window (measured: 2 s instead of 1000 s; a normal 40 Hz stream is unchanged).
+- **`inspect`, `ota` and `test` could return while still holding the light.**
+  Each had hand-placed disconnects on some paths, but every `?` between the
+  connect and them returned with the connection open, so the fixture did not
+  re-advertise until the OS reaped the process. Each command now has a single
+  release point that no path can skip.
+- **`HARDWARE-BRINGUP.md` told the operator to look for log lines that no longer
+  exist** (`BLE scan started`; `ArtNet lost — applying failsafe`, which is now
+  per-universe). Corrected against the source, along with the liveness-probe
+  step — a healthy probe is deliberately silent.
+
+### Changed
+
+- **`[logging] console = false` with no `file` is now refused.** It installed no
+  log destination at all, so the binary wrote nothing whatsoever — measured: a
+  failing command exited 1 with zero bytes of output, the error included. Set a
+  `file`, or leave the console on.
+- **`ota --settle-secs` must be 1..=3600.** A zero-second stability check is not
+  one (see above).
+- **`artnet-send --universe` must be 0..=32767**, the real Port-Address range.
+- The bring-up byte-table test moved from `tests/` into the library. It was in a
+  git-excluded directory, so it had never been in a clone and never ran in CI —
+  the tracked, public doc it pins had no guard against drifting from the code.
+
 ## [1.5.0] — 2026-08-25
 
 ### Fixed

@@ -55,6 +55,46 @@ fn report_due(last: Option<std::time::Instant>, now: std::time::Instant, every: 
     last.is_none_or(|t| now.duration_since(t) >= every)
 }
 
+/// What one connection-health probe means for the session.
+///
+/// Split out as a value for the same reason [`crate::bridge`]'s `FailsafeEdge`
+/// is: it makes the RECOVERY edge explicit and testable without a clock, a
+/// subscriber or a live link. Every failure below warns, but the recovery used
+/// to log at `debug` — so at the default `info` level a blip that cleared after
+/// one or two misses left a "connection probe failed" warning standing with
+/// nothing after it, on exactly the marginal-RSSI fixtures where it fires most.
+/// That is the same latched-warning-without-a-release-line defect the failsafe
+/// had; naming the edge is what stops it coming back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeEdge {
+    /// Probe passed and nothing was outstanding — silent.
+    Healthy,
+    /// Probe passed after `after` consecutive failures — announce the recovery.
+    Recovered { after: u32 },
+    /// Probe failed; `failures` consecutive so far, still under the limit.
+    Failed { failures: u32 },
+    /// Probe failed and reached the limit — the link is dead, recycle it.
+    Dead { failures: u32 },
+}
+
+/// Decide one probe tick. Pure. `failures` is the count BEFORE this probe.
+fn probe_edge(conn_ok: bool, failures: u32, max: u32) -> ProbeEdge {
+    if conn_ok {
+        if failures > 0 {
+            ProbeEdge::Recovered { after: failures }
+        } else {
+            ProbeEdge::Healthy
+        }
+    } else {
+        let failures = failures.saturating_add(1);
+        if failures >= max {
+            ProbeEdge::Dead { failures }
+        } else {
+            ProbeEdge::Failed { failures }
+        }
+    }
+}
+
 /// How long a liveness probe may take before it counts as a failure (§5).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 /// Consecutive GATT-read failures before we declare the *link* dead and recycle.
@@ -75,6 +115,10 @@ const PIXEL_FRAME_SPACING: Duration = Duration::from_millis(80);
 
 pub struct LightActor {
     cfg: LightCfg,
+    /// This light's log label, resolved once by the bridge
+    /// (`bridge::light_labels`) so the actor and its DMX sink provably log under
+    /// the same name — including the MAC suffix two same-named lights get.
+    label: String,
     adapter: Adapter,
     rx: watch::Receiver<LightState>,
     flush_hz: u32,
@@ -83,26 +127,21 @@ pub struct LightActor {
 }
 
 impl LightActor {
+    #[allow(clippy::too_many_arguments)] // one plumbing constructor, one call site
     pub fn new(
         cfg: LightCfg,
+        label: String,
         adapter: Adapter,
         rx: watch::Receiver<LightState>,
         flush_hz: u32,
         probe_secs: u64,
         scan: Arc<ScanCoordinator>,
     ) -> Self {
-        Self { cfg, adapter, rx, flush_hz, probe_secs, scan }
+        Self { cfg, label, adapter, rx, flush_hz, probe_secs, scan }
     }
 
     fn label(&self) -> String {
-        // An empty configured name (older `add` runs wrote `name = ""`) falls
-        // back to the MAC, same as no name at all.
-        self.cfg
-            .name
-            .as_deref()
-            .filter(|n| !n.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| self.cfg.mac.clone())
+        self.label.clone()
     }
 
     /// Run forever: (re)connect and serve until shut down.
@@ -146,10 +185,10 @@ impl LightActor {
                     if let Err(e) =
                         self.session(&label, &peripheral, &chars, &driver, discovery_rssi).await
                     {
-                        warn!(light = %label, error = %e, "session ended; will reconnect");
+                        warn!(light = %label, error = %format!("{e:#}"), "session ended; will reconnect");
                     }
                 }
-                Err(e) => warn!(light = %label, error = %e, "connect/verify failed"),
+                Err(e) => warn!(light = %label, error = %format!("{e:#}"), "connect/verify failed"),
             }
 
             // Best-effort disconnect so the OS doesn't keep a half-open handle.
@@ -241,7 +280,7 @@ impl LightActor {
                     let now = std::time::Instant::now();
                     if report_due(last_err_report, now, MISSING_REPORT) {
                         warn!(
-                            light = %label, error = %e, suppressed = err_suppressed,
+                            light = %label, error = %format!("{e:#}"), suppressed = err_suppressed,
                             "error listing peripherals"
                         );
                         last_err_report = Some(now);
@@ -313,11 +352,18 @@ impl LightActor {
         // for MAC-carrying drivers (classic/infinity, not Home). Pure telemetry, all
         // best-effort — a light without notify is still fully controllable.
         let query_mac = driver.mac();
+        // Whether the operator has been WARNED that telemetry is off. Only a
+        // failed subscribe warns (a stream merely ending mid-session is debug),
+        // so this is what decides whether a later re-subscribe owes them a
+        // matching `info` release line or is just noise — the same
+        // warn-needs-a-release rule as `probe_edge` above.
+        let mut notify_warned = false;
         let mut notif = match &chars.notify {
             Some(nc) => match ble::subscribe_notify(p, nc).await {
                 Ok(stream) => Some(stream),
                 Err(e) => {
-                    warn!(light = %label, error = %e, "notify subscribe failed; status reads disabled");
+                    notify_warned = true;
+                    warn!(light = %label, error = %format!("{e:#}"), "notify subscribe failed; status reads disabled");
                     None
                 }
             },
@@ -391,7 +437,15 @@ impl LightActor {
                     if notif.is_none() {
                         if let Some(nc) = &chars.notify {
                             if let Ok(stream) = ble::subscribe_notify(p, nc).await {
-                                debug!(light = %label, "notify stream re-subscribed");
+                                // `info` only if the loss was WARNED about, so the
+                                // warning gets its release line; a stream that
+                                // merely ended (debug) recovers at debug too.
+                                if notify_warned {
+                                    notify_warned = false;
+                                    info!(light = %label, "notify stream re-subscribed; status reads back on");
+                                } else {
+                                    debug!(light = %label, "notify stream re-subscribed");
+                                }
                                 notif = Some(stream);
                             }
                         }
@@ -406,16 +460,27 @@ impl LightActor {
                         Some(rc) => ble::probe_read(p, rc, PROBE_TIMEOUT).await,
                         None => true,
                     };
-                    if conn_ok {
-                        if failures > 0 {
-                            debug!(light = %label, "connection restored");
+                    match probe_edge(conn_ok, failures, MAX_PROBE_FAILURES) {
+                        ProbeEdge::Healthy => {}
+                        // A blip that clears must SAY so at `info`: every failure
+                        // below warns, so a recovery logged at `debug` left the
+                        // default-level log showing a warning that never resolved.
+                        ProbeEdge::Recovered { after } => {
+                            info!(light = %label, after_failures = after, rssi = ?rssi,
+                                  "connection probe recovered");
+                            failures = 0;
                         }
-                        failures = 0;
-                    } else {
-                        failures += 1;
-                        warn!(light = %label, failures, rssi = ?rssi, "connection probe failed (GATT read)");
-                        if failures >= MAX_PROBE_FAILURES {
-                            bail!("dead link: {failures} consecutive GATT-read failures");
+                        ProbeEdge::Failed { failures: n } => {
+                            failures = n;
+                            warn!(light = %label, failures = n, rssi = ?rssi,
+                                  "connection probe failed (GATT read)");
+                        }
+                        // Still warns first, exactly as before, so the failure
+                        // log stream is unchanged — only the recovery edge moved.
+                        ProbeEdge::Dead { failures: n } => {
+                            warn!(light = %label, failures = n, rssi = ?rssi,
+                                  "connection probe failed (GATT read)");
+                            bail!("dead link: {n} consecutive GATT-read failures");
                         }
                     }
 
@@ -612,6 +677,53 @@ mod tests {
         // A `now` that appears to precede the last report saturates to zero
         // rather than panicking, and simply isn't due.
         assert!(!report_due(Some(t0 + Duration::from_secs(10)), t0, MISSING_REPORT));
+    }
+
+    #[test]
+    fn probe_edge_announces_recovery_as_well_as_failure() {
+        use ProbeEdge::*;
+        // Healthy link, nothing outstanding — silent.
+        assert_eq!(probe_edge(true, 0, MAX_PROBE_FAILURES), Healthy);
+        // A blip that clears: this is the edge that used to log at `debug`, so a
+        // WARN was left standing with no resolution at the default level.
+        assert_eq!(probe_edge(true, 1, MAX_PROBE_FAILURES), Recovered { after: 1 });
+        assert_eq!(probe_edge(true, 2, MAX_PROBE_FAILURES), Recovered { after: 2 });
+        // Failures accumulate; the count reported is AFTER this probe.
+        assert_eq!(probe_edge(false, 0, MAX_PROBE_FAILURES), Failed { failures: 1 });
+        assert_eq!(probe_edge(false, 1, MAX_PROBE_FAILURES), Failed { failures: 2 });
+        // Reaching the limit is fatal to the session (inclusive, as before).
+        assert_eq!(probe_edge(false, 2, MAX_PROBE_FAILURES), Dead { failures: 3 });
+        assert_eq!(probe_edge(false, 9, MAX_PROBE_FAILURES), Dead { failures: 10 });
+        // A one-probe limit is dead on the first miss, not "failed then dead".
+        assert_eq!(probe_edge(false, 0, 1), Dead { failures: 1 });
+        // Saturates rather than wrapping if the count is ever absurd.
+        assert_eq!(probe_edge(false, u32::MAX, MAX_PROBE_FAILURES), Dead { failures: u32::MAX });
+
+        // Walk a full miss → miss → recover → miss cycle and confirm the loop's
+        // bookkeeping: without a Recovered edge that resets the count, a second
+        // blip would be reported as the third failure and kill a healthy link.
+        let mut failures = 0u32;
+        let mut seen = Vec::new();
+        for ok in [true, false, false, true, false, true] {
+            let e = probe_edge(ok, failures, MAX_PROBE_FAILURES);
+            match e {
+                Recovered { .. } => failures = 0,
+                Failed { failures: n } => failures = n,
+                Dead { .. } | Healthy => {}
+            }
+            seen.push(e);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Healthy,
+                Failed { failures: 1 },
+                Failed { failures: 2 },
+                Recovered { after: 2 },
+                Failed { failures: 1 },
+                Recovered { after: 1 },
+            ]
+        );
     }
 
     #[test]

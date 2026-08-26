@@ -20,6 +20,15 @@ pub const ARTNET_PORT: u16 = 6454;
 /// light's addressing, and on the merger's per-universe buffers.
 pub const DMX_UNIVERSE_SIZE: u16 = 512;
 
+/// Largest valid Port-Address: the field is 15 bits (`Net(7) | Sub-Net(4) |
+/// Universe(4)`), so 0..=32767.
+///
+/// Anything above this cannot be transmitted — [`encode_artdmx`] masks `Net` to
+/// its 7 bits — so every user-supplied universe must be checked against this
+/// rather than silently truncated. Shared by config validation and the
+/// `artnet-send` helper so the two can't disagree about the limit.
+pub const MAX_PORT_ADDRESS: u16 = 0x7FFF;
+
 const ARTNET_ID: &[u8; 8] = b"Art-Net\0";
 const OP_DMX: u16 = 0x5000;
 

@@ -201,10 +201,13 @@ pub struct LightCfg {
     pub cct_max: u8,
     /// Advanced-mode frame family — the app's per-model `commandType`. **2** =
     /// Infinity fixtures (TL120C): XY/RGBCW/FX need the MAC-embedded frames
-    /// (`0xB7`/`0xA9`/`0x91`). **0/1** = direct frames (`0xB9`/`0xA8`/`0x8B`;
-    /// HW-verified on the TL21C, whose FX only renders via direct `0x8B`).
-    /// `add` fills this from the model catalog; defaults to 2 (the previous
-    /// always-MAC behaviour) for hand-written entries.
+    /// (`0xB7`/`0xA9`/`0x91`). **Anything else** = direct frames
+    /// (`0xB9`/`0xA8`/`0x8B`; HW-verified on the TL21C, whose FX only renders
+    /// via direct `0x8B`). `add` fills this from the model catalog; defaults to
+    /// 2 (the previous always-MAC behaviour) for hand-written entries.
+    ///
+    /// Valid values are 0..=[`MAX_CMD_TYPE`] — see that constant for why the
+    /// bound is what it is.
     #[serde(default = "default_cmd_type")]
     pub cmd_type: u8,
 }
@@ -297,6 +300,19 @@ fn default_cct_max() -> u8 {
 fn default_cmd_type() -> u8 {
     2
 }
+/// Largest `cmd_type` a light may declare — the top of the app's `commandType`
+/// space as it appears in the model catalog (`models.toml` currently emits 0, 1,
+/// 2 and **3**; the 3 belongs to the `ZRP`).
+///
+/// The bound exists only to catch a typo such as `cmd_type = 20`, which would
+/// silently mean "direct frames" and leave a TL120C ignoring every advanced
+/// mode. It must therefore never be tighter than what the catalog itself emits:
+/// it used to be 2, so `add`-ing a `ZRP` built a config the validator then
+/// refused — after the scan, the blink and every prompt — complaining about a
+/// field the user never typed, and the light could not be added at all.
+/// `models::tests::every_model_produces_a_config_the_validator_accepts` is what
+/// keeps the two in step if the catalog is ever regenerated wider.
+pub const MAX_CMD_TYPE: u8 = 3;
 fn default_failsafe_mode() -> String {
     "hold".into()
 }
@@ -526,13 +542,31 @@ impl Config {
                 }
             }
         }
+        // Turning the console off with no file sink installs NO logging layer at
+        // all, so the process goes completely dark — measured: a failing command
+        // exits 1 having written **zero bytes**, including the error explaining
+        // why. `console = false` reads as "quieter", not "discard every
+        // diagnostic this program will ever produce", and there is no way to
+        // discover the difference from the outside. Same rule as the zero-valued
+        // settings below: refuse a setting that silently does something else.
+        // (A config that fails to validate still gets DEFAULT logging — `main`
+        // falls back with `unwrap_or_default` — so this message is always
+        // visible, even though it is a message about logging being off.)
+        let file_sink = self.logging.file.as_deref().is_some_and(|p| !p.is_empty());
+        if !self.logging.console && !file_sink {
+            bail!(
+                "[logging] console = false with no `file` set would disable logging \
+                 entirely — even fatal errors would be silent. Set `file = \"…\"` to \
+                 log to disk instead, or leave `console = true`."
+            );
+        }
         // Rotation sizes only matter when a file sink is configured. Zero is a
         // typo, not a setting — it reads as "unlimited"/"no rotations" but the
         // writer clamps it to 1, so the user silently gets a 1 MB / 1-file log.
         // Say so instead of quietly doing something else (the same rule the
         // [ble] zero-value checks above exist for). The condition below is the
         // same "is the file sink on?" test logging::init uses.
-        if self.logging.file.as_deref().is_some_and(|p| !p.is_empty()) {
+        if file_sink {
             if self.logging.max_size_mb == 0 {
                 bail!("[logging] max_size_mb must be ≥ 1 (size in MB at which the log file rotates)");
             }
@@ -549,8 +583,9 @@ impl Config {
             let profile = crate::profile::Profile::parse(&l.profile).ok_or_else(|| {
                 anyhow::anyhow!("{who}: unknown profile {:?}; expected one of {KNOWN_PROFILES:?}", l.profile)
             })?;
-            if l.universe > 32767 {
-                bail!("{who}: universe {} out of range (0..=32767)", l.universe);
+            let max_pa = crate::artnet::MAX_PORT_ADDRESS;
+            if l.universe > max_pa {
+                bail!("{who}: universe {} out of range (0..={max_pa})", l.universe);
             }
             let universe_size = crate::artnet::DMX_UNIVERSE_SIZE;
             if l.address < 1 || l.address > universe_size {
@@ -572,8 +607,12 @@ impl Config {
                     l.cct_min, l.cct_max
                 );
             }
-            if l.cmd_type > 2 {
-                bail!("{who}: cmd_type {} out of range (0..=2; 2 = MAC-embedded advanced frames)", l.cmd_type);
+            if l.cmd_type > MAX_CMD_TYPE {
+                bail!(
+                    "{who}: cmd_type {} out of range (0..={MAX_CMD_TYPE}; 2 = MAC-embedded \
+                     advanced frames, anything else = direct)",
+                    l.cmd_type
+                );
             }
         }
         // Detect duplicate MAC bindings — a config mistake that would make the
@@ -1338,6 +1377,31 @@ port = 6999
 
         c.logging.max_files = 5;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_completely_silenced_logger() {
+        // `console = false` with no file installs no logging layer at all, so the
+        // binary writes nothing whatsoever — measured: a failing command exited 1
+        // with zero bytes of output, error included.
+        let mut c = Config::default();
+        c.logging.console = false;
+        let err = c.validate().expect_err("a silent logger must be rejected");
+        assert!(format!("{err:#}").contains("disable logging entirely"), "{err:#}");
+
+        // An empty `file` is the same as no file (that's how `logging::init`
+        // tests it), so it must not be a way round the check.
+        c.logging.file = Some(String::new());
+        assert!(c.validate().is_err(), "an empty file path is not a file sink");
+
+        // Console off WITH a file is a perfectly ordinary daemon setup.
+        c.logging.file = Some("bridge.log".into());
+        c.validate().unwrap();
+
+        // …and console on with no file is the default.
+        let c = Config::default();
+        assert!(c.logging.console && c.logging.file.is_none());
+        c.validate().unwrap();
     }
 
     #[test]

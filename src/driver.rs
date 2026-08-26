@@ -246,6 +246,35 @@ mod tests {
         assert_eq!(h.apply(&hsi_state(240, 100, 100)), home::hsi(1000, 240, 100));
     }
 
+    /// The exact BLE bytes `HARDWARE-BRINGUP.md` step 4 tells the operator to
+    /// expect, produced by running the real DMX → `LightState` → driver
+    /// pipeline. If this fails, either the mapper/encoder changed or the doc is
+    /// stale — fix whichever is wrong.
+    ///
+    /// This lived in `tests/bringup_bytes.rs`, which is **git-excluded**, so it
+    /// was never in a clone and never ran in CI: the tracked, public doc had no
+    /// guard against drifting from the code at all. Living in the lib, it ships
+    /// and runs everywhere `cargo test` does.
+    #[test]
+    fn cct_profile_pipeline_matches_the_bringup_doc_byte_table() {
+        use crate::profile::{map_dmx, CctRange};
+
+        let drv = Driver::Classic { supports_gm: false, mac: [0; 6], mac_frames: true };
+        let hex = |b: &[u8]| {
+            b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+        };
+        // (DMX [dimmer, cct], expected write) — the doc's table verbatim.
+        let cases: &[([u8; 2], &str)] = &[
+            ([255, 255], "78 87 02 64 38 9d"), // brr 100, cct 56
+            ([128, 255], "78 87 02 32 38 6b"), // brr 50,  cct 56
+            ([255, 0], "78 87 02 64 20 85"),   // brr 100, cct 32
+        ];
+        for (dmx, want) in cases {
+            let st = map_dmx(Profile::Cct, dmx, CctRange::default());
+            assert_eq!(hex(&drv.apply(&st)), *want, "dmx {dmx:?}");
+        }
+    }
+
     #[test]
     fn resolve_auto_detects_home_from_nh_name() {
         let mac = [0u8; 6];

@@ -144,62 +144,76 @@ pub async fn test(
     let peripheral = ble::find_by_mac(&adapter, mac, Duration::from_secs(seconds)).await?;
     let chars = ble::connect_and_verify(&peripheral).await?;
 
-    if let Some(notify) = &chars.notify {
-        ble::spawn_notify_logger(&peripheral, notify).await?;
-    }
+    // Did we take the blink/CCT path (the only one that actually uses `drv`)?
+    // `--status` and `--set` build their frames without it, so the "you used
+    // auto" hint below must not fire for them — as it didn't before, when they
+    // returned early.
+    let used_driver = !status && plan.is_none();
 
-    // Status read (`--status`): query firmware version / battery / temperature / state
-    // and print the decoded replies. Non-mutating — no blink, no colour change — so
-    // it's safe to run anytime. Short-circuits before the blink/CCT sequence.
-    // Both early paths disconnect explicitly (best-effort) so the light re-advertises
-    // immediately rather than waiting for the OS to reap the process's connection.
-    if status {
-        let res = test_status(&peripheral, &chars.write, mac_bytes).await;
-        let _ = ble::disconnect(&peripheral).await;
-        return res;
-    }
+    // Everything from here holds the light, so it runs inside one block with a
+    // SINGLE exit that always releases it. The `--status` and `--set` paths each
+    // used to disconnect by hand while every `?` on the main path (a failed
+    // notify subscribe, a failed blink write, a probe error) returned with the
+    // connection still open — so the fixture only re-advertised once the OS
+    // reaped the process. One owner, one disconnect, no path that can skip it.
+    let res: Result<()> = async {
+        if let Some(notify) = &chars.notify {
+            ble::spawn_notify_logger(&peripheral, notify).await?;
+        }
 
-    // Single-frame set (`--set SPEC`): send exactly one frame (or pixel palette) and
-    // hold it, for guided one-at-a-time testing. The light keeps the state after
-    // disconnect. Short-circuits before the blink/CCT sequence.
-    if let Some(plan) = plan {
-        let res = test_set(&peripheral, &chars.write, plan).await;
-        let _ = ble::disconnect(&peripheral).await;
-        return res;
-    }
+        // Status read (`--status`): query firmware version / battery / temperature /
+        // state and print the decoded replies. Non-mutating — no blink, no colour
+        // change — so it's safe to run anytime. Short-circuits before the blink/CCT
+        // sequence.
+        if status {
+            return test_status(&peripheral, &chars.write, mac_bytes).await;
+        }
 
-    info!(driver, "blinking light to identify (3×) — watch which fixture flashes");
-    for n in 1..=3 {
-        info!(blink = n, "power OFF");
-        ble::write_command(&peripheral, &chars.write, &drv.power(mac_bytes, false)).await?;
-        tokio::time::sleep(BLINK_STEP).await;
-        info!(blink = n, "power ON");
-        ble::write_command(&peripheral, &chars.write, &drv.power(mac_bytes, true)).await?;
-        tokio::time::sleep(BLINK_STEP).await;
-    }
+        // Single-frame set (`--set SPEC`): send exactly one frame (or pixel palette)
+        // and hold it, for guided one-at-a-time testing. The light keeps the state
+        // after disconnect. Short-circuits before the blink/CCT sequence.
+        if let Some(plan) = plan {
+            return test_set(&peripheral, &chars.write, plan).await;
+        }
 
-    info!("setting CCT: 5600K @ 50% brightness");
-    // cct raw 56 = 5600K for most lights; 50 = 50% brightness.
-    ble::write_command(&peripheral, &chars.write, &drv.cct(mac_bytes, 50, 56)).await?;
+        info!(driver, "blinking light to identify (3×) — watch which fixture flashes");
+        for n in 1..=3 {
+            info!(blink = n, "power OFF");
+            ble::write_command(&peripheral, &chars.write, &drv.power(mac_bytes, false)).await?;
+            tokio::time::sleep(BLINK_STEP).await;
+            info!(blink = n, "power ON");
+            ble::write_command(&peripheral, &chars.write, &drv.power(mac_bytes, true)).await?;
+            tokio::time::sleep(BLINK_STEP).await;
+        }
 
-    if colors {
-        probe_colors(&peripheral, &chars.write, drv, mac_bytes).await?;
-    }
-    if modes {
-        probe_modes(&peripheral, &chars.write, drv, mac_bytes).await?;
-    }
-    if pixel_probe {
-        probe_pixel(&peripheral, &chars.write, drv, mac_bytes).await?;
-    }
+        info!("setting CCT: 5600K @ 50% brightness");
+        // cct raw 56 = 5600K for most lights; 50 = 50% brightness.
+        ble::write_command(&peripheral, &chars.write, &drv.cct(mac_bytes, 50, 56)).await?;
 
-    // Give notifications a moment to arrive, then leave cleanly.
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    info!("test complete; disconnecting");
+        if colors {
+            probe_colors(&peripheral, &chars.write, drv, mac_bytes).await?;
+        }
+        if modes {
+            probe_modes(&peripheral, &chars.write, drv, mac_bytes).await?;
+        }
+        if pixel_probe {
+            probe_pixel(&peripheral, &chars.write, drv, mac_bytes).await?;
+        }
+
+        // Give notifications a moment to arrive, then leave cleanly.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        info!("test complete; disconnecting");
+        Ok(())
+    }
+    .await;
+
     if let Err(e) = ble::disconnect(&peripheral).await {
         // Non-fatal — log and move on.
         tracing::warn!(error = %e, "disconnect returned an error");
     }
-    if drv == TestDriver::Auto {
+    res?;
+
+    if used_driver && drv == TestDriver::Auto {
         tracing::warn!(
             "--driver was 'auto'; sent CLASSIC commands. If nothing happened, retry with \
              --driver infinity (newer lights) or --driver home (NH-* devices)."

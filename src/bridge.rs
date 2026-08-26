@@ -23,7 +23,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
 use crate::ble;
-use crate::config::{Config, FailsafeMode};
+use crate::config::{Config, FailsafeMode, LightCfg};
 use crate::light::LightActor;
 use crate::merge;
 use crate::profile::{extract_slice, map_dmx, CctRange, Profile};
@@ -34,6 +34,77 @@ use crate::scan;
 /// of them ends (see the `background` JoinSet in [`run`]).
 const SCAN_TASK: &str = "BLE discovery-scan coordinator";
 const FAILSAFE_TASK: &str = "ArtNet-loss failsafe";
+
+/// The log label for each configured light, in config order.
+///
+/// A light's label is its `name`, or its MAC when unnamed, and EVERY per-light
+/// line carries only that — `connecting`, `session active`, `power on`, the
+/// starved-channel warning, a failed connection probe. Two lights may perfectly
+/// legitimately share a name: `add` fills it from the model catalog, so adding
+/// two TL120Cs names **both** of them `TL120C`, and the log then cannot tell
+/// them apart at all. (Rejecting the config instead — the rule duplicate ArtNet
+/// *input* labels get — would break that ordinary workflow, so the labels are
+/// disambiguated rather than refused.)
+///
+/// Colliding labels gain a MAC suffix; unique ones are left exactly as written,
+/// so nothing changes for the common case. The short two-octet suffix is used
+/// when it is enough to separate them, and the full MAC when it is not (two
+/// same-named lights can share their last two octets) — MACs are validated
+/// unique, so the full form always resolves the collision.
+fn light_labels(lights: &[LightCfg]) -> Vec<String> {
+    fn tally(labels: &[String]) -> HashMap<&str, usize> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for l in labels {
+            *counts.entry(l.as_str()).or_default() += 1;
+        }
+        counts
+    }
+    // Two octets, e.g. `EE:FF`. Built from the parsed bytes rather than by
+    // slicing the string, so an unparsable MAC can't panic on a char boundary.
+    fn short(mac: &str) -> String {
+        match crate::config::parse_mac(mac) {
+            Ok(b) => format!("{:02X}:{:02X}", b[4], b[5]),
+            Err(_) => mac.to_string(),
+        }
+    }
+
+    let base: Vec<String> = lights
+        .iter()
+        .map(|l| {
+            l.name
+                .as_deref()
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::config::normalize_mac(&l.mac))
+        })
+        .collect();
+
+    let counts = tally(&base);
+    let once: Vec<String> = base
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if counts[b.as_str()] > 1 {
+                format!("{b} ({})", short(&lights[i].mac))
+            } else {
+                b.clone()
+            }
+        })
+        .collect();
+
+    // Anything STILL duplicated shared its last two octets too — spell the MAC out.
+    let counts = tally(&once);
+    once.iter()
+        .enumerate()
+        .map(|(i, l)| {
+            if counts[l.as_str()] > 1 {
+                format!("{} ({})", base[i], crate::config::normalize_mac(&lights[i].mac))
+            } else {
+                l.clone()
+            }
+        })
+        .collect()
+}
 
 /// One DMX consumer: where a light lives in a universe and how to push to it.
 struct Sink {
@@ -143,7 +214,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     // never reconnecting - while the bridge reports healthy. LightActor::run
     // loops forever, so ANY join is a failure.
     let mut actors: JoinSet<String> = JoinSet::new();
-    for light in &cfg.lights {
+    // One label per light, disambiguated where two share a name (see
+    // `light_labels`). Computed ONCE so the sink and the actor provably log
+    // under the same name.
+    let labels = light_labels(&cfg.lights);
+    for (i, light) in cfg.lights.iter().enumerate() {
         let profile = Profile::parse(&light.profile).expect("validated profile");
         // Log the resolved personality per light at startup so the run log alone
         // shows what's driving each fixture — a light silently on the wrong profile
@@ -153,14 +228,13 @@ pub async fn run(cfg: Config) -> Result<()> {
         let channels = format!("{}-{}", light.address, last_ch);
         // Same label the per-light actor logs under, so a starved-channel warning
         // lines up with that light's connect/session lines.
-        let label = light
-            .name
-            .as_deref()
-            .filter(|n| !n.is_empty())
-            .unwrap_or(&light.mac)
-            .to_string();
+        let label = labels[i].clone();
         info!(
             name = light.name.as_deref().filter(|n| !n.is_empty()).unwrap_or("(unnamed)"),
+            // The label is what every later per-light line is tagged with, and it
+            // is not always the configured name (see `light_labels`), so print the
+            // mapping here rather than leaving the operator to infer it.
+            label = %label,
             mac = %light.mac,
             profile = %light.profile,
             universe = light.universe,
@@ -200,6 +274,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
         let actor = LightActor::new(
             light.clone(),
+            label.clone(),
             adapter.clone(),
             rx,
             cfg.ble.flush_hz,
@@ -519,6 +594,78 @@ mod tests {
             starved: AtomicBool::new(false),
         };
         (s, rx)
+    }
+
+    fn cfg_light(mac: &str, name: Option<&str>) -> LightCfg {
+        LightCfg {
+            mac: mac.into(),
+            name: name.map(str::to_string),
+            driver: "auto".into(),
+            profile: "rgb".into(),
+            universe: 0,
+            address: 1,
+            power_on_connect: true,
+            cct_min: 32,
+            cct_max: 56,
+            cmd_type: 2,
+        }
+    }
+
+    #[test]
+    fn light_labels_disambiguate_only_when_they_collide() {
+        // The common case must be untouched: distinct names stay verbatim.
+        let labels = light_labels(&[
+            cfg_light("AA:BB:CC:DD:EE:01", Some("Key light")),
+            cfg_light("AA:BB:CC:DD:EE:02", Some("Fill")),
+        ]);
+        assert_eq!(labels, vec!["Key light", "Fill"]);
+
+        // `add` fills the name from the model catalog, so adding two TL120Cs
+        // names BOTH of them "TL120C" — and every per-light log line carries
+        // only the label, which made them indistinguishable at runtime.
+        let labels = light_labels(&[
+            cfg_light("D6:50:F2:F6:BB:1B", Some("TL120C")),
+            cfg_light("CB:33:5A:EE:5A:7C", Some("TL120C")),
+            cfg_light("FA:F8:A9:B9:41:1C", Some("TL21C")),
+        ]);
+        assert_eq!(labels, vec!["TL120C (BB:1B)", "TL120C (5A:7C)", "TL21C"]);
+
+        // Unnamed / empty-named lights fall back to their normalised MAC, which
+        // config validation already guarantees is unique.
+        let labels = light_labels(&[
+            cfg_light("aa-bb-cc-dd-ee-01", None),
+            cfg_light("AA:BB:CC:DD:EE:02", Some("")),
+        ]);
+        assert_eq!(labels, vec!["AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02"]);
+
+        // Same name AND same last two octets: the short suffix is not enough, so
+        // the full MAC is spelled out. Without this fallback both would still
+        // read "Tube (EE:FF)" and the fix would not actually fix anything.
+        let labels = light_labels(&[
+            cfg_light("AA:BB:CC:DD:EE:FF", Some("Tube")),
+            cfg_light("11:22:33:44:EE:FF", Some("Tube")),
+        ]);
+        assert_eq!(
+            labels,
+            vec!["Tube (AA:BB:CC:DD:EE:FF)", "Tube (11:22:33:44:EE:FF)"]
+        );
+
+        // Whatever the shape, the result must be unique — that is the property
+        // the whole function exists for.
+        for lights in [
+            vec![cfg_light("AA:BB:CC:DD:EE:01", Some("x")), cfg_light("AA:BB:CC:DD:EE:02", Some("x"))],
+            vec![
+                cfg_light("AA:BB:CC:DD:EE:FF", Some("t")),
+                cfg_light("11:22:33:44:EE:FF", Some("t")),
+                cfg_light("99:88:77:66:EE:FF", Some("t")),
+                cfg_light("00:00:00:00:00:01", None),
+            ],
+            vec![],
+        ] {
+            let labels = light_labels(&lights);
+            let unique: std::collections::HashSet<&String> = labels.iter().collect();
+            assert_eq!(unique.len(), labels.len(), "labels not unique: {labels:?}");
+        }
     }
 
     #[test]

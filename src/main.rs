@@ -214,7 +214,13 @@ enum Command {
         #[arg(long)]
         confirm: bool,
         /// Seconds the link must stay connected in the pre-flash stability check.
-        #[arg(long, default_value_t = 20)]
+        ///
+        /// Must be ≥ 1: a zero-second "stability check" is not one, and it used
+        /// to run the check-loop body zero times while still reporting "link
+        /// held steady — OK to proceed" — the single safety gate before a
+        /// multi-minute firmware write, announcing a check it never performed.
+        /// Same rule the `[ble]` and `[logging]` zero-valued settings follow.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=3600))]
         settle_secs: u64,
         /// How long to wait to find the light, seconds.
         #[arg(long, default_value_t = 20)]
