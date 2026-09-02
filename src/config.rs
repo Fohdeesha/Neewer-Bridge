@@ -128,6 +128,14 @@ pub struct Ble {
     /// missing (still off once all are connected).
     #[serde(default = "default_scan_pause_secs")]
     pub scan_pause_secs: u64,
+    /// What the bridge may do when the OS Bluetooth stack's record of a light
+    /// goes stale — it reports the light connected with no link behind it, its
+    /// connect is a silent no-op and its disconnect never completes (seen on
+    /// BlueZ; see `recovery.rs`). `auto` = power-cycle the adapter, then restart
+    /// bluetoothd if the record survives; `adapter` = the power-cycle only;
+    /// `off` = park the light and log until the record clears by other means.
+    #[serde(default = "default_stale_link_recovery")]
+    pub stale_link_recovery: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -231,6 +239,7 @@ impl Default for Ble {
             probe_secs: default_probe_secs(),
             scan_window_secs: default_scan_window_secs(),
             scan_pause_secs: default_scan_pause_secs(),
+            stale_link_recovery: default_stale_link_recovery(),
         }
     }
 }
@@ -285,6 +294,12 @@ fn default_scan_window_secs() -> u64 {
 }
 fn default_scan_pause_secs() -> u64 {
     15
+}
+/// Full ladder by default: the bridge is meant to run unattended on a box whose
+/// Bluetooth exists for the lights, and a stale record otherwise parks a light
+/// until a human restarts bluetoothd.
+fn default_stale_link_recovery() -> String {
+    crate::recovery::RecoveryMode::Auto.as_str().into()
 }
 /// Default CCT scaling range (raw ×100K): 3200K..5600K, the common bi-color span.
 pub const DEFAULT_CCT_MIN: u8 = 32;
@@ -528,6 +543,13 @@ impl Config {
                 "[ble] scan_window_secs must be ≥ 1 (a 0-second scan burst would just \
                  hammer the adapter with start/stop-scan; use scan_pause_secs = 0 for \
                  a continuous scan while a light is missing)"
+            );
+        }
+        if crate::recovery::RecoveryMode::parse(&self.ble.stale_link_recovery).is_none() {
+            bail!(
+                "[ble] stale_link_recovery {:?} unknown; expected one of {:?}",
+                self.ble.stale_link_recovery,
+                crate::recovery::RecoveryMode::NAMES
             );
         }
         // Logging levels (global + optional per-destination overrides).
@@ -1044,6 +1066,19 @@ port = 6999
 
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_checks_the_stale_link_recovery_mode() {
+        let mut c = Config::default();
+        assert_eq!(c.ble.stale_link_recovery, "auto", "the default must be the full ladder");
+        for ok in ["auto", "adapter", "off", "AUTO", " off "] {
+            c.ble.stale_link_recovery = ok.into();
+            c.validate().unwrap_or_else(|e| panic!("{ok:?} must validate: {e}"));
+        }
+        c.ble.stale_link_recovery = "none".into();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("stale_link_recovery") && err.contains("\"none\""), "{err}");
     }
 
     #[test]

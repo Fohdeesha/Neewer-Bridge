@@ -86,6 +86,7 @@ port    = 6454
 [ble]
 adapter  = "default"    # or an index ("0") or a name substring
 flush_hz = 15           # max BLE updates per light per second
+stale_link_recovery = "auto"   # Linux: how to clear a stale BlueZ device record (see the example config)
 
 [failsafe]              # what to do when ArtNet for a universe stops arriving
 mode         = "hold"   # hold | blackout | poweroff
@@ -222,6 +223,15 @@ for each source.
   light and its channel range; `neewer-bridge lights` shows where each one sits.
 - **ArtNet isn't arriving.** Check the source targets this host's IP and the
   right universe. `neewer-bridge monitor` shows what's actually being received.
+- **A light shows as connected but ignores everything, or the whole fleet went
+  dark with `maximum number of pending replies` in the log.** The OS Bluetooth
+  stack's record of a light has gone stale (BlueZ keeps it marked connected
+  after the link died, so connects do nothing and disconnects never finish).
+  The bridge detects this, parks the light and clears the record by
+  power-cycling the adapter or, if needed, restarting bluetoothd — see
+  `stale_link_recovery` in the example config. With that turned off,
+  `systemctl restart bluetooth` clears it by hand. If its Bluetooth session is
+  ever refused outright, the bridge restarts itself and logs why.
 
 ## Building from source
 

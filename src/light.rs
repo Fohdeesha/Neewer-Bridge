@@ -22,13 +22,20 @@
 //! - status reads (battery/temperature/firmware/state) alongside each probe, purely
 //!   as logged telemetry — a light without notify is still fully controllable.
 //! - reconnect with jittered backoff (de-syncs the fleet), indefinitely.
+//! - **stale platform records:** a disconnect the OS stack never answers means
+//!   its record of the light is stale (reported connected, no link — BlueZ does
+//!   this; see `recovery.rs`). Retrying would leak one D-Bus reply slot per
+//!   attempt until the whole session is refused, which is how the fleet went
+//!   dark for four days in 2026-09. So the hang is detected once, handed to the
+//!   fleet-wide recovery gate, and the light is parked off the bus until the
+//!   record clears — see [`LightActor::stale_link`].
 //!
 //! Because binding is by MAC and the actor exists for the whole process
 //! lifetime, the DMX→light mapping is stable regardless of power-on/discovery
 //! order — a light that's currently absent simply keeps retrying.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use btleplug::api::Characteristic;
@@ -36,14 +43,15 @@ use btleplug::platform::{Adapter, Peripheral};
 use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::ble::{self, NeewerChars};
+use crate::ble::{self, DisconnectOutcome, NeewerChars};
 use crate::config::{parse_mac, LightCfg};
 use crate::driver::Driver;
 use crate::profile::Profile;
 use crate::protocol::replies::{self, Reply};
 use crate::protocol::{queries, LightState};
+use crate::recovery::{Outcome, StaleLinkRecovery};
 use crate::scan::ScanCoordinator;
 
 /// Whether a rate-limited repeat is due: nothing reported yet, or `every` has
@@ -112,6 +120,10 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(4);
 const QUERY_SPACING: Duration = Duration::from_millis(60);
 /// Gap between the sub-frames of a multi-frame (pixel) state, matching the app.
 const PIXEL_FRAME_SPACING: Duration = Duration::from_millis(80);
+/// While parked on a stale platform record: how often to re-read the record.
+const STALE_RECHECK: Duration = Duration::from_secs(60);
+/// While parked: how often to repeat the warning that the light is not driven.
+const STALE_REPORT: Duration = Duration::from_secs(600);
 
 pub struct LightActor {
     cfg: LightCfg,
@@ -124,6 +136,8 @@ pub struct LightActor {
     flush_hz: u32,
     probe_secs: u64,
     scan: Arc<ScanCoordinator>,
+    /// Fleet-wide stale-record recovery gate (see `recovery.rs`).
+    recovery: Arc<StaleLinkRecovery>,
 }
 
 impl LightActor {
@@ -136,8 +150,9 @@ impl LightActor {
         flush_hz: u32,
         probe_secs: u64,
         scan: Arc<ScanCoordinator>,
+        recovery: Arc<StaleLinkRecovery>,
     ) -> Self {
-        Self { cfg, label, adapter, rx, flush_hz, probe_secs, scan }
+        Self { cfg, label, adapter, rx, flush_hz, probe_secs, scan, recovery }
     }
 
     fn label(&self) -> String {
@@ -191,8 +206,26 @@ impl LightActor {
                 Err(e) => warn!(light = %label, error = %format!("{e:#}"), "connect/verify failed"),
             }
 
-            // Best-effort disconnect so the OS doesn't keep a half-open handle.
-            let _ = ble::disconnect(&peripheral).await;
+            // Release the link so the OS doesn't keep a half-open handle. Bounded,
+            // and the one outcome that must never be retried is handled here: a
+            // disconnect the platform never answers means its record of this
+            // light is stale, and every further attempt would leak a D-Bus reply
+            // slot the session never gets back (recovery.rs has the whole story).
+            match ble::disconnect_outcome(&peripheral).await {
+                DisconnectOutcome::Done => {}
+                DisconnectOutcome::Failed(e) => {
+                    debug!(light = %label, error = %format!("{e:#}"), "disconnect returned an error (ignored)")
+                }
+                DisconnectOutcome::Hung => {
+                    // Nothing to discover while the platform insists the light
+                    // is connected — scanning would not help, so release the
+                    // request before parking.
+                    drop(searching.take());
+                    if self.confirm_stale(&label, &peripheral).await {
+                        self.stale_link(&label, &peripheral).await;
+                    }
+                }
+            }
             // Release the discovery request (if still held after a failed
             // connect) so we don't scan during the backoff sleep.
             drop(searching.take());
@@ -208,6 +241,123 @@ impl LightActor {
             let backoff = RECONNECT_BACKOFF + Duration::from_millis(jitter_ms);
             info!(light = %label, backoff_secs = backoff.as_secs_f32(), "disconnected; reconnecting after backoff");
             tokio::time::sleep(backoff).await;
+        }
+    }
+
+    /// A disconnect went unanswered. Is the platform's record of this light
+    /// really stale, or is the platform merely unresponsive right now? Only
+    /// the first is the recovery ladder's business — power-cycling the adapter
+    /// (or restarting bluetoothd) because the daemon was busy for ten seconds
+    /// would drop every healthy light for nothing, and a frozen daemon made
+    /// exactly that happen on the rig (2026-09-02, bluetoothd SIGSTOPped: three
+    /// healthy lights reported "stale" and one adapter cycle ran). So the record
+    /// is called stale only when the platform POSITIVELY answers "connected" for
+    /// the light and then leaves a second disconnect unanswered too. A platform
+    /// that cannot answer the question at all is left to the stack watchdog
+    /// (`bridge.rs`). The retry costs one more leaked reply slot in the genuine
+    /// case — two per episode, and the ladder then clears the record.
+    async fn confirm_stale(&self, label: &str, p: &Peripheral) -> bool {
+        match ble::connected_state(p).await {
+            Err(e) => {
+                warn!(
+                    light = %label, error = %format!("{e:#}"),
+                    "disconnect went unanswered and the platform cannot say whether the light \
+                     is connected — leaving it to the BLE stack watchdog"
+                );
+                false
+            }
+            Ok(false) => {
+                debug!(light = %label, "disconnect went unanswered but the platform now reports the light disconnected");
+                false
+            }
+            Ok(true) => match ble::disconnect_outcome(p).await {
+                DisconnectOutcome::Hung => true,
+                DisconnectOutcome::Done | DisconnectOutcome::Failed(_) => {
+                    info!(
+                        light = %label,
+                        "a disconnect went unanswered once but the platform answered the retry — \
+                         a transient stall, not a stale record"
+                    );
+                    false
+                }
+            },
+        }
+    }
+
+    /// The platform never answered a disconnect for this light: its record is
+    /// stale — still "connected", no link behind it, connect a silent no-op.
+    /// Ask the fleet-wide gate to clear it (adapter power-cycle, then a
+    /// bluetoothd restart, as `[ble] stale_link_recovery` allows), and if that
+    /// does not do it, PARK: no connect, no disconnect, no listing — nothing
+    /// that could hang — just a cheap property read every [`STALE_RECHECK`]
+    /// until the record reads "not connected" (or vanishes, e.g. bluetoothd
+    /// restarted by hand), re-warning every [`STALE_REPORT`] so a light the
+    /// bridge is not driving is never invisible in the log. Returns once the
+    /// record has cleared; the caller's loop then re-discovers and reconnects.
+    async fn stale_link(&self, label: &str, p: &Peripheral) {
+        warn!(
+            light = %label, mode = %self.recovery.mode(),
+            "the platform still reports this light connected but its link is gone and the \
+             disconnect request never completed (stale device record) — starting recovery"
+        );
+        let still_stale = || ble::is_connected(p);
+        let mut outcome = self.recovery.recover(label, still_stale).await;
+        let parked_at = Instant::now();
+        let mut next_report = STALE_REPORT;
+        loop {
+            match outcome {
+                Outcome::AlreadyClear | Outcome::Cleared(_) => {
+                    let how = match outcome {
+                        Outcome::Cleared(step) => format!("cleared by the {step}"),
+                        _ => "already clear".to_string(),
+                    };
+                    info!(light = %label, parked_secs = parked_at.elapsed().as_secs(), "stale device record {how}; reconnecting");
+                    return;
+                }
+                Outcome::StillStale => error!(
+                    light = %label,
+                    "stale device record survived every permitted recovery step — parking this \
+                     light until the record clears (restart bluetoothd or power-cycle the adapter)"
+                ),
+                Outcome::RateLimited => warn!(
+                    light = %label,
+                    "stale device record: recovery ran recently for another light — parking \
+                     this light and retrying when a step is due again"
+                ),
+                Outcome::Disabled => warn!(
+                    light = %label,
+                    "stale device record: stale_link_recovery = \"off\" — parking this light; \
+                     clear it by hand (restart bluetoothd or power-cycle the adapter)"
+                ),
+            }
+            // A run that exhausted the ladder does not get to repeat it — that
+            // would power-cycle the adapter every couple of minutes, dropping the
+            // healthy lights each time, for a record it has already failed to
+            // clear. Only a rate-limited run (the steps were skipped, not
+            // failed) retries once they are due.
+            let may_retry = matches!(outcome, Outcome::RateLimited);
+            loop {
+                tokio::time::sleep(STALE_RECHECK).await;
+                if !ble::is_connected(p).await {
+                    info!(light = %label, parked_secs = parked_at.elapsed().as_secs(), "stale device record cleared; reconnecting");
+                    return;
+                }
+                if may_retry {
+                    outcome = self.recovery.recover(label, still_stale).await;
+                    if !matches!(outcome, Outcome::RateLimited) {
+                        break; // re-enter the outer match to log the new outcome
+                    }
+                }
+                if parked_at.elapsed() >= next_report {
+                    next_report += STALE_REPORT;
+                    error!(
+                        light = %label, parked_secs = parked_at.elapsed().as_secs(),
+                        "still parked on a stale device record — this light is not being driven; \
+                         restart bluetoothd (`systemctl restart bluetooth`) or power-cycle the \
+                         adapter to clear it"
+                    );
+                }
+            }
         }
     }
 

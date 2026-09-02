@@ -16,4 +16,5 @@ pub mod merge;
 pub mod models;
 pub mod profile;
 pub mod protocol;
+pub mod recovery;
 pub mod scan;

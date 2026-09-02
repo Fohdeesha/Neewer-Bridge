@@ -10,6 +10,11 @@
 //!
 //! The `watch` channel coalesces for free: a fast ArtNet stream only ever leaves
 //! the *latest* `LightState` for the actor to read at its flush rate.
+//!
+//! [`run`] supervises all of it: any task dying, or the BLE session being judged
+//! unusable by the stack watchdog, tears the whole bridge down and rebuilds it
+//! after a backoff — in-process, so a bare `neewer-bridge` in a screen session
+//! gets the same treatment a systemd `Restart=` would give it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,9 +23,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::watch;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::ble;
 use crate::config::{Config, FailsafeMode, LightCfg};
@@ -28,12 +33,14 @@ use crate::light::LightActor;
 use crate::merge;
 use crate::profile::{extract_slice, map_dmx, CctRange, Profile};
 use crate::protocol::LightState;
+use crate::recovery::{RecoveryMode, StaleLinkRecovery};
 use crate::scan;
 
-/// Names for the supervised background tasks, used in the fatal error when one
-/// of them ends (see the `background` JoinSet in [`run`]).
+/// Names for the supervised background tasks, used in the error when one of
+/// them ends (see the `background` JoinSet in [`start`]).
 const SCAN_TASK: &str = "BLE discovery-scan coordinator";
 const FAILSAFE_TASK: &str = "ArtNet-loss failsafe";
+const STACK_WATCHDOG_TASK: &str = "BLE stack watchdog";
 
 /// The log label for each configured light, in config order.
 ///
@@ -152,6 +159,17 @@ impl Sink {
     }
 }
 
+/// Run the bridge until Ctrl-C, restarting it in-process after any failure.
+///
+/// The FIRST start is fatal on error (an invalid config, a port already in use,
+/// no adapter — user-facing problems that must exit non-zero). Once the bridge
+/// has started it never gives up: a task that dies, a BLE session the watchdog
+/// judges unusable, or a failed restart is logged at ERROR and the whole bridge
+/// — sockets, adapter, actors, merger, failsafe — is torn down and rebuilt
+/// after a backoff ([`RestartPolicy`]). That is what a supervisor would do,
+/// done in-process, because the deployment this was written for runs the
+/// binary bare in a screen session: before this, a bridge whose BLE session
+/// had been refused by the bus sat "up" for four days driving nothing.
 pub async fn run(cfg: Config) -> Result<()> {
     // `Config::load` already validates, but `run` is a public entry point and
     // everything below relies on those invariants (profiles parse, MACs parse,
@@ -160,6 +178,194 @@ pub async fn run(cfg: Config) -> Result<()> {
     // in a spawned task into a plain startup error.
     cfg.validate().context("invalid bridge configuration")?;
 
+    let mut stack = ble::BleStack::new();
+    let mut policy = RestartPolicy::default();
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let started_at = Instant::now();
+        let outcome = match start(&cfg, &mut stack, attempt).await {
+            Ok(mut running) => {
+                let res = running.serve().await;
+                running.shutdown().await;
+                res
+            }
+            // The first start failing is the user's problem to fix, not ours to
+            // retry: a bad config, a busy port, no adapter.
+            Err(e) if attempt == 1 => return Err(e),
+            Err(e) => Err(e.context("bridge restart failed")),
+        };
+        let err = match outcome {
+            Ok(()) => return Ok(()), // Ctrl-C
+            Err(e) => e,
+        };
+        // A poisoned platform session can only be fixed by replacing it; any
+        // other failure keeps the session (opening a new one per restart would
+        // leak a bus connection each time — see `ble::BleStack`).
+        let poisoned =
+            ble::is_bus_poisoned(&err) || ble::stack_verdict() == ble::StackVerdict::Poisoned;
+        if poisoned {
+            stack.rebuild();
+        }
+        let delay = policy.next_delay(started_at.elapsed());
+        error!(
+            error = %format!("{err:#}"),
+            attempt,
+            rebuild_ble_session = poisoned,
+            retry_in_secs = delay.as_secs(),
+            "bridge failed — restarting"
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl-C received while waiting to restart — exiting");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// When to retry after a failure: [`RestartPolicy::MIN_DELAY`], doubling per
+/// consecutive failure up to [`RestartPolicy::MAX_DELAY`], and back to the
+/// minimum once a run has lasted [`RestartPolicy::HEALTHY_RUN`] (a bridge that
+/// ran for an hour and then died is not in a crash loop). Pure, so the schedule
+/// is pinned by a test.
+#[derive(Debug, Default)]
+pub struct RestartPolicy {
+    consecutive: u32,
+}
+
+impl RestartPolicy {
+    pub const MIN_DELAY: Duration = Duration::from_secs(5);
+    pub const MAX_DELAY: Duration = Duration::from_secs(300);
+    pub const HEALTHY_RUN: Duration = Duration::from_secs(600);
+
+    /// The delay before the next attempt, given how long the last run lasted.
+    pub fn next_delay(&mut self, last_run: Duration) -> Duration {
+        if last_run >= Self::HEALTHY_RUN {
+            self.consecutive = 0;
+        }
+        self.consecutive = self.consecutive.saturating_add(1);
+        let factor = 1u32.checked_shl(self.consecutive - 1).unwrap_or(u32::MAX);
+        Self::MIN_DELAY.saturating_mul(factor).min(Self::MAX_DELAY)
+    }
+}
+
+/// Why a supervised background task ended: `reason` is set when it ended on
+/// purpose (the stack watchdog giving up on the BLE session), `None` when it
+/// simply returned or panicked — which for these forever-loops is a bug.
+#[derive(Debug)]
+struct BackgroundExit {
+    task: &'static str,
+    reason: Option<String>,
+}
+
+/// A started bridge: every task it owns, so it can be served and then torn down
+/// completely before a restart (a leftover listener would keep the port).
+struct Running {
+    actors: JoinSet<String>,
+    background: JoinSet<BackgroundExit>,
+    listener: JoinHandle<Result<()>>,
+    /// Set once the listener branch has fired, so `shutdown` does not poll a
+    /// finished `JoinHandle` again.
+    listener_done: bool,
+    failsafe_mode: String,
+}
+
+impl Running {
+    /// Serve until Ctrl-C (`Ok`) or the first task failure (`Err`).
+    async fn serve(&mut self) -> Result<()> {
+        tokio::select! {
+            // A light actor ending is impossible in normal operation (run() loops
+            // forever) - a join here means the task panicked or was killed. That
+            // light would be invisibly dead for the rest of the process, so treat
+            // it like a dead ArtNet listener: fatal to this run.
+            Some(res) = self.actors.join_next() => {
+                let err = match res {
+                    Ok(light) => anyhow::anyhow!("light actor for {light} exited unexpectedly"),
+                    Err(join_err) => anyhow::Error::from(join_err).context("a light actor panicked"),
+                };
+                Err(err)
+            }
+            // Same rule for the background tasks (scan coordinator, failsafe):
+            // they loop forever, so any join is a panic or an impossible early
+            // return. Left unsupervised these die silently — no discovery ever
+            // again, or a rig that never goes safe — while everything else keeps
+            // running. The stack watchdog is the exception that ends on purpose,
+            // carrying its reason.
+            Some(res) = self.background.join_next() => {
+                let err = match res {
+                    Ok(BackgroundExit { task, reason: Some(reason) }) => anyhow::anyhow!("{task}: {reason}"),
+                    Ok(BackgroundExit { task, reason: None }) => anyhow::anyhow!("{task} task exited unexpectedly"),
+                    Err(join_err) => anyhow::Error::from(join_err).context("a background task panicked"),
+                };
+                Err(err)
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl-C received — shutting down");
+                info!("shutdown: failsafe = {} (lights keep their last commanded state)", self.failsafe_mode);
+                Ok(())
+            }
+            res = &mut self.listener => {
+                self.listener_done = true;
+                // The receive loop never returns Ok; any exit here is a failure.
+                let err = match res {
+                    Ok(Ok(())) => anyhow::anyhow!("ArtNet listener ended unexpectedly"),
+                    Ok(Err(e)) => e.context("ArtNet listener failed"),
+                    Err(join_err) => anyhow::Error::from(join_err).context("ArtNet listener task panicked"),
+                };
+                Err(err)
+            }
+        }
+    }
+
+    /// Tear everything down and wait for it to be gone: the listener first, so
+    /// the sockets it owns are closed before a restart binds them again; then
+    /// the actors and background tasks (which drop their adapter handles).
+    async fn shutdown(mut self) {
+        if !self.listener_done {
+            self.listener.abort();
+            let _ = (&mut self.listener).await;
+        }
+        self.actors.shutdown().await;
+        self.background.shutdown().await;
+    }
+}
+
+/// Poll the shared BLE session's health ([`ble::stack_verdict`]) and return a
+/// reason the moment it is unusable. Ending this task is deliberate: `serve`
+/// treats it like any other background exit, so `run` tears the bridge down
+/// and rebuilds it — replacing the platform session if it was poisoned. Per-light
+/// retries can never make this call, because each only sees its own failure.
+async fn stack_watchdog() -> String {
+    let mut tick = interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        match ble::stack_verdict() {
+            ble::StackVerdict::Healthy => {}
+            ble::StackVerdict::Poisoned => {
+                return "the BLE platform session is being refused by the D-Bus daemon \
+                        (its pending-reply limit was reached) — replacing it"
+                    .into();
+            }
+            ble::StackVerdict::Dead { failing_for } => {
+                return format!(
+                    "no BLE call has succeeded for {} s — rebuilding the bridge",
+                    failing_for.as_secs()
+                );
+            }
+        }
+    }
+}
+
+/// Start everything: bind the ArtNet inputs, acquire the adapter, spawn the
+/// scan coordinator, the light actors, the failsafe, the stack watchdog and the
+/// listener. Returns the running set for [`Running::serve`].
+async fn start(cfg: &Config, stack: &mut ble::BleStack, attempt: u32) -> Result<Running> {
+    if attempt > 1 {
+        info!(attempt, "restarting the bridge");
+    }
     if cfg.lights.is_empty() {
         warn!("no [[lights]] configured — the bridge will receive ArtNet but drive nothing");
     }
@@ -173,7 +379,15 @@ pub async fn run(cfg: Config) -> Result<()> {
     let (bound, merger) = merge::bind_inputs(&cfg.artnet).await?;
     let inputs_cfg = cfg.artnet.resolved_inputs();
 
-    let adapter = ble::acquire_adapter(&cfg.ble.adapter).await?;
+    // A fresh verdict for a fresh start: whatever the last run's session did is
+    // over (and if it was poisoned, `run` has already replaced it).
+    ble::reset_stack_health();
+    let adapter = stack.adapter(&cfg.ble.adapter).await?;
+    // The platform's id for the adapter (`hci0`), for the stale-record recovery.
+    let adapter_id = ble::adapter_id(&adapter).await;
+    let recovery_mode =
+        RecoveryMode::parse(&cfg.ble.stale_link_recovery).expect("validated stale_link_recovery");
+    let recovery = Arc::new(StaleLinkRecovery::new(recovery_mode, adapter_id));
     // Discovery scanning is coordinated (scan.rs), not permanently on: the bridge
     // scans only while a light is disconnected, in duty-cycled bursts, and not at
     // all once every light is connected. A continuous scan starves the active
@@ -188,7 +402,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     // both while the bridge carries on logging as if healthy. That is exactly the
     // failure mode the actor and listener supervision below exists to prevent, so
     // these get the same treatment. The payload is the task's name, for the error.
-    let mut background: JoinSet<&'static str> = JoinSet::new();
+    let mut background: JoinSet<BackgroundExit> = JoinSet::new();
     {
         let adapter = adapter.clone();
         let scan = scan.clone();
@@ -196,9 +410,16 @@ pub async fn run(cfg: Config) -> Result<()> {
         let pause = Duration::from_secs(cfg.ble.scan_pause_secs);
         background.spawn(async move {
             scan::run(adapter, scan, window, pause).await;
-            SCAN_TASK
+            BackgroundExit { task: SCAN_TASK, reason: None }
         });
     }
+    // The BLE stack watchdog: the one task here that is MEANT to end — when the
+    // platform session has stopped working for everyone, ending it is what
+    // makes `serve` return and `run` rebuild the bridge.
+    background.spawn(async move {
+        let reason = stack_watchdog().await;
+        BackgroundExit { task: STACK_WATCHDOG_TASK, reason: Some(reason) }
+    });
     info!(
         scan_window_secs = cfg.ble.scan_window_secs,
         scan_pause_secs = cfg.ble.scan_pause_secs,
@@ -280,6 +501,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             cfg.ble.flush_hz,
             cfg.ble.probe_secs,
             scan.clone(),
+            recovery.clone(),
         );
         actors.spawn(async move {
             actor.run().await;
@@ -305,13 +527,13 @@ pub async fn run(cfg: Config) -> Result<()> {
         })
         .collect();
 
-    spawn_failsafe(&mut background, &cfg, base, failsafe_universes);
+    spawn_failsafe(&mut background, cfg, base, failsafe_universes);
 
     // ArtNet listeners + merge/dispatch pump (merge.rs) — receives on every
     // input, sequence-filters per input, merges per channel, and pushes the
     // merged universes into the light sinks. The sockets were bound above, so
-    // the only way this task ends is a receive error — which the select! below
-    // treats as fatal.
+    // the only way this task ends is a receive error — which `Running::serve`
+    // treats as fatal to this run.
     // Merge only the universes something is actually patched to. Foreign
     // broadcast traffic still reaches `on_raw` below (where `note_artnet`
     // ignores it) but never builds merge state — see `merge::Interest`.
@@ -357,48 +579,17 @@ pub async fn run(cfg: Config) -> Result<()> {
             "n/a (single input)"
         },
         failsafe = %cfg.failsafe.mode,
+        stale_link_recovery = %recovery_mode,
         "bridge running — press Ctrl-C to stop"
     );
 
-    tokio::select! {
-        // A light actor ending is impossible in normal operation (run() loops
-        // forever) - a join here means the task panicked or was killed. That
-        // light would be invisibly dead for the rest of the process, so treat
-        // it like a dead ArtNet listener: fatal, supervisor-visible.
-        Some(res) = actors.join_next() => {
-            let err = match res {
-                Ok(light) => anyhow::anyhow!("light actor for {light} exited unexpectedly"),
-                Err(join_err) => anyhow::Error::from(join_err).context("a light actor panicked"),
-            };
-            return Err(err);
-        }
-        // Same rule for the background tasks (scan coordinator, failsafe): both
-        // loop forever, so any join is a panic or an impossible early return.
-        // Left unsupervised these die silently — no discovery ever again, or a
-        // rig that never goes safe — while everything else keeps running.
-        Some(res) = background.join_next() => {
-            let err = match res {
-                Ok(name) => anyhow::anyhow!("{name} task exited unexpectedly"),
-                Err(join_err) => anyhow::Error::from(join_err).context("a background task panicked"),
-            };
-            return Err(err);
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Ctrl-C received — shutting down");
-        }
-        res = listener => {
-            // The receive loop never returns Ok; any exit here is a failure and
-            // must surface as one (non-zero exit) so a supervisor restarts us.
-            let err = match res {
-                Ok(Ok(())) => anyhow::anyhow!("ArtNet listener ended unexpectedly"),
-                Ok(Err(e)) => e.context("ArtNet listener failed"),
-                Err(join_err) => anyhow::Error::from(join_err).context("ArtNet listener task panicked"),
-            };
-            return Err(err);
-        }
-    }
-    info!("shutdown: failsafe = {} (lights keep their last commanded state)", cfg.failsafe.mode);
-    Ok(())
+    Ok(Running {
+        actors,
+        background,
+        listener,
+        listener_done: false,
+        failsafe_mode: cfg.failsafe.mode.clone(),
+    })
 }
 
 /// How a failsafe mode mutates a light's state, or `None` for `hold` (nothing to
@@ -461,10 +652,10 @@ fn note_artnet(clocks: &HashMap<u16, Arc<AtomicU64>>, port_address: u16, elapsed
 ///
 /// Spawned into `tasks` rather than detached, so a panic in the loop is fatal and
 /// supervisor-visible instead of silently disarming the failsafe for the rest of
-/// the process (see the `background` JoinSet in [`run`]). The three early returns
+/// the process (see the `background` JoinSet in [`start`]). The three early returns
 /// below are the legitimate "nothing to run" cases and spawn no task at all.
 fn spawn_failsafe(
-    tasks: &mut JoinSet<&'static str>,
+    tasks: &mut JoinSet<BackgroundExit>,
     cfg: &Config,
     base: Instant,
     universes: Vec<UniverseClock>,
@@ -484,7 +675,7 @@ fn spawn_failsafe(
 
     tasks.spawn(async move {
         failsafe_loop(mode, timeout_ms, base, universes, action).await;
-        FAILSAFE_TASK
+        BackgroundExit { task: FAILSAFE_TASK, reason: None }
     });
 }
 
@@ -777,7 +968,7 @@ mod tests {
                 sinks: vec![Arc::new(dead)],
             },
         ];
-        let mut tasks: JoinSet<&'static str> = JoinSet::new();
+        let mut tasks: JoinSet<BackgroundExit> = JoinSet::new();
         spawn_failsafe(&mut tasks, &cfg, base, universes);
 
         // Keep universe 0's source "alive" for well past the timeout.
@@ -855,7 +1046,7 @@ mod tests {
                     sinks: vec![Arc::new(sink(1, Profile::Rgb).0)],
                 })
                 .collect();
-            let mut tasks: JoinSet<&'static str> = JoinSet::new();
+            let mut tasks: JoinSet<BackgroundExit> = JoinSet::new();
             spawn_failsafe(&mut tasks, &cfg, base, clocks);
             tasks.len()
         };
@@ -864,6 +1055,26 @@ mod tests {
         assert_eq!(count("hold", 5, 1), 0, "hold has nothing to run");
         assert_eq!(count("blackout", 0, 1), 0, "timeout_secs = 0 behaves like hold");
         assert_eq!(count("blackout", 5, 0), 0, "no lights ⇒ nothing to fail safe");
+    }
+
+    #[test]
+    fn restart_policy_backs_off_and_resets_after_a_healthy_run() {
+        let mut p = RestartPolicy::default();
+        let crash = Duration::from_secs(1);
+        assert_eq!(p.next_delay(crash), Duration::from_secs(5));
+        assert_eq!(p.next_delay(crash), Duration::from_secs(10));
+        assert_eq!(p.next_delay(crash), Duration::from_secs(20));
+        for _ in 0..10 {
+            p.next_delay(crash);
+        }
+        assert_eq!(p.next_delay(crash), RestartPolicy::MAX_DELAY, "capped");
+        // A run that lasted long enough is not a crash loop: back to the start.
+        assert_eq!(p.next_delay(RestartPolicy::HEALTHY_RUN), Duration::from_secs(5));
+        assert_eq!(p.next_delay(Duration::from_secs(3600)), Duration::from_secs(5));
+        // Never overflows, however many consecutive failures pile up.
+        for _ in 0..100 {
+            assert!(p.next_delay(crash) <= RestartPolicy::MAX_DELAY);
+        }
     }
 
     #[tokio::test]

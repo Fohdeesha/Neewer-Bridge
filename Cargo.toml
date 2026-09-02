@@ -1,6 +1,6 @@
 [package]
 name = "neewer-bridge"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 description = "ArtNet (DMX-over-UDP) to Neewer Bluetooth light control bridge"
 license = "MIT"
@@ -40,6 +40,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 # Non-blocking file logging + size-based rotation (long-lived daemon)
 tracing-appender = "0.2"
 file-rotate = "0.7"
+
+# Linux/BlueZ only: the stale-device-record recovery (recovery.rs) talks to
+# bluetoothd and systemd directly over the system bus. Already in the tree
+# through btleplug's BlueZ backend (bluez-async), so no new build requirement.
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = "0.9"
 
 [profile.release]
 lto = true

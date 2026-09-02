@@ -13,6 +13,52 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.7.0] — 2026-09-02
+
+The whole fleet on the test rig went dark for four days while the bridge
+reported itself healthy. This release fixes the mechanism, makes the bridge
+recover on its own, and adds one config key. MINOR because of the new key and
+the new self-restart behaviour.
+
+### Fixed
+
+- **A stale BlueZ device record could take the entire fleet down, permanently.**
+  When a marginal light's link died in a way that left bluetoothd still
+  reporting it `Connected`, every reconnect cycle's `Disconnect()` was answered
+  by nothing — on Linux 6.11+ the kernel reports "Disconnected (0x0e)" for a
+  connection it no longer has, which bluetoothd 5.82 treats as a failure and
+  never cleans up — and every un-answered call occupied one of the 128 pending
+  replies the D-Bus daemon allows per connection, for ever (the system bus never
+  expires them). After 128 cycles (about 75 minutes) the daemon refused every
+  call from the bridge's connection, including the peripheral listing every
+  other light depends on; the process stayed up, logging one throttled warning
+  per light per minute, for four days. The disconnect is now bounded (10 s,
+  not the library's 30 s), a hung one is recognised as the stale-record
+  signature and never retried, the light is parked off the bus, and a
+  fleet-wide, rate-limited recovery ladder clears the record: an adapter
+  power-cycle, then a bluetoothd restart through systemd (Linux only;
+  `[ble] stale_link_recovery`, default `auto`). A record is only called stale
+  when the platform positively reports the light connected and a second
+  bounded disconnect hangs as well, so a daemon that is merely busy for a
+  moment does not trigger the ladder. Reproduced and verified on the rig
+  against two live stale records: both cleared and every present light held a
+  real link again within 50 s of start.
+- **The bridge never noticed that its Bluetooth session had stopped working.**
+  A stack watchdog now watches the shared BLE calls: the exact "pending
+  replies" refusal, or two minutes with no successful call at all, restarts the
+  bridge.
+- **Any internal failure after a successful start is now survivable.** A task
+  that dies, or the watchdog above, tears the whole bridge down and rebuilds it
+  in-process after a backoff (5 s doubling to 5 min, reset after a healthy
+  run), replacing the BLE session only when it is known to be poisoned so that
+  a restart cannot leak a bus connection. The first start still fails fast on a
+  bad config, a busy port or a missing adapter. Ctrl-C still exits.
+
+### Added
+
+- `[ble] stale_link_recovery = "auto" | "adapter" | "off"` — how far the
+  stale-record recovery may go. `off` only parks the light and logs.
+
 ## [1.6.0] — 2026-08-26
 
 Fixes from a further full-source audit. MINOR rather than PATCH because three

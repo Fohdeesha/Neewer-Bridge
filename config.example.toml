@@ -61,6 +61,19 @@ scan_window_secs = 8     # length of each discovery burst (s) while a light is m
 scan_pause_secs  = 15    # idle gap between bursts (s) so a powered-off/flaky light is
                          # polled periodically, never scanned constantly. 0 = scan
                          # continuously while something's missing (still off when all up)
+# What the bridge may do when the OS Bluetooth stack's record of a light goes STALE.
+# BlueZ (Linux 6.11+ with bluez 5.82) has been seen to keep a light marked
+# "connected" after its link died: connecting to it then silently does nothing and
+# disconnecting never completes, and every such attempt used up one of the 128
+# D-Bus replies the bridge may have outstanding — after which the whole fleet went
+# dark while the process looked healthy. The bridge now detects the stale record,
+# stops retrying it, and:
+#   auto    = power-cycles the adapter, then restarts bluetoothd if the record
+#             survived that (Linux only; needs permission for both, e.g. root)
+#   adapter = power-cycles the adapter only
+#   off     = parks the light and logs; you clear it (systemctl restart bluetooth)
+# Either step briefly drops every light; they reconnect on their own.
+stale_link_recovery = "auto"
 # NB: a light stuck on its last colour / ignoring commands has TWO possible causes:
 #   1. WEAK RX LINK (common) — the bridge can't currently reach it. The reconnect loop
 #      recovers it on its own once the signal improves; keep a flaky unit within decent

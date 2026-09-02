@@ -12,6 +12,7 @@ use btleplug::api::{
     WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -71,8 +72,58 @@ static SERVICE_UUID: LazyLock<Uuid> =
 /// - any other string → case-insensitive substring match on the OS info string.
 ///
 /// On a miss it logs the available adapters and falls back to the first.
+/// One-shot: builds a fresh platform session each call, which is right for the
+/// tool commands. The bridge holds a [`BleStack`] instead, so a restart does not
+/// open a new session unless the old one is known to be unusable.
 pub async fn acquire_adapter(selector: &str) -> Result<Adapter> {
     let manager = Manager::new().await.context("creating BLE manager")?;
+    select_adapter(&manager, selector).await
+}
+
+/// The bridge's handle on the platform BLE session, kept across in-process
+/// restarts.
+///
+/// On BlueZ a `Manager` is a D-Bus connection whose reader task btleplug
+/// detaches, so a `Manager` that is dropped still keeps its connection open for
+/// the life of the process. Creating one per restart would leak a connection
+/// each time — and the system bus caps connections per user (256 by default),
+/// so a bridge retrying an absent adapter every few minutes would talk itself
+/// out of the bus within days. So the session is created once and reused;
+/// [`BleStack::rebuild`] discards it only when it is known to be unusable (a
+/// poisoned connection — see [`stack_verdict`]), where a fresh one is the fix.
+pub struct BleStack {
+    manager: Option<Manager>,
+}
+
+impl BleStack {
+    pub fn new() -> Self {
+        Self { manager: None }
+    }
+
+    /// Select the adapter (see [`acquire_adapter`]) on the shared session,
+    /// creating the session on first use or after a [`BleStack::rebuild`].
+    pub async fn adapter(&mut self, selector: &str) -> Result<Adapter> {
+        if self.manager.is_none() {
+            self.manager = Some(Manager::new().await.context("creating BLE manager")?);
+        }
+        let manager = self.manager.as_ref().expect("just created");
+        select_adapter(manager, selector).await
+    }
+
+    /// Discard the session so the next [`BleStack::adapter`] opens a new one.
+    pub fn rebuild(&mut self) {
+        self.manager = None;
+    }
+}
+
+impl Default for BleStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The selector logic behind [`acquire_adapter`], on an existing session.
+async fn select_adapter(manager: &Manager, selector: &str) -> Result<Adapter> {
     let adapters = manager.adapters().await.context("listing BLE adapters")?;
     let count = adapters.len();
     debug!(adapters = count, "enumerated BLE adapters");
@@ -116,6 +167,148 @@ pub async fn acquire_adapter(selector: &str) -> Result<Adapter> {
     let adapter = adapters.into_iter().next().unwrap();
     info!(index = 0usize, adapter = %infos[0], total = count, "using BLE adapter");
     Ok(adapter)
+}
+
+/// The platform's own id for an adapter — `hci0` on BlueZ — out of the info
+/// string [`acquire_adapter`] logs (`hci0 (usb:v1D6Bp0246d0552)`). Needed by
+/// the stale-link recovery (`recovery.rs`) to address the adapter directly.
+pub fn adapter_id_from_info(info: &str) -> String {
+    info.split_whitespace().next().unwrap_or_default().to_string()
+}
+
+/// [`adapter_id_from_info`] for a live adapter; empty if the info can't be read.
+pub async fn adapter_id(adapter: &Adapter) -> String {
+    adapter
+        .adapter_info()
+        .await
+        .map(|info| adapter_id_from_info(&info))
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Stack health — is the platform BLE session usable at all?
+//
+// Four days of a dark fleet taught the lesson this exists for: every BLE call
+// from the bridge's D-Bus connection can be refused, permanently, while the
+// process stays up and every actor keeps retrying (see recovery.rs for how the
+// connection got that way). Per-light retries can never notice that, because
+// each one only sees its own failure. So the shared primitives below report
+// every outcome here, and the bridge's watchdog turns "nothing has worked for
+// a long time" (or the exact poisoned-connection error) into a restart.
+// ---------------------------------------------------------------------------
+
+/// "Not set" sentinel for the millisecond timestamps below.
+const UNSET: u64 = u64::MAX;
+
+/// How long the stack may fail continuously — no successful call at all — before
+/// the watchdog declares it dead. Longer than the ~95 s an adapter that is
+/// unplugged and re-plugged has been seen to take to come back on its own.
+pub const STACK_DEAD_AFTER: Duration = Duration::from_secs(120);
+
+struct StackHealth {
+    started: Instant,
+    /// When a shared BLE call last succeeded (ms since `started`).
+    last_ok_ms: AtomicU64,
+    /// When the current run of consecutive failures began, if one is running.
+    streak_start_ms: AtomicU64,
+    /// The exact poisoned-connection error has been seen.
+    poisoned: AtomicBool,
+}
+
+static STACK: LazyLock<StackHealth> = LazyLock::new(|| StackHealth {
+    started: Instant::now(),
+    last_ok_ms: AtomicU64::new(UNSET),
+    streak_start_ms: AtomicU64::new(UNSET),
+    poisoned: AtomicBool::new(false),
+});
+
+fn now_ms() -> u64 {
+    STACK.started.elapsed().as_millis() as u64
+}
+
+/// A shared BLE call succeeded.
+pub fn note_ok() {
+    STACK.last_ok_ms.store(now_ms(), Ordering::Relaxed);
+    STACK.streak_start_ms.store(UNSET, Ordering::Relaxed);
+}
+
+/// A shared BLE call failed. Opens a failure streak if none is running, and
+/// latches the poisoned flag if this is the D-Bus pending-reply refusal.
+pub fn note_error(e: &anyhow::Error) {
+    let _ = STACK.streak_start_ms.compare_exchange(UNSET, now_ms(), Ordering::Relaxed, Ordering::Relaxed);
+    if is_bus_poisoned(e) {
+        STACK.poisoned.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Forget everything — called when the bridge (re)starts its BLE session.
+pub fn reset_stack_health() {
+    STACK.last_ok_ms.store(UNSET, Ordering::Relaxed);
+    STACK.streak_start_ms.store(UNSET, Ordering::Relaxed);
+    STACK.poisoned.store(false, Ordering::Relaxed);
+}
+
+/// Whether an error is dbus-daemon refusing a call because this connection has
+/// reached its cap of un-answered method calls (`max_replies_per_connection`,
+/// 128 on the system bus). Once that happens no call from the connection can
+/// ever succeed again — the platform session is poisoned and must be replaced.
+pub fn is_bus_poisoned(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let s = cause.to_string();
+        s.contains("maximum number of pending replies") || s.contains("LimitsExceeded")
+    })
+}
+
+/// The watchdog's reading of the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackVerdict {
+    Healthy,
+    /// The poisoned-connection error was seen: replace the session now.
+    Poisoned,
+    /// Nothing has succeeded for at least [`STACK_DEAD_AFTER`].
+    Dead { failing_for: Duration },
+}
+
+/// Decide the verdict. Pure — `now`, the timestamps and the flag are inputs, so
+/// the rule is testable without a clock or an adapter. A run of failures counts
+/// only when it is at least `dead_after` long AND no call has succeeded inside
+/// that window (a success ends the run anyway, so the second condition guards
+/// against an ordering race between two callers).
+fn verdict(now_ms: u64, last_ok_ms: u64, streak_start_ms: u64, poisoned: bool, dead_after: Duration) -> StackVerdict {
+    if poisoned {
+        return StackVerdict::Poisoned;
+    }
+    if streak_start_ms == UNSET {
+        return StackVerdict::Healthy;
+    }
+    let failing_for_ms = now_ms.saturating_sub(streak_start_ms);
+    let since_ok_ms = if last_ok_ms == UNSET { u64::MAX } else { now_ms.saturating_sub(last_ok_ms) };
+    let limit = dead_after.as_millis() as u64;
+    if failing_for_ms >= limit && since_ok_ms >= limit {
+        StackVerdict::Dead { failing_for: Duration::from_millis(failing_for_ms) }
+    } else {
+        StackVerdict::Healthy
+    }
+}
+
+/// The current verdict on the shared session.
+pub fn stack_verdict() -> StackVerdict {
+    verdict(
+        now_ms(),
+        STACK.last_ok_ms.load(Ordering::Relaxed),
+        STACK.streak_start_ms.load(Ordering::Relaxed),
+        STACK.poisoned.load(Ordering::Relaxed),
+        STACK_DEAD_AFTER,
+    )
+}
+
+/// Report a shared call's outcome to the stack health, passing it through.
+fn observed<T>(res: Result<T>) -> Result<T> {
+    match &res {
+        Ok(_) => note_ok(),
+        Err(e) => note_error(e),
+    }
+    res
 }
 
 /// Enumerate BLE adapters with their index + OS info string (for `adapters` CLI
@@ -230,18 +423,18 @@ pub async fn find_by_mac(adapter: &Adapter, target_mac: &str, timeout: Duration)
 /// their peripheral among whatever the current burst has discovered
 /// ([`find_scanned`]).
 pub async fn start_scan(adapter: &Adapter) -> Result<()> {
-    adapter
-        .start_scan(ScanFilter::default())
-        .await
-        .context("start_scan failed (check Bluetooth permissions / adapter power)")?;
-    Ok(())
+    observed(
+        adapter
+            .start_scan(ScanFilter::default())
+            .await
+            .context("start_scan failed (check Bluetooth permissions / adapter power)"),
+    )
 }
 
 /// Stop the shared scan. Used by the [`crate::scan`] coordinator's duty cycle so
 /// the adapter isn't scanning while every light is already connected.
 pub async fn stop_scan(adapter: &Adapter) -> Result<()> {
-    adapter.stop_scan().await.context("stop_scan failed")?;
-    Ok(())
+    observed(adapter.stop_scan().await.context("stop_scan failed"))
 }
 
 /// Look for a peripheral with `target_mac` among those already discovered by the
@@ -265,7 +458,9 @@ pub async fn find_scanned(
     target_mac: &str,
 ) -> Result<Option<(Peripheral, String, Option<i16>)>> {
     let target = parse_mac(target_mac)?;
-    for p in adapter.peripherals().await.context("listing peripherals")? {
+    // Every disconnected light runs this every FIND_POLL, so it is the stack
+    // health's main heartbeat — an empty listing is still a success.
+    for p in observed(adapter.peripherals().await.context("listing peripherals"))? {
         if !addr_matches(p.address(), target) {
             continue;
         }
@@ -299,9 +494,17 @@ pub async fn probe_read(p: &Peripheral, c: &Characteristic, timeout: Duration) -
     matches!(tokio::time::timeout(timeout, p.read(c)).await, Ok(Ok(_)))
 }
 
-/// Whether btleplug currently believes the peripheral is connected.
+/// Whether btleplug currently believes the peripheral is connected. An error
+/// (platform unreachable, device object gone) counts as "not connected".
 pub async fn is_connected(p: &Peripheral) -> bool {
     p.is_connected().await.unwrap_or(false)
+}
+
+/// [`is_connected`] with the error kept: callers that must tell "the platform
+/// says no" from "the platform cannot answer" (the stale-record check in
+/// `light.rs`) need the difference.
+pub async fn connected_state(p: &Peripheral) -> Result<bool> {
+    p.is_connected().await.context("reading the connection state")
 }
 
 /// The characteristics needed to talk to a Neewer light.
@@ -326,7 +529,13 @@ async fn connect_bounded(p: &Peripheral) -> Result<()> {
     }
     debug!("connecting…");
     match tokio::time::timeout(CONNECT_TIMEOUT, p.connect()).await {
-        Ok(res) => res.context("connect failed"),
+        Ok(Ok(())) => {
+            // A completed connect proves the session works (a FAILED one proves
+            // nothing about the session — that is usually the light or the RF).
+            note_ok();
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e).context("connect failed"),
         Err(_) => bail!("connect timed out after {CONNECT_TIMEOUT:?} (hung platform BLE call)"),
     }
 }
@@ -534,10 +743,59 @@ pub async fn peripheral_name(p: &Peripheral) -> String {
         .unwrap_or_default()
 }
 
-/// Cleanly drop a connection (best-effort).
+/// Upper bound on one `disconnect()` call. A disconnect the platform CAN
+/// perform completes in well under three seconds on BlueZ (its own disconnect
+/// timer is 2 s); one it never answers is the signature of a stale device
+/// record (recovery.rs), and the library's own 30 s timeout would just make the
+/// actor wait three times longer to learn the same thing.
+pub const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How a bounded disconnect ended.
+#[derive(Debug)]
+pub enum DisconnectOutcome {
+    Done,
+    /// The platform answered with an error (already gone, adapter off, …).
+    /// Harmless for a best-effort release; logged at debug by callers.
+    Failed(anyhow::Error),
+    /// No answer within [`DISCONNECT_TIMEOUT`]. On BlueZ this means the daemon's
+    /// record of the device is stale — it is still marked connected with no
+    /// link behind it — and the call will never be answered. Each such call
+    /// permanently occupies one of the connection's 128 D-Bus reply slots, so a
+    /// caller must not simply try again.
+    Hung,
+}
+
+/// Classify a bounded disconnect: `None` = the timeout elapsed. Pure, so the
+/// mapping is pinned by a test without a peripheral.
+fn classify_disconnect(res: Option<Result<()>>) -> DisconnectOutcome {
+    match res {
+        Some(Ok(())) => DisconnectOutcome::Done,
+        Some(Err(e)) => DisconnectOutcome::Failed(e),
+        None => DisconnectOutcome::Hung,
+    }
+}
+
+/// Drop a connection, bounded by [`DISCONNECT_TIMEOUT`], reporting what happened.
+pub async fn disconnect_outcome(p: &Peripheral) -> DisconnectOutcome {
+    let res = tokio::time::timeout(DISCONNECT_TIMEOUT, p.disconnect())
+        .await
+        .ok()
+        .map(|r| r.context("disconnect failed"));
+    classify_disconnect(res)
+}
+
+/// Cleanly drop a connection (best-effort), bounded by [`DISCONNECT_TIMEOUT`].
+/// The tool commands use this; the light actor uses [`disconnect_outcome`] so
+/// it can tell a hung disconnect from a failed one.
 pub async fn disconnect(p: &Peripheral) -> Result<()> {
-    p.disconnect().await.context("disconnect failed")?;
-    Ok(())
+    match disconnect_outcome(p).await {
+        DisconnectOutcome::Done => Ok(()),
+        DisconnectOutcome::Failed(e) => Err(e),
+        DisconnectOutcome::Hung => bail!(
+            "disconnect not answered within {DISCONNECT_TIMEOUT:?} — the platform still \
+             reports the device connected with no link behind it (stale device record)"
+        ),
+    }
 }
 
 /// Lower-case spaced hex for logging, e.g. `78 81 01 01 fb`.
@@ -593,5 +851,70 @@ mod tests {
     fn hexstr_formats_frames_for_logs() {
         assert_eq!(hexstr(&[0x78, 0x81, 0x01, 0x01, 0xFB]), "78 81 01 01 fb");
         assert_eq!(hexstr(&[]), "");
+    }
+
+    #[test]
+    fn adapter_id_is_the_first_token_of_the_info_string() {
+        // What btleplug's BlueZ backend formats: "<id> (<modalias>)".
+        assert_eq!(adapter_id_from_info("hci0 (usb:v1D6Bp0246d0552)"), "hci0");
+        assert_eq!(adapter_id_from_info("hci1"), "hci1");
+        assert_eq!(adapter_id_from_info("  hci2  (x)"), "hci2");
+        assert_eq!(adapter_id_from_info(""), "");
+    }
+
+    #[test]
+    fn disconnect_outcomes_are_classified_by_completion_not_success() {
+        assert!(matches!(classify_disconnect(Some(Ok(()))), DisconnectOutcome::Done));
+        assert!(matches!(classify_disconnect(Some(Err(anyhow::anyhow!("x")))), DisconnectOutcome::Failed(_)));
+        // The timeout elapsing is the one outcome that must never be retried
+        // blindly — it is the stale-record signature.
+        assert!(matches!(classify_disconnect(None), DisconnectOutcome::Hung));
+        // ...and the plain Result form reports it as an error that names the cause.
+        let e = anyhow::anyhow!("d-bus");
+        assert!(matches!(classify_disconnect(Some(Err(e))), DisconnectOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn bus_poisoning_is_recognised_anywhere_in_the_chain() {
+        // The exact text dbus-daemon returns (bus/connection.c), as it reached
+        // the log on 2026-09-02 wrapped in the listing context.
+        let inner = anyhow::anyhow!("The maximum number of pending replies per connection has been reached");
+        let wrapped = inner.context("listing peripherals");
+        assert!(is_bus_poisoned(&wrapped));
+        // The error NAME alone is enough too.
+        assert!(is_bus_poisoned(&anyhow::anyhow!("org.freedesktop.DBus.Error.LimitsExceeded")));
+        // Ordinary failures are not poisoning: an absent adapter or a dead
+        // daemon self-heal and must not force a session rebuild.
+        for other in [
+            "listing peripherals: Unit dbus-org.bluez.service failed to load properly",
+            "start_scan failed: Operation already in progress",
+            "connect failed: le-connection-abort-by-local",
+        ] {
+            assert!(!is_bus_poisoned(&anyhow::anyhow!("{other}")), "{other}");
+        }
+    }
+
+    #[test]
+    fn stack_verdict_needs_a_long_unbroken_failure_run() {
+        use StackVerdict::*;
+        let dead = STACK_DEAD_AFTER;
+        let ms = |d: Duration| d.as_millis() as u64;
+        // Nothing observed yet, or a success with no failure since: healthy.
+        assert_eq!(verdict(0, UNSET, UNSET, false, dead), Healthy);
+        assert_eq!(verdict(10_000, 9_000, UNSET, false, dead), Healthy);
+        // A failure run shorter than the limit is healthy (transient adapter loss).
+        assert_eq!(verdict(60_000, 1_000, 5_000, false, dead), Healthy);
+        // Exactly the limit, with the last success outside the window: dead.
+        let t = 5_000 + ms(dead);
+        assert_eq!(verdict(t, 1_000, 5_000, false, dead), Dead { failing_for: dead });
+        // ...and dead with no success EVER (a bridge that started poisoned).
+        assert_eq!(verdict(t, UNSET, 5_000, false, dead), Dead { failing_for: dead });
+        // A success inside the window (racing writer) keeps it alive.
+        assert_eq!(verdict(t, t - 1_000, 5_000, false, dead), Healthy);
+        // The poisoned flag wins outright, streak or not.
+        assert_eq!(verdict(0, UNSET, UNSET, true, dead), Poisoned);
+        assert_eq!(verdict(t, t, UNSET, true, dead), Poisoned);
+        // A clock that appears to run backwards saturates rather than panicking.
+        assert_eq!(verdict(0, UNSET, 5_000, false, dead), Healthy);
     }
 }
