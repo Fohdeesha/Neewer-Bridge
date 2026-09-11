@@ -18,6 +18,10 @@
 //!   skips the cleanup that would have replied. Older kernels reported
 //!   "Not Connected" (0x02) here, which bluetoothd handles as "already
 //!   disconnected" — so the record used to heal itself on the first attempt.
+//!   bluez fixed its side on 2025-07-15 (commit 8c9977b021, "adapter: Fix
+//!   RemoveDevice timeout when device already disconnected", bluez/bluez#1421):
+//!   5.84 and later treat 0x0e like 0x02. Debian 13 ships 5.82 without that
+//!   patch, which is why this module exists.
 //! - `Adapter1.RemoveDevice()` on such a record hangs the same way (it routes
 //!   a "connected" device through the same disconnect path).
 //! - Every un-answered D-Bus method call occupies one of the **128 pending

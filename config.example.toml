@@ -66,8 +66,9 @@ scan_pause_secs  = 15    # idle gap between bursts (s) so a powered-off/flaky li
 # "connected" after its link died: connecting to it then silently does nothing and
 # disconnecting never completes, and every such attempt used up one of the 128
 # D-Bus replies the bridge may have outstanding — after which the whole fleet went
-# dark while the process looked healthy. The bridge now detects the stale record,
-# stops retrying it, and:
+# dark while the process looked healthy. (bluez 5.84 and later fix the daemon
+# side — bluez issue #1421 — but Debian 13 ships 5.82.) The bridge detects the
+# stale record, stops retrying it, and:
 #   auto    = power-cycles the adapter, then restarts bluetoothd if the record
 #             survived that (Linux only; needs permission for both, e.g. root)
 #   adapter = power-cycles the adapter only

@@ -230,8 +230,10 @@ for each source.
   The bridge detects this, parks the light and clears the record by
   power-cycling the adapter or, if needed, restarting bluetoothd — see
   `stale_link_recovery` in the example config. With that turned off,
-  `systemctl restart bluetooth` clears it by hand. If its Bluetooth session is
-  ever refused outright, the bridge restarts itself and logs why.
+  `systemctl restart bluetooth` clears it by hand. The underlying bluetoothd
+  bug is fixed in bluez 5.84 and later; Debian 13 ships 5.82, which still has
+  it. If its Bluetooth session is ever refused outright, the bridge restarts
+  itself and logs why.
 
 ## Building from source
 

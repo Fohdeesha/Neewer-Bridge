@@ -13,7 +13,7 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
-## [1.7.0] — 2026-09-02
+## [1.7.0] — 2026-09-11
 
 The whole fleet on the test rig went dark for four days while the bridge
 reported itself healthy. This release fixes the mechanism, makes the bridge
@@ -42,7 +42,9 @@ the new self-restart behaviour.
   bounded disconnect hangs as well, so a daemon that is merely busy for a
   moment does not trigger the ladder. Reproduced and verified on the rig
   against two live stale records: both cleared and every present light held a
-  real link again within 50 s of start.
+  real link again within 50 s of start. bluez fixed the daemon side in 5.84
+  (commit 8c9977b021, bluez issue #1421); Debian 13 ships 5.82 without that
+  patch, which is why the bridge handles it itself.
 - **The bridge never noticed that its Bluetooth session had stopped working.**
   A stack watchdog now watches the shared BLE calls: the exact "pending
   replies" refusal, or two minutes with no successful call at all, restarts the
