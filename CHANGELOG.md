@@ -13,6 +13,56 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.8.0] — 2026-10-16
+
+On the test rig the USB Bluetooth dongle stopped answering a scan command, the
+kernel reset it, and it came back under a new name (`hci0` became `hci1`). The
+bridge kept talking to the adapter that no longer existed and drove nothing for
+12 hours 40 minutes, while every light it was sent commands for held its last
+colour. This release makes the bridge notice and recover from that and from
+its close relatives. MINOR because of the new self-recovery behaviour.
+
+### Fixed
+
+- **A Bluetooth adapter that disappeared and came back under a new name left
+  the bridge dark for good.** Every scan failed, every light sat "not
+  discovered", and the stack watchdog never fired, because the peripheral
+  listing each missing light polls still succeeds against a vanished adapter
+  on BlueZ: it returns an empty list. The watchdog now also checks, every 5 s,
+  that the adapter the bridge is using is still there. If the platform answers
+  that it is gone for 15 s, the bridge restarts and picks up whichever adapter
+  is present now. "Could not ask" (bluetoothd down or frozen) never counts as
+  gone, so a bluetoothd restart or a busy daemon does not trigger it.
+- **A restart with no adapter present backed off as if from a crash**, so a
+  dongle that came back a few minutes later could wait up to five more minutes
+  to be used. The bridge now waits for an adapter to appear, checks every 5 s,
+  and starts the moment one is listed. It says that it is waiting once a
+  minute, since no light is driven meanwhile. The first start still fails fast
+  when there is no adapter.
+- **A restart re-seeded every light with the startup baseline** (3200K at 50%).
+  A streaming console overwrites that within a second, but with the ArtNet
+  source down the baseline stuck, so an internal restart changed what the room
+  showed. Each light now starts a restart where the previous run left it.
+- **A discovery scan that could not start was retried about once a second**
+  rather than once per `scan_pause_secs` whenever the lights kept failing to
+  connect straight away. Each retry logged a warning, which came to about
+  2,500 lines an hour on the test rig. Retries now wait the full pause.
+- **The recovery ladder's rate limits reset on every internal restart.** One
+  adapter power-cycle per two minutes and one bluetoothd restart per ten are
+  now enforced across the bridge's own restarts too, so a fault that also
+  makes the bridge restart cannot earn a fresh power-cycle each time.
+
+### Added
+
+- **Recovery when discovery scans cannot start at all.** If every attempt to
+  start a discovery scan fails for two minutes while a light is waiting to be
+  found (a wedged controller, or an adapter that refuses to power on), the bridge
+  power-cycles the adapter, and in `auto` restarts bluetoothd if that was not
+  enough. It goes through the same rate-limited gate as the stale-record
+  recovery, so the two never cycle the adapter separately. It runs once per
+  episode, never repeatedly, and `[ble] stale_link_recovery = "off"` turns it
+  off along with the rest.
+
 ## [1.7.0] — 2026-09-11
 
 The whole fleet on the test rig went dark for four days while the bridge

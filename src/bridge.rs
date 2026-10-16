@@ -22,10 +22,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use btleplug::platform::{Adapter, Manager};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ble;
 use crate::config::{Config, FailsafeMode, LightCfg};
@@ -33,7 +34,7 @@ use crate::light::LightActor;
 use crate::merge;
 use crate::profile::{extract_slice, map_dmx, CctRange, Profile};
 use crate::protocol::LightState;
-use crate::recovery::{RecoveryMode, StaleLinkRecovery};
+use crate::recovery::{RecoveryMode, SharedHistory, StaleLinkRecovery};
 use crate::scan;
 
 /// Names for the supervised background tasks, used in the error when one of
@@ -181,12 +182,20 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut stack = ble::BleStack::new();
     let mut policy = RestartPolicy::default();
     let mut attempt: u32 = 0;
+    // Each light's last desired state, carried from one run into the next so a
+    // restart does not change what the lights show (see `initial_state`).
+    let mut carried: HashMap<String, LightState> = HashMap::new();
+    // When the recovery ladder last power-cycled the adapter or restarted
+    // bluetoothd. The process's, not a run's: a restart must not reset the
+    // rate limits (see `StaleLinkRecovery::with_history`).
+    let recovery_history = SharedHistory::default();
     loop {
         attempt += 1;
         let started_at = Instant::now();
-        let outcome = match start(&cfg, &mut stack, attempt).await {
+        let outcome = match start(&cfg, &mut stack, attempt, &carried, &recovery_history).await {
             Ok(mut running) => {
                 let res = running.serve().await;
+                carried = running.light_states();
                 running.shutdown().await;
                 res
             }
@@ -206,6 +215,21 @@ pub async fn run(cfg: Config) -> Result<()> {
             ble::is_bus_poisoned(&err) || ble::stack_verdict() == ble::StackVerdict::Poisoned;
         if poisoned {
             stack.rebuild();
+        }
+        // No adapter to restart on (unplugged, mid re-enumeration, bluetoothd
+        // down): backing off as from a crash would leave the bridge up to five
+        // minutes late once it is back. Wait for one to appear instead.
+        if ble::is_no_adapter(&err) {
+            error!(
+                error = %format!("{err:#}"),
+                attempt,
+                rebuild_ble_session = poisoned,
+                "bridge failed — no usable Bluetooth adapter; waiting for one to appear"
+            );
+            if !wait_for_adapter(&mut stack).await {
+                return Ok(()); // Ctrl-C
+            }
+            continue;
         }
         let delay = policy.next_delay(started_at.elapsed());
         error!(
@@ -251,6 +275,58 @@ impl RestartPolicy {
     }
 }
 
+/// While no adapter is usable: how often the supervisor looks for one.
+const ADAPTER_POLL: Duration = Duration::from_secs(5);
+/// ...and how often it repeats that it is still waiting.
+const ADAPTER_WAIT_REPORT: Duration = Duration::from_secs(60);
+
+/// Wait until the platform lists a Bluetooth adapter again, polling every
+/// [`ADAPTER_POLL`]. Returns `false` on Ctrl-C. Waiting is announced by the
+/// caller, repeated here every [`ADAPTER_WAIT_REPORT`] (no light is driven
+/// meanwhile, and that must never be invisible in the log), and its end is
+/// announced too.
+async fn wait_for_adapter(stack: &mut ble::BleStack) -> bool {
+    let since = Instant::now();
+    let mut next_report = ADAPTER_WAIT_REPORT;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(ADAPTER_POLL) => {}
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl-C received while waiting for a Bluetooth adapter — exiting");
+                return false;
+            }
+        }
+        let counted = tokio::select! {
+            res = stack.adapter_count() => res,
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl-C received while waiting for a Bluetooth adapter — exiting");
+                return false;
+            }
+        };
+        match counted {
+            Ok(n) if n > 0 => {
+                info!(
+                    adapters = n,
+                    waited_secs = since.elapsed().as_secs(),
+                    "a Bluetooth adapter is present — restarting the bridge"
+                );
+                return true;
+            }
+            Ok(_) => {}
+            // The listing itself is refused: this session can never work again.
+            Err(e) if ble::is_bus_poisoned(&e) => stack.rebuild(),
+            Err(e) => debug!(error = %format!("{e:#}"), "still no usable Bluetooth adapter"),
+        }
+        if since.elapsed() >= next_report {
+            next_report += ADAPTER_WAIT_REPORT;
+            warn!(
+                waited_secs = since.elapsed().as_secs(),
+                "still waiting for a Bluetooth adapter — no light is being driven"
+            );
+        }
+    }
+}
+
 /// Why a supervised background task ended: `reason` is set when it ended on
 /// purpose (the stack watchdog giving up on the BLE session), `None` when it
 /// simply returned or panicked — which for these forever-loops is a bug.
@@ -270,9 +346,17 @@ struct Running {
     /// finished `JoinHandle` again.
     listener_done: bool,
     failsafe_mode: String,
+    /// Each light's desired state, by normalised MAC — read when the run ends,
+    /// so the next run can start every light where this one left it.
+    states: Vec<(String, watch::Receiver<LightState>)>,
 }
 
 impl Running {
+    /// Every light's current desired state, by normalised MAC.
+    fn light_states(&self) -> HashMap<String, LightState> {
+        self.states.iter().map(|(mac, rx)| (mac.clone(), *rx.borrow())).collect()
+    }
+
     /// Serve until Ctrl-C (`Ok`) or the first task failure (`Err`).
     async fn serve(&mut self) -> Result<()> {
         tokio::select! {
@@ -332,14 +416,32 @@ impl Running {
     }
 }
 
-/// Poll the shared BLE session's health ([`ble::stack_verdict`]) and return a
-/// reason the moment it is unusable. Ending this task is deliberate: `serve`
-/// treats it like any other background exit, so `run` tears the bridge down
-/// and rebuilds it — replacing the platform session if it was poisoned. Per-light
-/// retries can never make this call, because each only sees its own failure.
-async fn stack_watchdog() -> String {
+/// The adapter this run is using, for the stack watchdog's presence check.
+struct AdapterWatch {
+    manager: Manager,
+    adapter: Adapter,
+    /// The platform's id for it (`hci0`).
+    id: String,
+}
+
+/// Poll the shared BLE session's health ([`ble::stack_verdict`]) and the
+/// presence of the adapter this run is using ([`ble::adapter_presence`]), and
+/// return a reason the moment either makes the bridge unusable. Ending this
+/// task is deliberate: `serve` treats it like any other background exit, so
+/// `run` tears the bridge down and rebuilds it — replacing the platform session
+/// if it was poisoned, and choosing the adapter afresh. Per-light retries can
+/// never make this call, because each only sees its own failure.
+///
+/// The presence check exists because the session can be perfectly healthy
+/// while the adapter behind it has gone: a USB dongle the kernel resets comes
+/// back under a new name (`hci0` → `hci1`), and every call on the old handle
+/// either fails (scans) or succeeds with nothing in it (the peripheral
+/// listing the stack health counts as its heartbeat) — for ever. See
+/// `ble::ADAPTER_GONE_AFTER`.
+async fn stack_watchdog(watch: AdapterWatch) -> String {
     let mut tick = interval(Duration::from_secs(5));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut gone = ble::GoneTracker::default();
     loop {
         tick.tick().await;
         match ble::stack_verdict() {
@@ -356,13 +458,46 @@ async fn stack_watchdog() -> String {
                 );
             }
         }
+        let presence = ble::adapter_presence(&watch.manager, &watch.adapter, &watch.id).await;
+        match gone.observe(&presence, Instant::now(), ble::ADAPTER_GONE_AFTER) {
+            ble::GoneEdge::Steady => {
+                if let ble::AdapterPresence::Unknown(why) = &presence {
+                    debug!(adapter = %watch.id, reason = %why, "could not check that the Bluetooth adapter is still present");
+                }
+            }
+            ble::GoneEdge::Vanished => warn!(
+                adapter = %watch.id,
+                restart_after_secs = ble::ADAPTER_GONE_AFTER.as_secs(),
+                "the Bluetooth adapter has disappeared from the system (unplugged, or reset by \
+                 the kernel?) — the bridge restarts on whatever adapter is present if it is not back soon"
+            ),
+            ble::GoneEdge::Returned { after } => info!(
+                adapter = %watch.id,
+                gone_secs = after.as_secs(),
+                "the Bluetooth adapter is back"
+            ),
+            ble::GoneEdge::Confirmed { gone_for } => {
+                return format!(
+                    "the Bluetooth adapter {} has been gone for {} s (unplugged, or reset and \
+                     re-numbered by the kernel) — rebuilding the bridge on the adapter present now",
+                    watch.id,
+                    gone_for.as_secs()
+                );
+            }
+        }
     }
 }
 
 /// Start everything: bind the ArtNet inputs, acquire the adapter, spawn the
 /// scan coordinator, the light actors, the failsafe, the stack watchdog and the
 /// listener. Returns the running set for [`Running::serve`].
-async fn start(cfg: &Config, stack: &mut ble::BleStack, attempt: u32) -> Result<Running> {
+async fn start(
+    cfg: &Config,
+    stack: &mut ble::BleStack,
+    attempt: u32,
+    carried: &HashMap<String, LightState>,
+    recovery_history: &SharedHistory,
+) -> Result<Running> {
     if attempt > 1 {
         info!(attempt, "restarting the bridge");
     }
@@ -383,11 +518,17 @@ async fn start(cfg: &Config, stack: &mut ble::BleStack, attempt: u32) -> Result<
     // over (and if it was poisoned, `run` has already replaced it).
     ble::reset_stack_health();
     let adapter = stack.adapter(&cfg.ble.adapter).await?;
-    // The platform's id for the adapter (`hci0`), for the stale-record recovery.
+    let manager = stack.manager().context("the BLE session closed while starting")?;
+    // The platform's id for the adapter (`hci0`), for the stale-record recovery
+    // and the watchdog's presence check.
     let adapter_id = ble::adapter_id(&adapter).await;
     let recovery_mode =
         RecoveryMode::parse(&cfg.ble.stale_link_recovery).expect("validated stale_link_recovery");
-    let recovery = Arc::new(StaleLinkRecovery::new(recovery_mode, adapter_id));
+    let recovery = Arc::new(StaleLinkRecovery::with_history(
+        recovery_mode,
+        adapter_id.clone(),
+        recovery_history.clone(),
+    ));
     // Discovery scanning is coordinated (scan.rs), not permanently on: the bridge
     // scans only while a light is disconnected, in duty-cycled bursts, and not at
     // all once every light is connected. A continuous scan starves the active
@@ -408,18 +549,22 @@ async fn start(cfg: &Config, stack: &mut ble::BleStack, attempt: u32) -> Result<
         let scan = scan.clone();
         let window = Duration::from_secs(cfg.ble.scan_window_secs);
         let pause = Duration::from_secs(cfg.ble.scan_pause_secs);
+        let recovery = recovery.clone();
         background.spawn(async move {
-            scan::run(adapter, scan, window, pause).await;
+            scan::run(adapter, scan, window, pause, recovery).await;
             BackgroundExit { task: SCAN_TASK, reason: None }
         });
     }
     // The BLE stack watchdog: the one task here that is MEANT to end — when the
-    // platform session has stopped working for everyone, ending it is what
-    // makes `serve` return and `run` rebuild the bridge.
-    background.spawn(async move {
-        let reason = stack_watchdog().await;
-        BackgroundExit { task: STACK_WATCHDOG_TASK, reason: Some(reason) }
-    });
+    // platform session has stopped working for everyone, or the adapter has
+    // gone, ending it is what makes `serve` return and `run` rebuild the bridge.
+    {
+        let watch = AdapterWatch { manager, adapter: adapter.clone(), id: adapter_id };
+        background.spawn(async move {
+            let reason = stack_watchdog(watch).await;
+            BackgroundExit { task: STACK_WATCHDOG_TASK, reason: Some(reason) }
+        });
+    }
     info!(
         scan_window_secs = cfg.ble.scan_window_secs,
         scan_pause_secs = cfg.ble.scan_pause_secs,
@@ -435,6 +580,7 @@ async fn start(cfg: &Config, stack: &mut ble::BleStack, attempt: u32) -> Result<
     // never reconnecting - while the bridge reports healthy. LightActor::run
     // loops forever, so ANY join is a failure.
     let mut actors: JoinSet<String> = JoinSet::new();
+    let mut states = Vec::with_capacity(cfg.lights.len());
     // One label per light, disambiguated where two share a name (see
     // `light_labels`). Computed ONCE so the sink and the actor provably log
     // under the same name.
@@ -476,12 +622,10 @@ async fn start(cfg: &Config, stack: &mut ble::BleStack, attempt: u32) -> Result<
         // first real DMX state replaces the seed and normal power handling
         // takes over. With power_on_connect = true the seed flag stays false so
         // every failsafe/reconnect corner behaves exactly as before.
-        let initial = LightState {
-            power: light.power_on_connect,
-            seed: !light.power_on_connect,
-            ..LightState::default()
-        };
-        let (tx, rx) = watch::channel(initial);
+        // On a RESTART the light instead starts where the last run left it —
+        // see `initial_state`.
+        let (tx, rx) = watch::channel(initial_state(light, carried));
+        states.push((crate::config::normalize_mac(&light.mac), tx.subscribe()));
         let cct = CctRange { min: light.cct_min, max: light.cct_max };
         let sink = Arc::new(Sink {
             label: label.clone(),
@@ -589,7 +733,30 @@ async fn start(cfg: &Config, stack: &mut ble::BleStack, attempt: u32) -> Result<
         listener,
         listener_done: false,
         failsafe_mode: cfg.failsafe.mode.clone(),
+        states,
     })
+}
+
+/// The state a light starts a run in: where the previous run left it if this
+/// is a restart (`carried`, by normalised MAC), else the startup baseline
+/// seeded from `power_on_connect`.
+///
+/// A restart is the bridge's business, not the lights'. Re-seeding every light
+/// with the baseline (3200K @ 50%) on every restart — as the bridge did until
+/// 1.8.0 — is invisible while a console is streaming, which overwrites it within
+/// a second; but with the ArtNet source down the baseline STICKS, so an adapter
+/// reset or any other internal restart would change the room against
+/// `[failsafe] hold`. The carried state is the last desired state including
+/// anything the failsafe applied, which the failsafe then keeps applying.
+fn initial_state(light: &LightCfg, carried: &HashMap<String, LightState>) -> LightState {
+    carried
+        .get(&crate::config::normalize_mac(&light.mac))
+        .copied()
+        .unwrap_or(LightState {
+            power: light.power_on_connect,
+            seed: !light.power_on_connect,
+            ..LightState::default()
+        })
 }
 
 /// How a failsafe mode mutates a light's state, or `None` for `hold` (nothing to
@@ -1055,6 +1222,55 @@ mod tests {
         assert_eq!(count("hold", 5, 1), 0, "hold has nothing to run");
         assert_eq!(count("blackout", 0, 1), 0, "timeout_secs = 0 behaves like hold");
         assert_eq!(count("blackout", 5, 0), 0, "no lights ⇒ nothing to fail safe");
+    }
+
+    #[test]
+    fn a_restart_starts_each_light_where_the_last_run_left_it() {
+        let on = cfg_light("D6:50:F2:F6:BB:1B", Some("on"));
+        let mut hands_off = cfg_light("CB:33:5A:EE:5A:7C", Some("hands-off"));
+        hands_off.power_on_connect = false;
+
+        // First start: nothing carried, so the startup baseline as before —
+        // powered seed for power_on_connect = true, passive seed otherwise.
+        let none = HashMap::new();
+        assert_eq!(initial_state(&on, &none), LightState { power: true, seed: false, ..LightState::default() });
+        assert_eq!(
+            initial_state(&hands_off, &none),
+            LightState { power: false, seed: true, ..LightState::default() }
+        );
+
+        // Restart: the carried state wins, matched by MAC whatever its spelling
+        // (the config may write it any way `parse_mac` accepts).
+        let dark = crate::profile::map_dmx(Profile::Rgb, &[0, 0, 0], CctRange::default());
+        let carried: HashMap<String, LightState> =
+            [(crate::config::normalize_mac("d6-50-f2-f6-bb-1b"), dark)].into_iter().collect();
+        assert_eq!(initial_state(&on, &carried), dark);
+        assert_eq!(initial_state(&on, &carried).brightness, 0, "a dark light must come back dark");
+        // A light the last run knew nothing about still gets the baseline.
+        assert_eq!(
+            initial_state(&hands_off, &carried),
+            LightState { power: false, seed: true, ..LightState::default() }
+        );
+    }
+
+    #[tokio::test]
+    async fn running_reports_every_lights_latest_state_by_mac() {
+        // What `run` carries into the next start is whatever each light's
+        // channel holds when the run ends — including the latest DMX.
+        let (tx, _rx) = watch::channel(LightState::default());
+        let states = vec![("AA:BB:CC:DD:EE:01".to_string(), tx.subscribe())];
+        let dark = crate::profile::map_dmx(Profile::Rgb, &[0, 0, 0], CctRange::default());
+        tx.send(dark).unwrap();
+        let running = Running {
+            actors: JoinSet::new(),
+            background: JoinSet::new(),
+            listener: tokio::spawn(async { Ok(()) }),
+            listener_done: false,
+            failsafe_mode: "hold".into(),
+            states,
+        };
+        assert_eq!(running.light_states().get("AA:BB:CC:DD:EE:01"), Some(&dark));
+        running.shutdown().await;
     }
 
     #[test]

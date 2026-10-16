@@ -74,6 +74,12 @@ scan_pause_secs  = 15    # idle gap between bursts (s) so a powered-off/flaky li
 #   adapter = power-cycles the adapter only
 #   off     = parks the light and logs; you clear it (systemctl restart bluetooth)
 # Either step briefly drops every light; they reconnect on their own.
+# The same setting covers one more case: if a discovery scan cannot be started at
+# all for 2 minutes while a light is waiting to be found (a wedged controller, or
+# an adapter that refuses to power on), the same steps run once for that episode;
+# "off" disables this too. Separately, and whatever this is set to, the bridge restarts
+# itself on whatever adapter is present if the one it is using disappears
+# (unplugged, or reset by the kernel and back under a new name, hci0 -> hci1).
 stale_link_recovery = "auto"
 # NB: a light stuck on its last colour / ignoring commands has TWO possible causes:
 #   1. WEAK RX LINK (common) — the bridge can't currently reach it. The reconnect loop

@@ -51,7 +51,7 @@ use crate::driver::Driver;
 use crate::profile::Profile;
 use crate::protocol::replies::{self, Reply};
 use crate::protocol::{queries, LightState};
-use crate::recovery::{Outcome, StaleLinkRecovery};
+use crate::recovery::{Outcome, Problem, StaleLinkRecovery};
 use crate::scan::ScanCoordinator;
 
 /// Whether a rate-limited repeat is due: nothing reported yet, or `every` has
@@ -301,7 +301,7 @@ impl LightActor {
              disconnect request never completed (stale device record) — starting recovery"
         );
         let still_stale = || ble::is_connected(p);
-        let mut outcome = self.recovery.recover(label, still_stale).await;
+        let mut outcome = self.recovery.recover(Problem::StaleRecord, label, still_stale).await;
         let parked_at = Instant::now();
         let mut next_report = STALE_REPORT;
         loop {
@@ -343,7 +343,7 @@ impl LightActor {
                     return;
                 }
                 if may_retry {
-                    outcome = self.recovery.recover(label, still_stale).await;
+                    outcome = self.recovery.recover(Problem::StaleRecord, label, still_stale).await;
                     if !matches!(outcome, Outcome::RateLimited) {
                         break; // re-enter the outer match to log the new outcome
                     }

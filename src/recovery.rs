@@ -53,8 +53,16 @@
 //! the actor only parks the light (no leak, loud log) until the record clears
 //! by other means. Both platform steps exist only on Linux/BlueZ — the only
 //! backend with this failure — and report `Unsupported` elsewhere.
+//!
+//! The same ladder, through the same gate, serves one other problem
+//! ([`Problem::ScanBlocked`]): the discovery scan cannot be started at all for
+//! minutes while a light is waiting to be found — a wedged controller, or an
+//! adapter that refuses to power on. (One merely powered OFF is not this case:
+//! btleplug's BlueZ `start_scan` powers the adapter on first.) An adapter
+//! power-cycle resets the controller. See `scan.rs`.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -97,6 +105,16 @@ impl std::fmt::Display for RecoveryMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// What a recovery request is for. The ladder and its rate limits are the
+/// same; only the log lines differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Problem {
+    /// A light's platform device record is stale (`light.rs`).
+    StaleRecord,
+    /// Discovery scans cannot be started at all (`scan.rs`).
+    ScanBlocked,
 }
 
 /// One rung of the ladder.
@@ -170,39 +188,53 @@ pub enum Outcome {
     Disabled,
 }
 
-/// The fleet-wide recovery gate. One per bridge; every light actor holds a
-/// clone of the `Arc`.
+/// When each step last ran, shared by every gate the process builds — see
+/// [`StaleLinkRecovery::with_history`].
+pub type SharedHistory = Arc<Mutex<History>>;
+
+/// The fleet-wide recovery gate. One per bridge run; every light actor (and the
+/// scan coordinator) holds a clone of the `Arc`.
 pub struct StaleLinkRecovery {
     mode: RecoveryMode,
     /// The adapter's platform id (`hci0`), for the power-cycle step.
     adapter_id: String,
-    state: Mutex<History>,
+    state: SharedHistory,
 }
 
 impl StaleLinkRecovery {
     pub fn new(mode: RecoveryMode, adapter_id: String) -> Self {
-        Self { mode, adapter_id, state: Mutex::new(History::default()) }
+        Self::with_history(mode, adapter_id, SharedHistory::default())
+    }
+
+    /// A gate whose rate limits are kept in `history`. The bridge passes the
+    /// same history to the gate of every run, so an in-process restart does
+    /// not reset them: otherwise a fault that also made the bridge restart
+    /// (the adapter vanishing during a bluetoothd restart, say) could earn a
+    /// fresh power-cycle every couple of minutes, for ever.
+    pub fn with_history(mode: RecoveryMode, adapter_id: String, history: SharedHistory) -> Self {
+        Self { mode, adapter_id, state: history }
     }
 
     pub fn mode(&self) -> RecoveryMode {
         self.mode
     }
 
-    /// Try to clear a stale record for `light`. `still_stale` re-reads the
-    /// platform's view of the light (true = still reported connected); it is
-    /// consulted before anything runs and after every step, so no step runs
-    /// for a record that has already cleared.
+    /// Try to clear `problem` for `subject` (a light's label, for a stale
+    /// record). `still_bad` re-reads the platform's view (true = the problem is
+    /// still there: the light still reported connected, or a scan still cannot
+    /// start); it is consulted before anything runs and after every step, so no
+    /// step runs for a problem that has already cleared.
     ///
-    /// Episodes are serialised: a second light arriving while a step is in
-    /// flight waits, then re-checks — the first light's power-cycle usually
+    /// Episodes are serialised: a second request arriving while a step is in
+    /// flight waits, then re-checks — the first one's power-cycle usually
     /// cleared it too.
-    pub async fn recover<F, Fut>(&self, light: &str, still_stale: F) -> Outcome
+    pub async fn recover<F, Fut>(&self, problem: Problem, subject: &str, still_bad: F) -> Outcome
     where
         F: Fn() -> Fut,
         Fut: Future<Output = bool>,
     {
         let mut history = self.state.lock().await;
-        if !still_stale().await {
+        if !still_bad().await {
             return Outcome::AlreadyClear;
         }
         if self.mode == RecoveryMode::Off {
@@ -214,37 +246,62 @@ impl StaleLinkRecovery {
         }
         for step in steps {
             let now = Instant::now();
+            match step {
+                Step::CycleAdapter => history.last_adapter_cycle = Some(now),
+                Step::RestartDaemon => history.last_daemon_restart = Some(now),
+            }
+            self.announce(problem, subject, step);
             let attempted = match step {
-                Step::CycleAdapter => {
-                    history.last_adapter_cycle = Some(now);
-                    info!(
-                        light = %light, adapter = %self.adapter_id,
-                        "stale link recovery: power-cycling the Bluetooth adapter \
-                         (every light will drop and reconnect)"
-                    );
-                    platform::power_cycle_adapter(&self.adapter_id).await
-                }
-                Step::RestartDaemon => {
-                    history.last_daemon_restart = Some(now);
-                    warn!(
-                        light = %light,
-                        "stale link recovery: restarting bluetoothd (systemd bluetooth.service) \
-                         — the adapter power-cycle did not clear the record"
-                    );
-                    platform::restart_bluetoothd().await
-                }
+                Step::CycleAdapter => platform::power_cycle_adapter(&self.adapter_id).await,
+                Step::RestartDaemon => platform::restart_bluetoothd().await,
             };
             if let Err(e) = attempted {
-                warn!(light = %light, step = %step, error = %format!("{e:#}"), "stale link recovery step failed");
+                let error = format!("{e:#}");
+                match problem {
+                    Problem::StaleRecord => {
+                        warn!(light = %subject, step = %step, error = %error, "stale link recovery step failed")
+                    }
+                    Problem::ScanBlocked => {
+                        warn!(step = %step, error = %error, "discovery scan recovery step failed")
+                    }
+                }
                 continue;
             }
             tokio::time::sleep(SETTLE).await;
-            if !still_stale().await {
+            if !still_bad().await {
                 return Outcome::Cleared(step);
             }
-            warn!(light = %light, step = %step, "stale device record survived this step");
+            match problem {
+                Problem::StaleRecord => warn!(light = %subject, step = %step, "stale device record survived this step"),
+                Problem::ScanBlocked => warn!(step = %step, "discovery scans still cannot start after this step"),
+            }
         }
         Outcome::StillStale
+    }
+
+    /// The line that says a step is about to run.
+    fn announce(&self, problem: Problem, subject: &str, step: Step) {
+        match (problem, step) {
+            (Problem::StaleRecord, Step::CycleAdapter) => info!(
+                light = %subject, adapter = %self.adapter_id,
+                "stale link recovery: power-cycling the Bluetooth adapter \
+                 (every light will drop and reconnect)"
+            ),
+            (Problem::StaleRecord, Step::RestartDaemon) => warn!(
+                light = %subject,
+                "stale link recovery: restarting bluetoothd (systemd bluetooth.service) \
+                 — the adapter power-cycle did not clear the record"
+            ),
+            (Problem::ScanBlocked, Step::CycleAdapter) => warn!(
+                adapter = %self.adapter_id,
+                "discovery scan recovery: power-cycling the Bluetooth adapter \
+                 (every light will drop and reconnect)"
+            ),
+            (Problem::ScanBlocked, Step::RestartDaemon) => warn!(
+                "discovery scan recovery: restarting bluetoothd (systemd bluetooth.service) \
+                 — discovery is still blocked"
+            ),
+        }
     }
 }
 
@@ -413,7 +470,7 @@ mod tests {
         let gate = StaleLinkRecovery::new(RecoveryMode::Auto, "hci0".into());
         let checks = AtomicU32::new(0);
         let outcome = gate
-            .recover("t", || {
+            .recover(Problem::StaleRecord, "t", || {
                 checks.fetch_add(1, Ordering::SeqCst);
                 async { false }
             })
@@ -424,7 +481,7 @@ mod tests {
 
         // Off: parks without touching anything, even though the record is stale.
         let gate = StaleLinkRecovery::new(RecoveryMode::Off, "hci0".into());
-        let outcome = gate.recover("t", || async { true }).await;
+        let outcome = gate.recover(Problem::StaleRecord, "t", || async { true }).await;
         assert!(matches!(outcome, Outcome::Disabled));
         assert!(gate.state.lock().await.last_adapter_cycle.is_none());
 
@@ -435,7 +492,51 @@ mod tests {
             h.last_adapter_cycle = Some(Instant::now());
             h.last_daemon_restart = Some(Instant::now());
         }
-        let outcome = gate.recover("t", || async { true }).await;
+        let outcome = gate.recover(Problem::StaleRecord, "t", || async { true }).await;
         assert!(matches!(outcome, Outcome::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_scan_shares_the_gate_and_its_rate_limits() {
+        // The discovery-scan escalation goes through the SAME fleet-wide gate as
+        // the stale-record ladder: a power-cycle drops every light, so a stale
+        // record and a blocked scan found moments apart must share one cycle,
+        // never get one each.
+        let gate = StaleLinkRecovery::new(RecoveryMode::Adapter, "hci0".into());
+        gate.state.lock().await.last_adapter_cycle = Some(Instant::now());
+        let outcome = gate.recover(Problem::ScanBlocked, "discovery scan", || async { true }).await;
+        assert!(matches!(outcome, Outcome::RateLimited), "{outcome:?}");
+
+        // `off` means hands off for this problem too.
+        let gate = StaleLinkRecovery::new(RecoveryMode::Off, "hci0".into());
+        let outcome = gate.recover(Problem::ScanBlocked, "discovery scan", || async { true }).await;
+        assert!(matches!(outcome, Outcome::Disabled), "{outcome:?}");
+        assert!(gate.state.lock().await.last_adapter_cycle.is_none());
+
+        // And a scan that starts on the re-check runs nothing at all.
+        let gate = StaleLinkRecovery::new(RecoveryMode::Auto, "hci0".into());
+        let outcome = gate.recover(Problem::ScanBlocked, "discovery scan", || async { false }).await;
+        assert!(matches!(outcome, Outcome::AlreadyClear), "{outcome:?}");
+        assert!(gate.state.lock().await.last_adapter_cycle.is_none());
+    }
+
+    #[tokio::test]
+    async fn rate_limits_survive_a_restart_through_the_shared_history() {
+        // Each bridge run builds a new gate (the adapter id may have changed);
+        // the history is the process's, so a cycle the last run did still
+        // counts. A fresh history per run would grant a new power-cycle after
+        // every restart.
+        let history = SharedHistory::default();
+        let first = StaleLinkRecovery::with_history(RecoveryMode::Adapter, "hci0".into(), history.clone());
+        first.state.lock().await.last_adapter_cycle = Some(Instant::now());
+        drop(first);
+
+        let next_run = StaleLinkRecovery::with_history(RecoveryMode::Adapter, "hci1".into(), history.clone());
+        let outcome = next_run.recover(Problem::ScanBlocked, "discovery scan", || async { true }).await;
+        assert!(matches!(outcome, Outcome::RateLimited), "{outcome:?}");
+
+        // `new` still gives a gate a history of its own.
+        let separate = StaleLinkRecovery::new(RecoveryMode::Adapter, "hci0".into());
+        assert!(separate.state.lock().await.last_adapter_cycle.is_none());
     }
 }

@@ -114,6 +114,58 @@ impl BleStack {
     pub fn rebuild(&mut self) {
         self.manager = None;
     }
+
+    /// The shared session, once [`BleStack::adapter`] has opened it — a clone,
+    /// which shares the session rather than opening another.
+    pub fn manager(&self) -> Option<Manager> {
+        self.manager.clone()
+    }
+
+    /// How many adapters the platform lists right now, on the shared session
+    /// (opened if needed). The supervisor polls this while it waits for an
+    /// adapter to come back.
+    pub async fn adapter_count(&mut self) -> Result<usize> {
+        if self.manager.is_none() {
+            self.manager = Some(Manager::new().await.context("creating BLE manager")?);
+        }
+        let manager = self.manager.as_ref().expect("just created");
+        Ok(manager.adapters().await.context("listing BLE adapters")?.len())
+    }
+}
+
+/// No Bluetooth adapter can be used right now: the platform lists none, or it
+/// cannot be asked at all (on Linux, bluetoothd not running). A type of its own
+/// so the bridge's supervisor can tell "wait for an adapter to appear" from a
+/// crash it should back off from — see [`is_no_adapter`].
+#[derive(Debug)]
+pub enum NoAdapter {
+    /// The platform lists no adapter.
+    None,
+    /// The adapter list could not be read.
+    Unlisted(btleplug::Error),
+}
+
+impl std::fmt::Display for NoAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NoAdapter::None => "no Bluetooth adapter found — is Bluetooth enabled?",
+            NoAdapter::Unlisted(_) => "listing BLE adapters",
+        })
+    }
+}
+
+impl std::error::Error for NoAdapter {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            NoAdapter::None => None,
+            NoAdapter::Unlisted(e) => Some(e),
+        }
+    }
+}
+
+/// Whether an error is (or wraps) a [`NoAdapter`].
+pub fn is_no_adapter(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<NoAdapter>())
 }
 
 impl Default for BleStack {
@@ -124,11 +176,11 @@ impl Default for BleStack {
 
 /// The selector logic behind [`acquire_adapter`], on an existing session.
 async fn select_adapter(manager: &Manager, selector: &str) -> Result<Adapter> {
-    let adapters = manager.adapters().await.context("listing BLE adapters")?;
+    let adapters = manager.adapters().await.map_err(NoAdapter::Unlisted)?;
     let count = adapters.len();
     debug!(adapters = count, "enumerated BLE adapters");
     if count == 0 {
-        bail!("no Bluetooth adapter found — is Bluetooth enabled?");
+        return Err(NoAdapter::None.into());
     }
 
     // Resolve the per-adapter info strings up front (used for index/substring
@@ -183,6 +235,134 @@ pub async fn adapter_id(adapter: &Adapter) -> String {
         .await
         .map(|info| adapter_id_from_info(&info))
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Adapter presence — is the adapter the bridge is using still there at all?
+//
+// On 2026-10-14 the rig's USB dongle stopped answering a scan command, the
+// kernel reset it, and it came back as `hci1`. The bridge kept addressing the
+// vanished `hci0` for 12 h 40 min: every scan failed, every light sat "not
+// discovered", and the stack watchdog never fired, because the peripheral
+// listing each missing light polls still SUCCEEDS against a vanished adapter —
+// on BlueZ it is one listing of every object bluetoothd holds, filtered by
+// adapter path, so a gone adapter is just an empty list. Nothing that goes
+// through the old handle can notice; asking the platform whether the adapter
+// is still listed can.
+// ---------------------------------------------------------------------------
+
+/// How long the adapter the bridge is using may be missing before the bridge
+/// gives up on it and restarts on whatever adapter is present. Long enough to
+/// ride out a bluetoothd restart (its objects vanish for a second or two),
+/// short enough that a re-enumerated dongle is picked up within half a minute.
+pub const ADAPTER_GONE_AFTER: Duration = Duration::from_secs(15);
+/// Upper bound on each platform call in one presence check.
+pub const PRESENCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the platform says about the adapter the bridge is using.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdapterPresence {
+    Present,
+    /// The platform answered, and does not list it.
+    Gone,
+    /// The platform could not say (daemon down, frozen, or the listing was
+    /// incomplete). Never treated as gone.
+    Unknown(String),
+}
+
+/// Judge presence from the platform's adapter list. Each entry is a listed
+/// adapter's id, or `None` if that adapter could not be identified — in which
+/// case it might be ours, so the answer is `Unknown` rather than `Gone`. Pure.
+fn presence_in(id: &str, listed: &[Option<String>]) -> AdapterPresence {
+    if listed.iter().flatten().any(|l| l == id) {
+        AdapterPresence::Present
+    } else if listed.iter().any(Option::is_none) {
+        AdapterPresence::Unknown("a listed adapter could not be identified".into())
+    } else {
+        AdapterPresence::Gone
+    }
+}
+
+/// Check whether `adapter` (platform id `id`, e.g. `hci0`) still exists.
+///
+/// Asks the adapter itself first, which is one small call and answers the
+/// common case. Only if the platform ANSWERS that with an error is the adapter
+/// list consulted — no answer at all means the platform is unresponsive (a
+/// frozen bluetoothd), which is the stack watchdog's business, not evidence
+/// that the adapter is gone. On WinRT and CoreBluetooth btleplug answers the
+/// first call locally and always succeeds, so this is in effect a BlueZ check;
+/// that also keeps CoreBluetooth's adapter listing — which builds a new
+/// central manager on every call — from ever being reached.
+pub async fn adapter_presence(manager: &Manager, adapter: &Adapter, id: &str) -> AdapterPresence {
+    let own_error = match tokio::time::timeout(PRESENCE_TIMEOUT, adapter.adapter_info()).await {
+        Ok(Ok(_)) => return AdapterPresence::Present,
+        Ok(Err(e)) => e,
+        Err(_) => {
+            return AdapterPresence::Unknown(format!("the adapter did not answer within {PRESENCE_TIMEOUT:?}"))
+        }
+    };
+    if id.is_empty() {
+        return AdapterPresence::Unknown(format!("the adapter's id is unknown ({own_error})"));
+    }
+    let listed = async {
+        let mut ids = Vec::new();
+        for a in manager.adapters().await? {
+            ids.push(a.adapter_info().await.ok().map(|info| adapter_id_from_info(&info)));
+        }
+        Ok::<_, btleplug::Error>(ids)
+    };
+    match tokio::time::timeout(PRESENCE_TIMEOUT, listed).await {
+        Ok(Ok(ids)) => presence_in(id, &ids),
+        Ok(Err(e)) => AdapterPresence::Unknown(format!("{own_error}; listing adapters failed too: {e}")),
+        Err(_) => AdapterPresence::Unknown(format!("listing adapters did not finish within {PRESENCE_TIMEOUT:?}")),
+    }
+}
+
+/// What one presence observation means. See [`GoneTracker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoneEdge {
+    /// Nothing to act on or report.
+    Steady,
+    /// First sighting of the adapter missing.
+    Vanished,
+    /// Listed again, after being missing for `after`.
+    Returned { after: Duration },
+    /// Missing for at least the limit — give up on it.
+    Confirmed { gone_for: Duration },
+}
+
+/// Turns presence observations into edges. The adapter counts as gone only
+/// after a run of `Gone` answers with no `Present` in between lasting the
+/// limit; `Unknown` neither starts nor ends a run. Pure — `now` is an input.
+#[derive(Debug, Default)]
+pub struct GoneTracker {
+    since: Option<Instant>,
+}
+
+impl GoneTracker {
+    pub fn observe(&mut self, presence: &AdapterPresence, now: Instant, limit: Duration) -> GoneEdge {
+        match presence {
+            AdapterPresence::Present => match self.since.take() {
+                Some(t) => GoneEdge::Returned { after: now.saturating_duration_since(t) },
+                None => GoneEdge::Steady,
+            },
+            AdapterPresence::Unknown(_) => GoneEdge::Steady,
+            AdapterPresence::Gone => match self.since {
+                None => {
+                    self.since = Some(now);
+                    GoneEdge::Vanished
+                }
+                Some(t) => {
+                    let gone_for = now.saturating_duration_since(t);
+                    if gone_for >= limit {
+                        GoneEdge::Confirmed { gone_for }
+                    } else {
+                        GoneEdge::Steady
+                    }
+                }
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1072,99 @@ mod tests {
         ] {
             assert!(!is_bus_poisoned(&anyhow::anyhow!("{other}")), "{other}");
         }
+    }
+
+    #[test]
+    fn a_missing_adapter_is_recognised_through_the_context_chain() {
+        // `bridge::run` wraps a failed restart in context before it decides
+        // whether to wait for an adapter, so the marker must survive that.
+        let none = anyhow::Error::from(NoAdapter::None).context("bridge restart failed");
+        assert!(is_no_adapter(&none));
+        // Same message as before it had a type of its own.
+        assert_eq!(NoAdapter::None.to_string(), "no Bluetooth adapter found — is Bluetooth enabled?");
+
+        // A listing failure keeps its cause in the chain, printed exactly as the
+        // old `.context("listing BLE adapters")` printed it — and a poisoned
+        // session's refusal is still visible to `is_bus_poisoned` through it.
+        let refused = btleplug::Error::Other(
+            "The maximum number of pending replies per connection has been reached".into(),
+        );
+        let unlisted = anyhow::Error::from(NoAdapter::Unlisted(refused)).context("bridge restart failed");
+        assert!(is_no_adapter(&unlisted));
+        assert!(is_bus_poisoned(&unlisted));
+        let shown = format!("{unlisted:#}");
+        assert!(shown.starts_with("bridge restart failed: listing BLE adapters: "), "{shown}");
+
+        // Anything else is not "no adapter" — it gets the ordinary backoff.
+        for other in ["start_scan failed: Operation already in progress", "binding 0.0.0.0:6454"] {
+            assert!(!is_no_adapter(&anyhow::anyhow!("{other}")), "{other}");
+        }
+    }
+
+    #[test]
+    fn presence_is_judged_by_id_and_never_guessed() {
+        use AdapterPresence::*;
+        let id = |s: &str| Some(s.to_string());
+        // Listed: present, wherever it sits in the list.
+        assert_eq!(presence_in("hci0", &[id("hci0")]), Present);
+        assert_eq!(presence_in("hci0", &[id("hci1"), id("hci0")]), Present);
+        // The 2026-10-14 incident: hci0 gone, the same dongle back as hci1.
+        assert_eq!(presence_in("hci0", &[id("hci1")]), Gone);
+        // No adapter at all (unplugged, or mid re-enumeration).
+        assert_eq!(presence_in("hci0", &[]), Gone);
+        // An adapter that could not be identified might be ours: never Gone.
+        assert!(matches!(presence_in("hci0", &[None]), Unknown(_)));
+        assert!(matches!(presence_in("hci0", &[id("hci1"), None]), Unknown(_)));
+        // ...but a positive match still wins over an unidentifiable neighbour.
+        assert_eq!(presence_in("hci0", &[None, id("hci0")]), Present);
+        // Prefix-equal ids are different adapters.
+        assert_eq!(presence_in("hci1", &[id("hci10")]), Gone);
+    }
+
+    #[test]
+    fn gone_tracker_confirms_only_an_unbroken_absence() {
+        use AdapterPresence::*;
+        use GoneEdge::*;
+        let limit = ADAPTER_GONE_AFTER;
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let unknown = Unknown("daemon down".into());
+
+        // Present throughout: nothing happens.
+        let mut g = GoneTracker::default();
+        assert_eq!(g.observe(&Present, at(0), limit), Steady);
+        assert_eq!(g.observe(&Present, at(5), limit), Steady);
+
+        // Gone: announced once, quiet while short of the limit, confirmed at it
+        // (inclusive) and on every observation after, until it returns.
+        assert_eq!(g.observe(&Gone, at(10), limit), Vanished);
+        assert_eq!(g.observe(&Gone, at(15), limit), Steady);
+        assert_eq!(g.observe(&Gone, at(24), limit), Steady);
+        assert_eq!(g.observe(&Gone, at(25), limit), Confirmed { gone_for: limit });
+        assert_eq!(g.observe(&Gone, at(30), limit), Confirmed { gone_for: Duration::from_secs(20) });
+
+        // A bluetoothd restart: gone for a moment, then listed again — the
+        // return ends the run, so a later absence starts counting afresh.
+        let mut g = GoneTracker::default();
+        assert_eq!(g.observe(&Gone, at(0), limit), Vanished);
+        assert_eq!(g.observe(&Present, at(5), limit), Returned { after: Duration::from_secs(5) });
+        assert_eq!(g.observe(&Gone, at(14), limit), Vanished);
+        assert_eq!(g.observe(&Gone, at(20), limit), Steady, "the earlier absence must not count");
+
+        // Unknown neither starts a run nor ends one: a daemon that is down
+        // proves nothing about the adapter either way.
+        let mut g = GoneTracker::default();
+        assert_eq!(g.observe(&unknown, at(0), limit), Steady);
+        assert_eq!(g.observe(&unknown, at(60), limit), Steady, "Unknown alone must never confirm");
+        assert_eq!(g.observe(&Gone, at(61), limit), Vanished);
+        assert_eq!(g.observe(&unknown, at(70), limit), Steady);
+        assert_eq!(g.observe(&Gone, at(76), limit), Confirmed { gone_for: limit });
+
+        // A clock that appears to run backwards saturates instead of panicking.
+        let mut g = GoneTracker::default();
+        assert_eq!(g.observe(&Gone, at(10), limit), Vanished);
+        assert_eq!(g.observe(&Gone, at(0), limit), Steady);
+        assert_eq!(g.observe(&Present, at(0), limit), Returned { after: Duration::ZERO });
     }
 
     #[test]

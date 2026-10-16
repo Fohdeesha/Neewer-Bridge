@@ -134,6 +134,8 @@ pub struct Ble {
     /// BlueZ; see `recovery.rs`). `auto` = power-cycle the adapter, then restart
     /// bluetoothd if the record survives; `adapter` = the power-cycle only;
     /// `off` = park the light and log until the record clears by other means.
+    /// The same ladder, under the same setting, also serves a discovery scan
+    /// that cannot be started at all for two minutes (`scan.rs`).
     #[serde(default = "default_stale_link_recovery")]
     pub stale_link_recovery: String,
 }

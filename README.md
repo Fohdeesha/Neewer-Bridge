@@ -86,7 +86,7 @@ port    = 6454
 [ble]
 adapter  = "default"    # or an index ("0") or a name substring
 flush_hz = 15           # max BLE updates per light per second
-stale_link_recovery = "auto"   # Linux: how to clear a stale BlueZ device record (see the example config)
+stale_link_recovery = "auto"   # Linux: how far the bridge may go to reset the Bluetooth stack (see the example config)
 
 [failsafe]              # what to do when ArtNet for a universe stops arriving
 mode         = "hold"   # hold | blackout | poweroff
@@ -234,6 +234,13 @@ for each source.
   bug is fixed in bluez 5.84 and later; Debian 13 ships 5.82, which still has
   it. If its Bluetooth session is ever refused outright, the bridge restarts
   itself and logs why.
+- **Every light dropped at once and the log says the Bluetooth adapter
+  disappeared.** The dongle was unplugged or reset by the kernel, which can
+  bring it back under a new name (`hci0` becomes `hci1`). The bridge notices
+  within about 15 seconds and restarts on whatever adapter is there, waiting
+  for one if there is none. Each light picks up where it was. If discovery
+  scans keep failing while the adapter is still there, it power-cycles the
+  adapter after two minutes (see `stale_link_recovery`).
 
 ## Building from source
 
