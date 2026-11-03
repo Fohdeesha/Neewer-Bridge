@@ -40,10 +40,16 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      # btleplug's Linux backend talks to BlueZ over D-Bus.
+      # btleplug's Linux backend talks to BlueZ over D-Bus. dpkg-dev provides
+      # dpkg-shlibdeps, which works out the .deb's library dependencies.
       - name: Install Linux build deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config zip
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config zip dpkg-dev
+
+      # Pinned, so a cargo-deb release can't change the package under us.
+      - name: Install cargo-deb
+        if: runner.os == 'Linux'
+        run: cargo install cargo-deb --locked --version 3.8.0
 
       - name: Check tag matches Cargo.toml version
         shell: bash
@@ -73,6 +79,26 @@ jobs:
           cp target/release/neewer-bridge config.example.toml LICENSE stage/
           cd stage && zip "../neewer-bridge-$TAG-linux-x64.zip" ./*
 
+      # The Debian package ([package.metadata.deb] in Cargo.toml), from the
+      # binary built and tested above. A second revision of the same build is
+      # made too, only so the install test can run a real version upgrade.
+      # cargo-deb clears target/debian when it builds, hence the copies.
+      - name: Package (Debian)
+        if: runner.os == 'Linux'
+        run: |
+          cargo deb --no-build
+          mkdir -p deb-test/upgrade
+          cp target/debian/neewer-bridge_*.deb .
+          cp neewer-bridge_*.deb deb-test/
+          cargo deb --no-build --deb-revision 2 -o deb-test/upgrade/
+
+      # On this runner's real systemd and dpkg: install, service start, journal,
+      # SIGTERM, config errors, crash restart, upgrade, remove, purge. Nothing
+      # is published unless it passes.
+      - name: Install-test the Debian package
+        if: runner.os == 'Linux'
+        run: sudo sh packaging/test-deb.sh deb-test/neewer-bridge_*.deb deb-test/upgrade/neewer-bridge_*.deb
+
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -84,7 +110,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
-          path: neewer-bridge-*.zip
+          path: |
+            neewer-bridge-*.zip
+            neewer-bridge_*.deb
           if-no-files-found: error
 
   release:
@@ -119,10 +147,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          # The Linux job must have produced the package; never publish
+          # without it.
+          ls dist/neewer-bridge_*_amd64.deb >/dev/null
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.zip --clobber --repo "${{ github.repository }}"
+            gh release upload "$TAG" dist/*.zip dist/*.deb --clobber --repo "${{ github.repository }}"
           else
-            gh release create "$TAG" dist/*.zip \
+            gh release create "$TAG" dist/*.zip dist/*.deb \
               --repo "${{ github.repository }}" \
               --title "Neewer-Bridge $TAG" \
               --verify-tag \

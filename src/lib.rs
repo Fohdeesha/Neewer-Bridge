@@ -18,3 +18,5 @@ pub mod profile;
 pub mod protocol;
 pub mod recovery;
 pub mod scan;
+pub mod sdnotify;
+pub mod shutdown;

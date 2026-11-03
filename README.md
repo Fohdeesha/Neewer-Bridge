@@ -10,7 +10,9 @@ Tested against real TL120C, TL21C, TL60 RGB, and TL97C fixtures.
 1. Download the zip for your OS from the
    [releases page](https://github.com/Fohdeesha/Neewer-Bridge/releases) and
    unzip it anywhere. You need a Bluetooth LE adapter; a cheap USB dongle is
-   fine. (Or [build from source](#building-from-source).)
+   fine. (Or [build from source](#building-from-source). On Debian or Ubuntu
+   there is also a `.deb` that runs the bridge as a service — see
+   [below](#running-as-a-service-debian--ubuntu).)
 
 2. Add your lights. Power them on and make sure the Neewer phone app isn't
    connected to them (a light stops advertising while the app holds it), then:
@@ -40,6 +42,35 @@ Lights are bound by MAC address, so the DMX mapping survives reboots and
 doesn't depend on what order things power on in. A light that drops, loses
 power, or goes out of range reconnects on its own.
 
+## Running as a service (Debian / Ubuntu)
+
+On Debian 12 or later, or Ubuntu 22.04 or later, install the `.deb` from the
+releases page instead of the zip:
+
+```
+sudo apt install ./neewer-bridge_*_amd64.deb
+```
+
+That installs the binary, a systemd service that starts the bridge at boot,
+and the config at `/etc/neewer-bridge/config.toml`. The config is created from
+the example on the first install, and upgrades never touch it. Then:
+
+```
+sudo neewer-bridge add                  # add your lights
+sudo systemctl restart neewer-bridge    # apply them
+systemctl status neewer-bridge          # how many lights are connected
+journalctl -u neewer-bridge -f          # the log
+```
+
+The installed `neewer-bridge` always uses `/etc/neewer-bridge/config.toml`,
+whatever directory you run it from, so it sees the same config as the
+service. Stop the service before using `test` or `ota` on a light it is
+driving. If the adapter isn't there yet at boot (a USB dongle that shows up
+late), the service waits for it. A broken config stops the service instead of
+restarting it over and over; `journalctl -u neewer-bridge` says what's wrong.
+To upgrade, install the newer `.deb` the same way. `apt remove` keeps your
+config, `apt purge` deletes it.
+
 ## Commands
 
 Run `neewer-bridge <command> --help` for the flags on each.
@@ -61,7 +92,8 @@ Run `neewer-bridge <command> --help` for the flags on each.
 `-v` turns on debug logging (shows every BLE write as hex), `-vv` adds the
 Bluetooth wire logs. `--config PATH` points at a different config file; by
 default the bridge uses `config.toml` next to the binary if there is one,
-otherwise the one in the current directory.
+otherwise the one in the current directory (the `.deb`'s binary always uses
+`/etc/neewer-bridge/config.toml`).
 
 ## Configuration
 

@@ -1,0 +1,63 @@
+# Neewer-Bridge as a service, installed by the Debian package.
+#
+# Configure in /etc/neewer-bridge/config.toml, then
+# `systemctl restart neewer-bridge`. To change anything in this unit, use
+# `systemctl edit neewer-bridge`: a drop-in survives package upgrades, an edit
+# to this file does not.
+
+[Unit]
+Description=Neewer-Bridge (ArtNet to Neewer Bluetooth lights)
+Documentation=https://github.com/Fohdeesha/Neewer-Bridge
+# Every BLE call goes through bluetoothd. Wants, not Requires: the bridge must
+# outlive bluetoothd restarting underneath it (its own recovery may restart it).
+Wants=bluetooth.service network-online.target
+After=bluetooth.service network-online.target
+# Never stop retrying. Starts that cannot succeed (a bad config) are stopped by
+# RestartPreventExitStatus below instead.
+StartLimitIntervalSec=0
+
+[Service]
+# READY once the bridge is running (or waiting for its adapter); the status
+# line shows how many lights are connected.
+Type=notify
+NotifyAccess=main
+# --wait-for-adapter: at boot the adapter can appear after the service starts
+# (a USB-over-network dongle attaches seconds late); wait for it instead of
+# failing and restarting.
+ExecStart=/usr/bin/neewer-bridge --config /etc/neewer-bridge/config.toml run --wait-for-adapter
+Restart=on-failure
+RestartSec=5
+# 78 = configuration error (missing or invalid config). Restarting cannot fix
+# that; the unit fails once, with the reason in the journal.
+RestartPreventExitStatus=78
+TimeoutStopSec=20
+
+# Runs as root: when BlueZ's record of a light goes stale, the bridge's recovery
+# power-cycles the adapter and restarts bluetooth.service over D-Bus, which
+# bluetoothd and systemd allow root. (`[ble] stale_link_recovery = "off"`
+# disables that.)
+
+# For a file log, should one be wanted (the journal has everything without
+# it): the working directory is the log directory, so the example's
+# `[logging] file = "neewer-bridge.log"` lands in /var/log/neewer-bridge/.
+LogsDirectory=neewer-bridge
+WorkingDirectory=/var/log/neewer-bridge
+
+# Hardening that cannot touch what the bridge does: D-Bus to bluetoothd and
+# systemd, UDP for ArtNet, and its log.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

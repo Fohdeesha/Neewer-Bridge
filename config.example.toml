@@ -11,6 +11,11 @@
 # `config.toml` from this file automatically the first time you add a light, so
 # you can skip the copy if you start there.
 #
+# The Debian package does the copy for you: its config is
+# /etc/neewer-bridge/config.toml, created from this file on the first install
+# and never touched by an upgrade. Apply changes with
+# `systemctl restart neewer-bridge`.
+#
 # Launching `neewer-bridge` with no --config looks for `config.toml` beside the
 # executable first, then in the working directory (a bare `neewer-bridge` with
 # no subcommand runs the bridge). Lights are bound by MAC address, so the
@@ -117,7 +122,9 @@ level         = "info"    # trace | debug | info | warn | error (global default)
 console       = true      # log to the console (stderr; stdout stays clean for --json).
                           # Turning this off requires setting `file` below.
 # console_level = "info"  # optional per-console override (defaults to `level`)
-# file          = "neewer-bridge.log"  # path; omit/empty = no file logging
+# file          = "neewer-bridge.log"  # path; omit/empty = no file logging. A relative
+                          # path is from the working directory, which for the
+                          # Debian package's service is /var/log/neewer-bridge/.
 # file_level    = "debug" # optional per-file override — keep a full debug record
                           # on disk while the console stays at info
 max_size_mb   = 10        # rotate the log file once it passes this size (min 1)

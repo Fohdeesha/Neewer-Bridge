@@ -14,11 +14,23 @@ use tracing::{debug, error, info, warn};
 use neewer_bridge::config::{self, Config};
 use neewer_bridge::{bridge, commands, logging};
 
+/// The Debian package installs the binary here…
+const PACKAGED_EXE_DIR: &str = "/usr/bin";
+/// …and its one config here (the systemd unit passes it explicitly too).
+const PACKAGED_CONFIG: &str = "/etc/neewer-bridge/config.toml";
+
+/// Exit status for a configuration error — sysexits' EX_CONFIG. The packaged
+/// unit lists it in `RestartPreventExitStatus=`: restarting cannot fix a
+/// missing or broken config, so systemd reports it once instead of retrying it
+/// every few seconds for ever.
+const EXIT_CONFIG: i32 = 78;
+
 #[derive(Parser)]
 #[command(name = "neewer-bridge", version, about = "ArtNet → Neewer Bluetooth light bridge")]
 struct Cli {
-    /// Path to the TOML config file. Default: `config.toml` next to the
-    /// executable if present, else `config.toml` in the working directory.
+    /// Path to the TOML config file. Default: /etc/neewer-bridge/config.toml
+    /// for the Debian package; otherwise `config.toml` next to the executable
+    /// if present, else `config.toml` in the working directory.
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
@@ -234,7 +246,13 @@ enum Command {
     /// Listen for ArtNet and print received ArtDmx packets (no BLE needed).
     Monitor,
     /// Run the full ArtNet→BLE bridge (the default when no command is given).
-    Run,
+    Run {
+        /// With no Bluetooth adapter at startup, wait for one to appear instead
+        /// of exiting. For a service started before its adapter exists (a USB
+        /// dongle that attaches late in boot); the packaged unit uses it.
+        #[arg(long)]
+        wait_for_adapter: bool,
+    },
 }
 
 impl Command {
@@ -251,21 +269,67 @@ impl Command {
 }
 
 /// Resolve the config path. An explicit `--config` is used as-is; otherwise
-/// prefer `config.toml` next to the executable, falling back to `config.toml`
-/// in the working directory (the historical default).
+/// the installation's own config (see [`resolve_from`]), falling back to
+/// `config.toml` in the working directory (the historical default).
 fn resolve_config_path(explicit: Option<&PathBuf>) -> PathBuf {
     if let Some(path) = explicit {
         return path.clone();
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let beside = dir.join("config.toml");
-            if beside.is_file() {
-                return beside;
-            }
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    resolve_from(exe_dir.as_deref(), |p| p.is_file())
+}
+
+/// The config an installation uses, from the directory its executable is in —
+/// pure (the filesystem check is passed in), so the rules are pinned by tests.
+///
+/// - **The Debian package** (`/usr/bin/neewer-bridge`) has exactly one config,
+///   `/etc/neewer-bridge/config.toml` — the one its service runs on. It is used
+///   even when it does not exist yet, so `add` creates it there and a missing
+///   one is reported there, and a stray `config.toml` in whatever directory
+///   someone happens to run a command from can never shadow it: an `add` that
+///   silently wrote to `./config.toml` would leave the service running without
+///   the light.
+/// - **Anything else** (an unpacked release zip, a cargo build): `config.toml`
+///   beside the executable if there is one, else the working directory's.
+fn resolve_from(exe_dir: Option<&Path>, is_file: impl Fn(&Path) -> bool) -> PathBuf {
+    if let Some(dir) = exe_dir {
+        if dir == Path::new(PACKAGED_EXE_DIR) {
+            return PathBuf::from(PACKAGED_CONFIG);
+        }
+        let beside = dir.join("config.toml");
+        if is_file(&beside) {
+            return beside;
         }
     }
     PathBuf::from("config.toml")
+}
+
+/// An error that is the configuration's fault — missing, unreadable, invalid —
+/// rather than the environment's. Carried in the error chain so `main` can exit
+/// with [`EXIT_CONFIG`]; it displays as exactly the error it wraps, so no
+/// message changes.
+#[derive(Debug)]
+struct ConfigFault(anyhow::Error);
+
+impl std::fmt::Display for ConfigFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for ConfigFault {}
+
+fn config_fault(e: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(ConfigFault(e))
+}
+
+/// The exit status for a failed command.
+fn exit_code(e: &anyhow::Error) -> i32 {
+    if e.chain().any(|cause| cause.is::<ConfigFault>()) {
+        EXIT_CONFIG
+    } else {
+        1
+    }
 }
 
 /// Do two file paths live in the same directory? Canonicalised, so a relative
@@ -412,12 +476,13 @@ async fn main() {
     if let Err(e) = dispatch(&cli, &config_path, exists, loaded).await {
         // Print the full error chain for debuggability.
         error!("{:#}", e);
+        let code = exit_code(&e);
         // Drop the logging guards explicitly: `process::exit` runs no
         // destructors, so without this the non-blocking file writer could be
         // torn down with this very error still queued — losing the one line
         // that explains the exit.
         drop(_log_guards);
-        std::process::exit(1);
+        std::process::exit(code);
     }
 }
 
@@ -433,13 +498,15 @@ async fn dispatch(
     loaded: Result<Config>,
 ) -> Result<()> {
     // No subcommand ⇒ run the bridge (`neewer-bridge` alone just runs).
-    let command = cli.command.as_ref().unwrap_or(&Command::Run);
+    let default_run = Command::Run { wait_for_adapter: false };
+    let command = cli.command.as_ref().unwrap_or(&default_run);
     // The missing-vs-broken rule lives in `Config::for_command`; this just
-    // serves it from the parse `main` already did.
+    // serves it from the parse `main` already did. Its errors are the
+    // config's, and say so in the exit status.
     //
     // `FnOnce`: it consumes `loaded`. Only one match arm ever runs, so calling
     // it from several of them is fine.
-    let load = move || Config::for_command(config_path, exists, loaded);
+    let load = move || Config::for_command(config_path, exists, loaded).map_err(config_fault);
     match command {
         Command::Adapters => commands::adapters().await,
         Command::Scan { seconds, all, json } => {
@@ -469,13 +536,15 @@ async fn dispatch(
             // A config we just seeded postdates `main`'s parse, so read it back
             // rather than serving the "no config" defaults for it.
             let cfg = if !exists && config_path.is_file() {
-                Config::load(config_path).with_context(|| {
-                    format!("loading the config just created at {}", config_path.display())
-                })?
+                Config::load(config_path)
+                    .with_context(|| {
+                        format!("loading the config just created at {}", config_path.display())
+                    })
+                    .map_err(config_fault)?
             } else {
                 load()?
             };
-            match mac {
+            let added = match mac {
                 Some(mac) => {
                     // clap's `requires` on --mac already rejected a missing
                     // flag before we got here (and before the seeding above);
@@ -489,18 +558,23 @@ async fn dispatch(
                     .await
                 }
                 None => commands::add(config_path, &cfg.ble.adapter).await,
+            };
+            // The service reads its config once, at start.
+            if added.is_ok() && config_path == Path::new(PACKAGED_CONFIG) {
+                info!("restart the service to drive the new light: sudo systemctl restart neewer-bridge");
             }
+            added
         }
         Command::Models => commands::models(),
         // `lights` reports the configured channel map, so — like `run` — a
         // missing config is an error, not an empty table.
         Command::Lights => {
             if !exists {
-                anyhow::bail!(
+                return Err(config_fault(anyhow::anyhow!(
                     "no config file at {} — {}",
                     config_path.display(),
                     config_hint(config_path)
-                );
+                )));
             }
             let cfg = load()?;
             commands::lights(&cfg)
@@ -562,16 +636,16 @@ async fn dispatch(
         // `run` requires a valid config (it defines the light bindings). A
         // missing one is the first-run case, so say how to make one rather than
         // surfacing a bare "No such file or directory".
-        Command::Run => {
+        Command::Run { wait_for_adapter } => {
             if !exists {
-                anyhow::bail!(
+                return Err(config_fault(anyhow::anyhow!(
                     "no config file at {} — {}",
                     config_path.display(),
                     config_hint(config_path)
-                );
+                )));
             }
             let cfg = load()?;
-            bridge::run(cfg).await
+            bridge::run(cfg, bridge::RunOptions { wait_for_adapter: *wait_for_adapter }).await
         }
     }
 }
@@ -579,6 +653,40 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_packaged_binary_always_uses_the_system_config() {
+        let packaged = Some(Path::new("/usr/bin"));
+        // Whether or not it exists yet: `add` must create it there, and a
+        // `config.toml` in whatever directory the command was run from must
+        // never shadow the one the service reads.
+        assert_eq!(resolve_from(packaged, |_| true), PathBuf::from(PACKAGED_CONFIG));
+        assert_eq!(resolve_from(packaged, |_| false), PathBuf::from(PACKAGED_CONFIG));
+    }
+
+    #[test]
+    fn other_installs_prefer_the_config_beside_the_binary_then_the_working_dir() {
+        let zip = Path::new("/opt/neewer-bridge");
+        let beside = zip.join("config.toml");
+        assert_eq!(resolve_from(Some(zip), |p| p == beside), beside);
+        assert_eq!(resolve_from(Some(zip), |_| false), PathBuf::from("config.toml"));
+        // A binary elsewhere in a bin dir is not the package's.
+        let local = Path::new("/usr/local/bin");
+        assert_eq!(resolve_from(Some(local), |_| false), PathBuf::from("config.toml"));
+        assert_eq!(resolve_from(None, |_| true), PathBuf::from("config.toml"));
+    }
+
+    #[test]
+    fn configuration_errors_exit_78_and_keep_their_message() {
+        let fault = config_fault(anyhow::anyhow!("no [[lights]] here").context("config x is invalid"));
+        assert_eq!(exit_code(&fault), EXIT_CONFIG);
+        // Exactly the text the wrapped error printed before it was wrapped.
+        assert_eq!(format!("{fault:#}"), "config x is invalid: no [[lights]] here");
+        // Still found under further context.
+        assert_eq!(exit_code(&fault.context("starting")), EXIT_CONFIG);
+        // Everything else is a plain failure.
+        assert_eq!(exit_code(&anyhow::anyhow!("Address already in use")), 1);
+    }
 
     #[test]
     fn verbatim_prefix_is_stripped_for_display() {

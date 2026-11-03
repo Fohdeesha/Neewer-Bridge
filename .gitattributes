@@ -1,0 +1,3 @@
+# Shipped into the Debian package: shell scripts and a systemd unit must stay LF
+# whatever the checkout platform.
+packaging/** text eol=lf

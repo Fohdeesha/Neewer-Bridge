@@ -197,11 +197,15 @@ impl LightActor {
                     // Power is driven entirely by the flushed LightState (the
                     // bridge seeds the initial state's power from
                     // `power_on_connect`), so there's no separate power-on here.
+                    // Counted as connected for exactly the session's length
+                    // (the service status line reads the count).
+                    let live = self.scan.begin_session();
                     if let Err(e) =
                         self.session(&label, &peripheral, &chars, &driver, discovery_rssi).await
                     {
                         warn!(light = %label, error = %format!("{e:#}"), "session ended; will reconnect");
                     }
+                    drop(live);
                 }
                 Err(e) => warn!(light = %label, error = %format!("{e:#}"), "connect/verify failed"),
             }

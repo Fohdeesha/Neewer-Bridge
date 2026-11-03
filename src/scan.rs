@@ -126,16 +126,38 @@ async fn scan_blocked(adapter: &Adapter) -> bool {
 }
 
 /// Shared discovery-need accounting between the light actors and the scan task.
+///
+/// It also counts live sessions ([`SessionGuard`]s), for the service status
+/// line. That is a separate count on purpose: "not searching" is not
+/// "connected" — a light sitting out its reconnect backoff, or parked on a
+/// stale device record, has released its search request too.
 pub struct ScanCoordinator {
     /// Number of lights currently needing discovery (outstanding [`SearchGuard`]s).
     searching: AtomicUsize,
     /// Pulsed whenever `searching` changes, so the coordinator reacts promptly.
     changed: Notify,
+    /// Number of lights with a live session (outstanding [`SessionGuard`]s).
+    connected: AtomicUsize,
 }
 
 impl ScanCoordinator {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { searching: AtomicUsize::new(0), changed: Notify::new() })
+        Arc::new(Self {
+            searching: AtomicUsize::new(0),
+            changed: Notify::new(),
+            connected: AtomicUsize::new(0),
+        })
+    }
+
+    /// Register a live session until the returned guard is dropped.
+    pub fn begin_session(self: &Arc<Self>) -> SessionGuard {
+        self.connected.fetch_add(1, Ordering::SeqCst);
+        SessionGuard { coord: Arc::clone(self) }
+    }
+
+    /// How many lights have a live session right now.
+    pub fn connected(&self) -> usize {
+        self.connected.load(Ordering::SeqCst)
     }
 
     /// Register that the caller needs the scan running until the returned guard
@@ -166,6 +188,18 @@ pub struct SearchGuard {
 impl Drop for SearchGuard {
     fn drop(&mut self) {
         self.coord.end_search();
+    }
+}
+
+/// Held by an actor for the length of a session; dropping it — on every way a
+/// session can end, including the task being aborted — decrements the count.
+pub struct SessionGuard {
+    coord: Arc<ScanCoordinator>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.coord.connected.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -326,6 +360,29 @@ mod tests {
         assert_eq!(c.searching(), 1);
         drop(g2);
         assert_eq!(c.searching(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_count_is_separate_from_search_count_and_survives_an_abort() {
+        let c = ScanCoordinator::new();
+        let session = c.begin_session();
+        assert_eq!((c.connected(), c.searching()), (1, 0));
+        drop(session);
+        assert_eq!(c.connected(), 0);
+
+        // An actor aborted mid-session (bridge shutdown / restart) must not
+        // leave a phantom "connected" light behind in the status line.
+        let held = c.clone();
+        let task = tokio::spawn(async move {
+            let _session = held.begin_session();
+            std::future::pending::<()>().await;
+        });
+        while c.connected() == 0 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert_eq!(c.connected(), 0);
     }
 
     #[test]

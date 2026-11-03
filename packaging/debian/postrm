@@ -1,0 +1,18 @@
+#!/bin/sh
+# postrm for neewer-bridge.
+#
+# `remove` leaves the config and logs; `purge` removes what the package created
+# outside dpkg's own file list: the live config (made by postinst) and the log
+# directory (made by the unit's LogsDirectory=). Anything else an admin put in
+# /etc/neewer-bridge stays, and so does the directory then.
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -f /etc/neewer-bridge/config.toml /etc/neewer-bridge/config.toml.dpkg-tmp
+    rmdir /etc/neewer-bridge 2>/dev/null || true
+    rm -rf /var/log/neewer-bridge
+fi
+
+#DEBHELPER#
+
+exit 0

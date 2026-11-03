@@ -36,12 +36,17 @@ use crate::profile::{extract_slice, map_dmx, CctRange, Profile};
 use crate::protocol::LightState;
 use crate::recovery::{RecoveryMode, SharedHistory, StaleLinkRecovery};
 use crate::scan;
+use crate::{sdnotify, shutdown};
 
 /// Names for the supervised background tasks, used in the error when one of
 /// them ends (see the `background` JoinSet in [`start`]).
 const SCAN_TASK: &str = "BLE discovery-scan coordinator";
 const FAILSAFE_TASK: &str = "ArtNet-loss failsafe";
 const STACK_WATCHDOG_TASK: &str = "BLE stack watchdog";
+const STATUS_TASK: &str = "service status reporter";
+
+/// How often the service status line (`systemctl status`) is refreshed.
+const STATUS_EVERY: Duration = Duration::from_secs(5);
 
 /// The log label for each configured light, in config order.
 ///
@@ -160,24 +165,42 @@ impl Sink {
     }
 }
 
-/// Run the bridge until Ctrl-C, restarting it in-process after any failure.
+/// How [`run`] behaves at its first start.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions {
+    /// With no Bluetooth adapter at the first start, wait for one to appear
+    /// instead of failing. Off for an interactive run, where "no adapter" is
+    /// an answer the user needs at once; on for the packaged service, which
+    /// can start before the adapter exists — a USB-over-network dongle (the
+    /// SEH box on the test rig) attaches some seconds after boot.
+    pub wait_for_adapter: bool,
+}
+
+/// Run the bridge until Ctrl-C or SIGTERM, restarting it in-process after any
+/// failure.
 ///
 /// The FIRST start is fatal on error (an invalid config, a port already in use,
-/// no adapter — user-facing problems that must exit non-zero). Once the bridge
-/// has started it never gives up: a task that dies, a BLE session the watchdog
-/// judges unusable, or a failed restart is logged at ERROR and the whole bridge
-/// — sockets, adapter, actors, merger, failsafe — is torn down and rebuilt
-/// after a backoff ([`RestartPolicy`]). That is what a supervisor would do,
-/// done in-process, because the deployment this was written for runs the
-/// binary bare in a screen session: before this, a bridge whose BLE session
-/// had been refused by the bus sat "up" for four days driving nothing.
-pub async fn run(cfg: Config) -> Result<()> {
+/// no adapter — user-facing problems that must exit non-zero), except that
+/// [`RunOptions::wait_for_adapter`] turns "no adapter" into a wait. Once the
+/// bridge has started it never gives up: a task that dies, a BLE session the
+/// watchdog judges unusable, or a failed restart is logged at ERROR and the
+/// whole bridge — sockets, adapter, actors, merger, failsafe — is torn down
+/// and rebuilt after a backoff ([`RestartPolicy`]). That is what a supervisor
+/// would do, done in-process, because the deployment this was written for ran
+/// the binary bare in a screen session: before this, a bridge whose BLE session
+/// had been refused by the bus sat "up" for four days driving nothing. Under
+/// the packaged systemd unit, systemd is the outer layer (a crash of the whole
+/// process), and this stays the inner one.
+pub async fn run(cfg: Config, opts: RunOptions) -> Result<()> {
     // `Config::load` already validates, but `run` is a public entry point and
     // everything below relies on those invariants (profiles parse, MACs parse,
     // channels fit the universe) — the per-light setup and each actor `expect()`
     // them. Re-checking here is idempotent and cheap, and turns a would-be panic
     // in a spawned task into a plain startup error.
     cfg.validate().context("invalid bridge configuration")?;
+    // From here on a stop request is recorded whenever it arrives, so none can
+    // fall between the waits below (see `shutdown`).
+    shutdown::listen();
 
     let mut stack = ble::BleStack::new();
     let mut policy = RestartPolicy::default();
@@ -194,10 +217,19 @@ pub async fn run(cfg: Config) -> Result<()> {
         let started_at = Instant::now();
         let outcome = match start(&cfg, &mut stack, attempt, &carried, &recovery_history).await {
             Ok(mut running) => {
+                sdnotify::ready();
                 let res = running.serve().await;
                 carried = running.light_states();
                 running.shutdown().await;
                 res
+            }
+            // Waiting for hardware is the service's normal boot, not an error.
+            Err(e) if attempt == 1 && opts.wait_for_adapter && ble::is_no_adapter(&e) => {
+                warn!(error = %format!("{e:#}"), "no usable Bluetooth adapter yet — waiting for one to appear");
+                if !wait_for_adapter(&mut stack).await {
+                    return Ok(()); // stop requested
+                }
+                continue;
             }
             // The first start failing is the user's problem to fix, not ours to
             // retry: a bad config, a busy port, no adapter.
@@ -205,7 +237,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             Err(e) => Err(e.context("bridge restart failed")),
         };
         let err = match outcome {
-            Ok(()) => return Ok(()), // Ctrl-C
+            Ok(()) => return Ok(()), // stop requested
             Err(e) => e,
         };
         // A poisoned platform session can only be fixed by replacing it; any
@@ -227,7 +259,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 "bridge failed — no usable Bluetooth adapter; waiting for one to appear"
             );
             if !wait_for_adapter(&mut stack).await {
-                return Ok(()); // Ctrl-C
+                return Ok(()); // stop requested
             }
             continue;
         }
@@ -239,10 +271,12 @@ pub async fn run(cfg: Config) -> Result<()> {
             retry_in_secs = delay.as_secs(),
             "bridge failed — restarting"
         );
+        sdnotify::status(&format!("restarting in {} s after a failure: {err:#}", delay.as_secs()));
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl-C received while waiting to restart — exiting");
+            signal = shutdown::requested() => {
+                info!("{signal} received while waiting to restart — exiting");
+                sdnotify::stopping();
                 return Ok(());
             }
         }
@@ -281,25 +315,31 @@ const ADAPTER_POLL: Duration = Duration::from_secs(5);
 const ADAPTER_WAIT_REPORT: Duration = Duration::from_secs(60);
 
 /// Wait until the platform lists a Bluetooth adapter again, polling every
-/// [`ADAPTER_POLL`]. Returns `false` on Ctrl-C. Waiting is announced by the
-/// caller, repeated here every [`ADAPTER_WAIT_REPORT`] (no light is driven
+/// [`ADAPTER_POLL`]. Returns `false` on a stop request. Waiting is announced by
+/// the caller, repeated here every [`ADAPTER_WAIT_REPORT`] (no light is driven
 /// meanwhile, and that must never be invisible in the log), and its end is
 /// announced too.
 async fn wait_for_adapter(stack: &mut ble::BleStack) -> bool {
+    // Waiting for hardware is still "up" as far as the service manager is
+    // concerned: the bridge is doing exactly what it should.
+    sdnotify::ready();
+    sdnotify::status("waiting for a Bluetooth adapter — no light is being driven");
     let since = Instant::now();
     let mut next_report = ADAPTER_WAIT_REPORT;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(ADAPTER_POLL) => {}
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl-C received while waiting for a Bluetooth adapter — exiting");
+            signal = shutdown::requested() => {
+                info!("{signal} received while waiting for a Bluetooth adapter — exiting");
+                sdnotify::stopping();
                 return false;
             }
         }
         let counted = tokio::select! {
             res = stack.adapter_count() => res,
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl-C received while waiting for a Bluetooth adapter — exiting");
+            signal = shutdown::requested() => {
+                info!("{signal} received while waiting for a Bluetooth adapter — exiting");
+                sdnotify::stopping();
                 return false;
             }
         };
@@ -385,9 +425,10 @@ impl Running {
                 };
                 Err(err)
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl-C received — shutting down");
+            signal = shutdown::requested() => {
+                info!("{signal} received — shutting down");
                 info!("shutdown: failsafe = {} (lights keep their last commanded state)", self.failsafe_mode);
+                sdnotify::stopping();
                 Ok(())
             }
             res = &mut self.listener => {
@@ -488,6 +529,31 @@ async fn stack_watchdog(watch: AdapterWatch) -> String {
     }
 }
 
+/// Keep the service status line current: re-sent only when it changes.
+async fn report_status(scan: Arc<scan::ScanCoordinator>, total: usize) {
+    let mut tick = interval(STATUS_EVERY);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last = String::new();
+    loop {
+        tick.tick().await;
+        let line = status_line(scan.connected(), total);
+        if line != last {
+            sdnotify::status(&line);
+            last = line;
+        }
+    }
+}
+
+/// The running bridge's one-line service status. Pure, so it is pinned by a
+/// test.
+fn status_line(connected: usize, total: usize) -> String {
+    match total {
+        0 => "running — no lights configured; add some to the config, then restart".into(),
+        1 => format!("running — {connected} of 1 light connected"),
+        _ => format!("running — {connected} of {total} lights connected"),
+    }
+}
+
 /// Start everything: bind the ArtNet inputs, acquire the adapter, spawn the
 /// scan coordinator, the light actors, the failsafe, the stack watchdog and the
 /// listener. Returns the running set for [`Running::serve`].
@@ -563,6 +629,17 @@ async fn start(
         background.spawn(async move {
             let reason = stack_watchdog(watch).await;
             BackgroundExit { task: STACK_WATCHDOG_TASK, reason: Some(reason) }
+        });
+    }
+    // The status line `systemctl status` shows. Only when systemd is listening
+    // — it exists for nothing else. Loops forever like the others, so it is
+    // supervised the same way.
+    if sdnotify::enabled() {
+        let scan = scan.clone();
+        let total = cfg.lights.len();
+        background.spawn(async move {
+            report_status(scan, total).await;
+            BackgroundExit { task: STATUS_TASK, reason: None }
         });
     }
     info!(
@@ -1310,7 +1387,17 @@ mod tests {
             cct_max: 56,
             cmd_type: 2,
         });
-        let err = run(cfg).await.expect_err("invalid config must be an error");
+        let err = run(cfg, RunOptions::default()).await.expect_err("invalid config must be an error");
         assert!(format!("{err:#}").contains("invalid bridge configuration"));
+    }
+
+    #[test]
+    fn service_status_line_counts_connected_lights() {
+        assert_eq!(status_line(0, 5), "running — 0 of 5 lights connected");
+        assert_eq!(status_line(4, 5), "running — 4 of 5 lights connected");
+        assert_eq!(status_line(1, 1), "running — 1 of 1 light connected");
+        // A fresh package install runs on the example config, which has no
+        // lights: say what to do rather than "0 of 0".
+        assert!(status_line(0, 0).contains("no lights configured"));
     }
 }

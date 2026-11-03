@@ -1,0 +1,33 @@
+#!/bin/sh
+# postinst for neewer-bridge.
+#
+# The package never ships the live config. It ships config.example.toml (a
+# conffile, kept current by upgrades) and creates config.toml from it ONCE, on
+# the first install. From then on config.toml is the admin's: no upgrade
+# touches it, and only a purge removes it.
+set -e
+
+CONF_DIR=/etc/neewer-bridge
+CONF="$CONF_DIR/config.toml"
+EXAMPLE="$CONF_DIR/config.example.toml"
+
+if [ "$1" = "configure" ]; then
+    # -L as well as -e: a symlink the admin put there is theirs even if it
+    # dangles.
+    if [ ! -e "$CONF" ] && [ ! -L "$CONF" ] && [ -f "$EXAMPLE" ]; then
+        install -m 0644 "$EXAMPLE" "$CONF.dpkg-tmp"
+        mv -f "$CONF.dpkg-tmp" "$CONF"
+        cat <<EOF
+neewer-bridge: created $CONF from the example.
+  Add your lights:  neewer-bridge add     (or edit the file)
+  Then apply:       systemctl restart neewer-bridge
+  Logs:             journalctl -u neewer-bridge -f
+EOF
+    fi
+fi
+
+# The systemd unit handling (enable, start, restart on upgrade) is generated
+# and inserted here. It must come after the config is in place.
+#DEBHELPER#
+
+exit 0

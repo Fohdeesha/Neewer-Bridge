@@ -13,6 +13,52 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.9.0] — 2026-11-03
+
+A Debian package that runs the bridge as a systemd service, and the changes
+the bridge needed to behave well as one. MINOR: new packaging and new
+behaviour, and configuration errors now exit with a different status.
+
+### Added
+
+- **A `.deb` for Debian 12+ and Ubuntu 22.04+** on every release, next to the
+  zips. It installs `/usr/bin/neewer-bridge`, a `neewer-bridge` systemd service
+  that starts at boot, and `/etc/neewer-bridge/`. The live `config.toml` there
+  is created from `config.example.toml` on the first install and is never
+  touched by an upgrade; `apt purge` removes it. The service restarts the
+  bridge if it crashes, waits for the Bluetooth adapter if it starts first,
+  logs to the journal, and reports how many lights are connected in
+  `systemctl status`. The release workflow install-tests every package on a
+  real systemd machine (install, stop, crash, config error, upgrade, remove,
+  purge) before publishing it.
+- **`run --wait-for-adapter`**: with no Bluetooth adapter at startup, wait for
+  one instead of exiting. The service uses it, because a USB dongle (especially
+  one attached over the network) can appear after the service has started.
+- **systemd notifications.** Under a `Type=notify` unit the bridge reports
+  ready once it is running (or waiting for its adapter), keeps the status line
+  current ("running — 4 of 5 lights connected"), and says when it is stopping.
+  Outside systemd this does nothing.
+
+### Changed
+
+- **SIGTERM stops the bridge cleanly**, like Ctrl-C (it used to kill it
+  outright). A stop request is also no longer lost if it arrives while the
+  bridge is between two waits, such as a restart backoff. A second Ctrl-C or
+  SIGTERM during shutdown exits at once.
+- **Configuration errors exit with status 78** (EX_CONFIG) instead of 1: a
+  missing, unreadable or invalid config. The service uses it to fail once
+  instead of restarting every few seconds over a config that cannot load.
+- **The binary installed in `/usr/bin` by the package always uses
+  `/etc/neewer-bridge/config.toml`** unless `--config` says otherwise, so a
+  `config.toml` in whatever directory a command is run from can never shadow
+  the service's. Zip installs resolve the config exactly as before.
+- **Console colour only on a terminal.** Log output piped to a file or another
+  program no longer carries colour escape codes (`NO_COLOR` is still honoured).
+- **Logging to the systemd journal**: lines carry no timestamp of their own
+  (journald adds one) and each is stored at its real priority, so
+  `journalctl -u neewer-bridge -p warning` shows exactly the warnings and
+  errors — including every line of a multi-line error.
+
 ## [1.8.0] — 2026-10-16
 
 On the test rig the USB Bluetooth dongle stopped answering a scan command, the
