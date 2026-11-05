@@ -9,6 +9,7 @@ pub mod ble;
 pub mod bridge;
 pub mod commands;
 pub mod config;
+pub mod controller;
 pub mod driver;
 pub mod light;
 pub mod logging;

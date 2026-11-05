@@ -85,7 +85,8 @@ and none while the value is constant.
   nothing on a good link. With `-v`, idle the light (no ArtNet) and every
   `probe_secs` you should see the status-query BLE writes (battery `78 95 …`,
   temperature `78 b3 …`). Degrade the link and you get
-  `connection probe failed (GATT read)` with a rising `failures` count;
+  `connection probe failed` with a rising `failures` count (its `probe` field says
+  which check ran: `GATT read` on Windows, `status write` on Linux);
   it either clears with `connection probe recovered` or, at 3 in a row, ends the
   session (`session ended; will reconnect`) and reconnects.
 - **Failsafe:** set `[failsafe] mode="poweroff"` / `timeout_secs=3`, run, send one

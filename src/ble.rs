@@ -491,6 +491,17 @@ fn observed<T>(res: Result<T>) -> Result<T> {
     res
 }
 
+/// Commands the platform has accepted for delivery, process-wide.
+static WRITES_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+
+/// How many commands the platform has accepted for delivery. Accepted is all it
+/// means: on BlueZ a write-without-response succeeds once bluetoothd has queued
+/// it, so this keeps climbing with a dead controller. Set against the kernel's
+/// packet counter, that is what shows a stall (`controller.rs`).
+pub fn writes_accepted() -> u64 {
+    WRITES_ACCEPTED.load(Ordering::Relaxed)
+}
+
 /// Enumerate BLE adapters with their index + OS info string (for `adapters` CLI
 /// and so users know what to put in `[ble] adapter`).
 pub async fn list_adapters() -> Result<Vec<(usize, String)>> {
@@ -659,9 +670,11 @@ pub async fn find_scanned(
 }
 
 /// Find any readable characteristic for use as a non-mutating liveness probe
-/// (the connection check in `light.rs`). Standard Generic Access chars (e.g.
-/// Device Name) are usually
-/// readable even if the Neewer control chars are not.
+/// (the connection check in `light.rs`). On Windows that is usually Generic
+/// Access's Device Name. On BlueZ it is `None` for every fixture we have: BlueZ
+/// keeps Generic Access to itself and does not export it, and everything else
+/// these lights expose is write or notify only (checked on all four present
+/// lights, 2026-11-03).
 pub fn find_readable_char(p: &Peripheral) -> Option<Characteristic> {
     p.characteristics()
         .into_iter()
@@ -768,6 +781,7 @@ pub async fn write_command(p: &Peripheral, write: &Characteristic, data: &[u8]) 
     p.write(write, data, wt)
         .await
         .with_context(|| format!("writing command {}", hexstr(data)))?;
+    WRITES_ACCEPTED.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -800,6 +814,7 @@ pub async fn write_command_chunked(p: &Peripheral, write: &Characteristic, data:
         p.write(write, chunk, wt)
             .await
             .with_context(|| format!("writing chunk of command {}", hexstr(data)))?;
+        WRITES_ACCEPTED.fetch_add(1, Ordering::Relaxed);
         // Small settle BETWEEN fragments so the device's reassembler keeps up.
         // Not after the last one — that delay buys nothing and, at flush rates,
         // just eats into the next tick.
@@ -907,8 +922,8 @@ pub async fn inspect(p: &Peripheral) -> Result<Vec<CharInfo>> {
 /// device connects**, so on a connected light this is typically `None` now that
 /// scanning is on-demand. Callers that want a per-session signal number should
 /// use the value [`find_scanned`] captured at discovery time (the actor does).
-/// Good for signal-strength diagnostics, NOT for liveness (we use a GATT read
-/// probe for that). Always `None` on macOS/CoreBluetooth.
+/// Good for signal-strength diagnostics, NOT for liveness. Always `None` on
+/// macOS/CoreBluetooth.
 pub async fn rssi(p: &Peripheral) -> Option<i16> {
     p.properties().await.ok().flatten().and_then(|pr| pr.rssi)
 }

@@ -5,12 +5,16 @@
 //! - power on (if configured),
 //! - **coalescing flush:** at `flush_hz`, send the latest desired `LightState`
 //!   only if it changed (handles the ArtNet-44Hz → BLE rate mismatch),
-//! - **liveness:** a cheap GATT read every `probe_secs`, for every fixture. These
-//!   lights give no write ACK (write-without-response), so an unprobed half-dead
-//!   link would look healthy forever — NeewerLite's stale-session lesson. The read
-//!   is answered by the light's radio, so a healthy light stays connected with zero
-//!   churn; three consecutive misses — or a reported disconnect — means a dead link
-//!   and we reconnect. A stuck/unresponsive fixture has TWO distinct causes
+//! - **liveness:** a probe every `probe_secs`. These lights give no write ACK
+//!   (write-without-response), so an unprobed half-dead link would look healthy
+//!   forever — NeewerLite's stale-session lesson. Where the platform exposes a
+//!   readable characteristic (Windows) the probe is a cheap GATT read, answered by
+//!   the light's radio, so a healthy light stays connected with zero churn. BlueZ
+//!   exports nothing readable for these fixtures, so there the probe can only be
+//!   whether the platform accepts the status queries, which proves little: a dead
+//!   controller still accepts writes. That case is caught per adapter, not per
+//!   light (`controller.rs`). Three consecutive misses — or a reported disconnect
+//!   — means a dead link and we reconnect. A stuck/unresponsive fixture has TWO distinct causes
 //!   (both seen live on hardware): a **weak-RF link** (drops or
 //!   won't connect at −90 dBm and below; moving it closer + this reconnect loop
 //!   recovers it) and a genuine **firmware WEDGE** (the fixture stays dead even
@@ -105,9 +109,8 @@ fn probe_edge(conn_ok: bool, failures: u32, max: u32) -> ProbeEdge {
 
 /// How long a liveness probe may take before it counts as a failure (§5).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
-/// Consecutive GATT-read failures before we declare the *link* dead and recycle.
-/// The radio answers this read, so it's a stable connection-health signal — a real
-/// dead link (weak signal / gone) fails it, a merely-idle one does not.
+/// Consecutive probe failures before we declare the *link* dead and recycle. A
+/// real dead link (weak signal / gone) fails the probe, a merely-idle one does not.
 const MAX_PROBE_FAILURES: u32 = 3;
 /// How often to poll the shared scan while waiting for the light to appear.
 const FIND_POLL: Duration = Duration::from_secs(2);
@@ -477,16 +480,20 @@ impl LightActor {
         // we don't probe before the link has settled.
         probe.tick().await;
 
-        // Connection-health probe target: a readable characteristic (usually Generic
-        // Access Device Name). The GATT read against it is the liveness check for
-        // every fixture (the radio answers it — stable, no churn). See the probe arm.
+        // Connection-health probe target: a readable characteristic, if the platform
+        // exposes one (Windows: usually Generic Access Device Name; BlueZ: none).
         let read_char = ble::find_readable_char(p);
-        if read_char.is_none() {
-            debug!(light = %label, "no readable characteristic; connection health falls back to is_connected() only");
-        }
+        // Status reads are MAC-addressed, so only for MAC-carrying drivers
+        // (classic/infinity, not Home).
+        let query_mac = driver.mac();
+        let probe_kind = match (&read_char, query_mac) {
+            (Some(_), _) => "GATT read",
+            (None, Some(_)) => "status write",
+            (None, None) => "connection state only",
+        };
 
         let mut last_sent: Option<LightState> = None;
-        // Connection-health failures (consecutive GATT-read misses); reset on success.
+        // Connection-health failures (consecutive probe misses); reset on success.
         let mut failures: u32 = 0;
         // Advertisement RSSI: BlueZ clears the live property once the device
         // connects, so the "most recent advertisement RSSI" for this session is
@@ -497,15 +504,15 @@ impl LightActor {
             light = %label,
             flush_hz = self.flush_hz,
             probe_secs = self.probe_secs,
+            probe = probe_kind,
             rssi = ?rssi0,
             "session active"
         );
 
         // Status reads (protocol::queries/replies): subscribe to the notify char and
-        // fire an initial battery/temp/version/state query. MAC-addressed, so only
-        // for MAC-carrying drivers (classic/infinity, not Home). Pure telemetry, all
-        // best-effort — a light without notify is still fully controllable.
-        let query_mac = driver.mac();
+        // fire an initial battery/temp/version/state query. The replies are pure
+        // telemetry, all best-effort — a light without notify is still fully
+        // controllable.
         // Whether the operator has been WARNED that telemetry is off. Only a
         // failed subscribe warns (a stream merely ending mid-session is debug),
         // so this is what decides whether a later re-subscribe owes them a
@@ -587,7 +594,7 @@ impl LightActor {
                     // If the notify stream dropped (a transient backend hiccup on a
                     // live link, or a prior disconnect), try to restore it — paced at
                     // the probe interval, so there's no tight re-subscribe loop. It's
-                    // only telemetry; the GATT-read health below is unaffected.
+                    // only telemetry; the connection health below is unaffected.
                     if notif.is_none() {
                         if let Some(nc) = &chars.notify {
                             if let Ok(stream) = ble::subscribe_notify(p, nc).await {
@@ -605,14 +612,23 @@ impl LightActor {
                         }
                     }
 
-                    // CONNECTION HEALTH — a cheap GATT read, answered by the radio, so
-                    // it's stable and can't false-trip; it's what keeps a healthy light
-                    // connected with no churn. Three consecutive misses = a genuinely
-                    // dead link (weak signal / gone) → recycle. No readable char ⇒
-                    // is_connected() only (checked above).
+                    // Status telemetry (battery + temperature): the replies are logged,
+                    // best-effort.
+                    let queries_ok = match query_mac {
+                        Some(mac) => send_status_queries(p, &chars.write, mac, false).await,
+                        None => true,
+                    };
+
+                    // CONNECTION HEALTH — where it exists, a cheap GATT read, answered
+                    // by the radio, so it's stable and can't false-trip. With nothing
+                    // to read (BlueZ), a refused write is the one signal left: without
+                    // this, a device record whose link has gone would refuse every
+                    // status query and stay "connected" until the next DMX change.
+                    // Three consecutive misses = a genuinely dead link (weak signal /
+                    // gone) → recycle.
                     let conn_ok = match &read_char {
                         Some(rc) => ble::probe_read(p, rc, PROBE_TIMEOUT).await,
-                        None => true,
+                        None => queries_ok,
                     };
                     match probe_edge(conn_ok, failures, MAX_PROBE_FAILURES) {
                         ProbeEdge::Healthy => {}
@@ -626,21 +642,16 @@ impl LightActor {
                         }
                         ProbeEdge::Failed { failures: n } => {
                             failures = n;
-                            warn!(light = %label, failures = n, rssi = ?rssi,
-                                  "connection probe failed (GATT read)");
+                            warn!(light = %label, failures = n, probe = probe_kind, rssi = ?rssi,
+                                  "connection probe failed");
                         }
-                        // Still warns first, exactly as before, so the failure
-                        // log stream is unchanged — only the recovery edge moved.
+                        // Still warns first, so the failure log stream is unchanged
+                        // — only the recovery edge moved.
                         ProbeEdge::Dead { failures: n } => {
-                            warn!(light = %label, failures = n, rssi = ?rssi,
-                                  "connection probe failed (GATT read)");
-                            bail!("dead link: {n} consecutive GATT-read failures");
+                            warn!(light = %label, failures = n, probe = probe_kind, rssi = ?rssi,
+                                  "connection probe failed");
+                            bail!("dead link: {n} consecutive failed probes ({probe_kind})");
                         }
-                    }
-
-                    // Status telemetry (battery + temperature): logged, best-effort.
-                    if let Some(mac) = query_mac {
-                        send_status_queries(p, &chars.write, mac, false).await;
                     }
                 }
                 // Status replies (battery/temp/version/state) pushed on the notify
@@ -746,10 +757,10 @@ fn log_status(label: &str, data: &[u8], cache: &mut StatusCache) {
 /// Best-effort MAC-addressed status reads (battery/temp/firmware/state) — pure
 /// telemetry. Replies land on the notify stream (see [`log_status`]). `full` adds
 /// the version + state reads (used once per session); otherwise just battery +
-/// temperature (polled each probe). All best-effort — a failed write is non-fatal
-/// (link health is decided by the GATT-read probe), and a light that never replies
-/// (e.g. the TL97C) is still fully controllable.
-async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6], full: bool) {
+/// temperature (polled each probe). Best-effort: a light that never replies (e.g.
+/// the TL97C) is still fully controllable. Returns whether the platform accepted
+/// every write, which is the connection probe where no GATT read is possible.
+async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6], full: bool) -> bool {
     let mut frames = vec![queries::battery(mac), queries::temperature(mac)];
     if full {
         frames.push(queries::version(mac));
@@ -760,14 +771,15 @@ async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6
     // arm alongside it) for no benefit.
     let mut it = frames.iter().peekable();
     while let Some(f) = it.next() {
-        if ble::write_command(p, write, f).await.is_err() {
-            debug!("status query write failed (non-fatal)");
-            return;
+        if let Err(e) = ble::write_command(p, write, f).await {
+            debug!(error = %format!("{e:#}"), "status query write failed");
+            return false;
         }
         if it.peek().is_some() {
             tokio::time::sleep(QUERY_SPACING).await;
         }
     }
+    true
 }
 
 #[cfg(test)]

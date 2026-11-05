@@ -13,6 +13,32 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.10.0] — 2026-11-05
+
+Recovery from a Bluetooth controller that stops passing traffic while Linux still
+reports every light as connected. It left a fleet dark for seven hours while the
+service status said "4 of 5 lights connected" and the bridge logged nothing.
+MINOR: new behaviour, and the connection-probe warning reads differently.
+
+### Added
+
+- **Stalled-controller detection (Linux).** If writes keep being accepted but the
+  kernel sends the adapter no packet for 90 seconds, the bridge logs an error,
+  says so in the service status line, and clears it the way it clears a stale
+  device record: an adapter power-cycle, then a bluetoothd restart. A step counts
+  as having worked only once data comes back from a light. While the stall lasts
+  the steps are tried again every 10 minutes. `stale_link_recovery = "off"` only
+  logs it.
+
+### Fixed
+
+- **A light whose status queries are refused now counts as a dead link on Linux.**
+  BlueZ exposes nothing readable on these lights, so the connection probe never
+  ran there: only a colour change could notice a link that had gone, and a static
+  scene never made one. Three refused rounds in a row now end the session.
+  `connection probe failed` no longer says "(GATT read)" in its message; a `probe`
+  field says which check ran, and `session active` shows it too.
+
 ## [1.9.0] — 2026-11-03
 
 A Debian package that runs the bridge as a systemd service, and the changes

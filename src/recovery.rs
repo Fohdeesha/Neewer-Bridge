@@ -60,6 +60,9 @@
 //! adapter that refuses to power on. (One merely powered OFF is not this case:
 //! btleplug's BlueZ `start_scan` powers the adapter on first.) An adapter
 //! power-cycle resets the controller. See `scan.rs`.
+//!
+//! And [`Problem::ControllerStalled`]: the controller has stopped passing LE
+//! traffic while every light still reads as connected. See `controller.rs`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -115,6 +118,24 @@ pub enum Problem {
     StaleRecord,
     /// Discovery scans cannot be started at all (`scan.rs`).
     ScanBlocked,
+    /// The controller has stopped passing traffic (`controller.rs`).
+    ControllerStalled,
+}
+
+impl Problem {
+    /// How long a step gets to show results before the next one runs. A stale
+    /// record or a blocked scan can be re-checked right away. A stalled
+    /// controller cannot: the only proof it is working again is data from a
+    /// light, and the lights first have to notice the drop (up to one probe
+    /// interval), sit out their backoff and be found by a scan burst. A
+    /// power-cycle has been measured taking 49 s from start to every light
+    /// back (2026-09-12).
+    fn settle_limit(self) -> Duration {
+        match self {
+            Problem::StaleRecord | Problem::ScanBlocked => SETTLE,
+            Problem::ControllerStalled => STALL_SETTLE_LIMIT,
+        }
+    }
 }
 
 /// One rung of the ladder.
@@ -140,6 +161,8 @@ pub const ADAPTER_CYCLE_MIN_GAP: Duration = Duration::from_secs(120);
 pub const DAEMON_RESTART_MIN_GAP: Duration = Duration::from_secs(600);
 /// How long a step is given to take effect before the record is re-checked.
 const SETTLE: Duration = Duration::from_secs(4);
+/// See [`Problem::settle_limit`].
+const STALL_SETTLE_LIMIT: Duration = Duration::from_secs(90);
 
 /// When each step last ran (fleet-wide).
 #[derive(Debug, Default, Clone, Copy)]
@@ -264,16 +287,26 @@ impl StaleLinkRecovery {
                     Problem::ScanBlocked => {
                         warn!(step = %step, error = %error, "discovery scan recovery step failed")
                     }
+                    Problem::ControllerStalled => {
+                        warn!(step = %step, error = %error, "controller stall recovery step failed")
+                    }
                 }
                 continue;
             }
-            tokio::time::sleep(SETTLE).await;
-            if !still_bad().await {
-                return Outcome::Cleared(step);
+            let give_up_at = Instant::now() + problem.settle_limit();
+            loop {
+                tokio::time::sleep(SETTLE).await;
+                if !still_bad().await {
+                    return Outcome::Cleared(step);
+                }
+                if Instant::now() >= give_up_at {
+                    break;
+                }
             }
             match problem {
                 Problem::StaleRecord => warn!(light = %subject, step = %step, "stale device record survived this step"),
                 Problem::ScanBlocked => warn!(step = %step, "discovery scans still cannot start after this step"),
+                Problem::ControllerStalled => warn!(step = %step, "no data has come back from any light after this step"),
             }
         }
         Outcome::StillStale
@@ -300,6 +333,13 @@ impl StaleLinkRecovery {
             (Problem::ScanBlocked, Step::RestartDaemon) => warn!(
                 "discovery scan recovery: restarting bluetoothd (systemd bluetooth.service) \
                  — discovery is still blocked"
+            ),
+            (Problem::ControllerStalled, Step::CycleAdapter) => warn!(
+                adapter = %self.adapter_id,
+                "controller stall recovery: power-cycling the Bluetooth adapter"
+            ),
+            (Problem::ControllerStalled, Step::RestartDaemon) => warn!(
+                "controller stall recovery: restarting bluetoothd (systemd bluetooth.service)"
             ),
         }
     }
@@ -518,6 +558,37 @@ mod tests {
         let outcome = gate.recover(Problem::ScanBlocked, "discovery scan", || async { false }).await;
         assert!(matches!(outcome, Outcome::AlreadyClear), "{outcome:?}");
         assert!(gate.state.lock().await.last_adapter_cycle.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_controller_shares_the_gate_and_its_rate_limits() {
+        // A stale record found moments before a stall must not earn a second
+        // power-cycle, and `off` means hands off here too.
+        let gate = StaleLinkRecovery::new(RecoveryMode::Adapter, "hci0".into());
+        gate.state.lock().await.last_adapter_cycle = Some(Instant::now());
+        let outcome = gate.recover(Problem::ControllerStalled, "controller", || async { true }).await;
+        assert!(matches!(outcome, Outcome::RateLimited), "{outcome:?}");
+
+        let gate = StaleLinkRecovery::new(RecoveryMode::Off, "hci0".into());
+        let outcome = gate.recover(Problem::ControllerStalled, "controller", || async { true }).await;
+        assert!(matches!(outcome, Outcome::Disabled), "{outcome:?}");
+        assert!(gate.state.lock().await.last_adapter_cycle.is_none());
+
+        // Data from a light before anything ran: nothing runs.
+        let gate = StaleLinkRecovery::new(RecoveryMode::Auto, "hci0".into());
+        let outcome = gate.recover(Problem::ControllerStalled, "controller", || async { false }).await;
+        assert!(matches!(outcome, Outcome::AlreadyClear), "{outcome:?}");
+        assert!(gate.state.lock().await.last_adapter_cycle.is_none());
+    }
+
+    #[test]
+    fn only_a_stalled_controller_gets_a_long_settle() {
+        // The other two re-check once, at SETTLE, as they always have.
+        assert_eq!(Problem::StaleRecord.settle_limit(), SETTLE);
+        assert_eq!(Problem::ScanBlocked.settle_limit(), SETTLE);
+        // Long enough for the slowest measured reconnect after a power-cycle
+        // (49 s), since escalating too early restarts bluetoothd for nothing.
+        assert!(Problem::ControllerStalled.settle_limit() > Duration::from_secs(49));
     }
 
     #[tokio::test]

@@ -273,6 +273,12 @@ for each source.
   for one if there is none. Each light picks up where it was. If discovery
   scans keep failing while the adapter is still there, it power-cycles the
   adapter after two minutes (see `stale_link_recovery`).
+- **Every light stopped responding at once, with `link tx timeout` in `dmesg`.**
+  The Bluetooth controller has stopped passing traffic, while Linux still
+  reports the lights as connected. The bridge notices within about two minutes,
+  logs it, and power-cycles the adapter or, if needed, restarts bluetoothd (see
+  `stale_link_recovery`). By hand: `btmgmt power off`, `btmgmt power on`,
+  `systemctl restart bluetooth`.
 
 ## Building from source
 

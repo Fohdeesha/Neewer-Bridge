@@ -56,8 +56,10 @@ merge_timeout_secs = 10
 # adapters` to list what's available on this machine.
 adapter     = "default"
 flush_hz    = 15         # max BLE state updates per light per second (coalescing cap)
-probe_secs  = 20         # how often (s) to run the cheap GATT-read connection check
-                         # (3 consecutive misses recycle the link) + read status telemetry
+probe_secs  = 20         # how often (s) to check each connection (3 consecutive misses
+                         # recycle the link) and read status telemetry. The check is a
+                         # GATT read on Windows; BlueZ has nothing readable to offer, so
+                         # on Linux it is whether the status queries are accepted.
 # Discovery scanning is on-demand, not permanent: the bridge scans only while a light
 # is disconnected, in duty-cycled bursts, and NOT AT ALL once every light is connected.
 # A continuous scan starves the active connections on cheap USB BT dongles (kernel
@@ -82,7 +84,11 @@ scan_pause_secs  = 15    # idle gap between bursts (s) so a powered-off/flaky li
 # The same setting covers one more case: if a discovery scan cannot be started at
 # all for 2 minutes while a light is waiting to be found (a wedged controller, or
 # an adapter that refuses to power on), the same steps run once for that episode;
-# "off" disables this too. Separately, and whatever this is set to, the bridge restarts
+# "off" disables this too.
+# And another: if writes keep being accepted but no packet leaves the adapter for 90 s
+# (Linux only: the controller has stalled, while every light still reads as connected),
+# the same steps run, and again every 10 minutes while it lasts; "off" only logs it.
+# Separately, and whatever this is set to, the bridge restarts
 # itself on whatever adapter is present if the one it is using disappears
 # (unplugged, or reset by the kernel and back under a new name, hci0 -> hci1).
 stale_link_recovery = "auto"

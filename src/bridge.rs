@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::ble;
 use crate::config::{Config, FailsafeMode, LightCfg};
+use crate::controller;
 use crate::light::LightActor;
 use crate::merge;
 use crate::profile::{extract_slice, map_dmx, CctRange, Profile};
@@ -43,6 +44,7 @@ use crate::{sdnotify, shutdown};
 const SCAN_TASK: &str = "BLE discovery-scan coordinator";
 const FAILSAFE_TASK: &str = "ArtNet-loss failsafe";
 const STACK_WATCHDOG_TASK: &str = "BLE stack watchdog";
+const CONTROLLER_TASK: &str = "Bluetooth controller stall check";
 const STATUS_TASK: &str = "service status reporter";
 
 /// How often the service status line (`systemctl status`) is refreshed.
@@ -530,13 +532,13 @@ async fn stack_watchdog(watch: AdapterWatch) -> String {
 }
 
 /// Keep the service status line current: re-sent only when it changes.
-async fn report_status(scan: Arc<scan::ScanCoordinator>, total: usize) {
+async fn report_status(scan: Arc<scan::ScanCoordinator>, total: usize, stalled: Arc<AtomicBool>) {
     let mut tick = interval(STATUS_EVERY);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last = String::new();
     loop {
         tick.tick().await;
-        let line = status_line(scan.connected(), total);
+        let line = status_line(scan.connected(), total, stalled.load(Ordering::Relaxed));
         if line != last {
             sdnotify::status(&line);
             last = line;
@@ -545,8 +547,12 @@ async fn report_status(scan: Arc<scan::ScanCoordinator>, total: usize) {
 }
 
 /// The running bridge's one-line service status. Pure, so it is pinned by a
-/// test.
-fn status_line(connected: usize, total: usize) -> String {
+/// test. A stalled controller overrides the count: "4 of 5 lights connected" is
+/// what this line said for the whole of a seven-hour outage.
+fn status_line(connected: usize, total: usize, controller_stalled: bool) -> String {
+    if controller_stalled {
+        return "Bluetooth controller stalled — no light is being reached".into();
+    }
     match total {
         0 => "running — no lights configured; add some to the config, then restart".into(),
         1 => format!("running — {connected} of 1 light connected"),
@@ -621,6 +627,29 @@ async fn start(
             BackgroundExit { task: SCAN_TASK, reason: None }
         });
     }
+    // The controller stall check: no write has reached a light for a long time
+    // although the platform still reports them connected. Linux only (on Windows
+    // the GATT-read probe in light.rs does this job, per light).
+    let controller_stalled = Arc::new(AtomicBool::new(false));
+    if cfg!(target_os = "linux") {
+        match controller::hci_index(&adapter_id) {
+            Some(index) => {
+                let adapter_id = adapter_id.clone();
+                let scan = scan.clone();
+                let recovery = recovery.clone();
+                let stalled = controller_stalled.clone();
+                background.spawn(async move {
+                    controller::watch(adapter_id, index, scan, recovery, stalled).await;
+                    BackgroundExit { task: CONTROLLER_TASK, reason: None }
+                });
+            }
+            None => warn!(
+                adapter = %adapter_id,
+                "cannot tell which kernel device this adapter is — a stalled Bluetooth controller \
+                 will not be noticed"
+            ),
+        }
+    }
     // The BLE stack watchdog: the one task here that is MEANT to end — when the
     // platform session has stopped working for everyone, or the adapter has
     // gone, ending it is what makes `serve` return and `run` rebuild the bridge.
@@ -638,7 +667,7 @@ async fn start(
         let scan = scan.clone();
         let total = cfg.lights.len();
         background.spawn(async move {
-            report_status(scan, total).await;
+            report_status(scan, total, controller_stalled).await;
             BackgroundExit { task: STATUS_TASK, reason: None }
         });
     }
@@ -1393,11 +1422,19 @@ mod tests {
 
     #[test]
     fn service_status_line_counts_connected_lights() {
-        assert_eq!(status_line(0, 5), "running — 0 of 5 lights connected");
-        assert_eq!(status_line(4, 5), "running — 4 of 5 lights connected");
-        assert_eq!(status_line(1, 1), "running — 1 of 1 light connected");
+        assert_eq!(status_line(0, 5, false), "running — 0 of 5 lights connected");
+        assert_eq!(status_line(4, 5, false), "running — 4 of 5 lights connected");
+        assert_eq!(status_line(1, 1, false), "running — 1 of 1 light connected");
         // A fresh package install runs on the example config, which has no
         // lights: say what to do rather than "0 of 0".
-        assert!(status_line(0, 0).contains("no lights configured"));
+        assert!(status_line(0, 0, false).contains("no lights configured"));
+    }
+
+    #[test]
+    fn service_status_line_does_not_count_lights_on_a_stalled_controller() {
+        // "4 of 5 lights connected" is what it said for the whole 2026-11-03 outage.
+        let line = status_line(4, 5, true);
+        assert!(line.contains("stalled"), "{line}");
+        assert!(!line.contains("connected"), "{line}");
     }
 }

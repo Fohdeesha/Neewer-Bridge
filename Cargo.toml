@@ -1,6 +1,6 @@
 [package]
 name = "neewer-bridge"
-version = "1.9.0"
+version = "1.10.0"
 edition = "2021"
 description = "ArtNet (DMX-over-UDP) to Neewer Bluetooth light control bridge"
 license = "MIT"
@@ -47,6 +47,10 @@ file-rotate = "0.7"
 # through btleplug's BlueZ backend (bluez-async), so no new build requirement.
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus = "0.9"
+# The controller stall check (controller.rs) reads the kernel's per-adapter
+# packet counters, which only an ioctl on a raw HCI socket can reach. Also
+# already in the tree, through tokio.
+libc = "0.2"
 
 [profile.release]
 lto = true

@@ -110,9 +110,10 @@ pub struct Ble {
     /// Max BLE state updates pushed to each light per second (coalescing cap).
     #[serde(default = "default_flush_hz")]
     pub flush_hz: u32,
-    /// Liveness/status-probe interval, seconds. Each tick does a cheap GATT read
-    /// (connection health — 3 consecutive misses recycle the link) and sends a
-    /// best-effort status query for telemetry.
+    /// Liveness/status-probe interval, seconds. Each tick sends a best-effort
+    /// status query for telemetry and checks the connection (3 consecutive misses
+    /// recycle the link): a cheap GATT read where the platform exposes something
+    /// readable, otherwise whether the status query was accepted (BlueZ).
     #[serde(default = "default_probe_secs")]
     pub probe_secs: u64,
     /// Discovery-scan burst length, seconds. The bridge scans for a missing light
@@ -135,7 +136,8 @@ pub struct Ble {
     /// bluetoothd if the record survives; `adapter` = the power-cycle only;
     /// `off` = park the light and log until the record clears by other means.
     /// The same ladder, under the same setting, also serves a discovery scan
-    /// that cannot be started at all for two minutes (`scan.rs`).
+    /// that cannot be started at all for two minutes (`scan.rs`) and a controller
+    /// that has stopped passing traffic (`controller.rs`).
     #[serde(default = "default_stale_link_recovery")]
     pub stale_link_recovery: String,
 }
