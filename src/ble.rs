@@ -768,9 +768,31 @@ pub async fn connect_and_verify(p: &Peripheral) -> Result<NeewerChars> {
     Ok(NeewerChars { write, notify })
 }
 
+/// Upper bound on one GATT write. A write normally completes in milliseconds
+/// (write-without-response returns once the platform has queued it). On Linux
+/// bluez-async already gives up on every D-Bus call after 30 s; WinRT has no
+/// limit at all, so a write it never completed would freeze that light's actor
+/// for good: no flush, no probe, no reconnect. Every other platform call here
+/// is bounded too (connect, service discovery, disconnect, the probe read).
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Await a platform write, giving up after `limit`. Generic over the future, so
+/// the bound is testable without a peripheral.
+async fn write_bounded<F, E>(write: F, limit: Duration) -> Result<()>
+where
+    F: std::future::Future<Output = std::result::Result<(), E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match tokio::time::timeout(limit, write).await {
+        Ok(res) => res.map_err(anyhow::Error::from),
+        Err(_) => bail!("not completed within {limit:?} (hung platform BLE call)"),
+    }
+}
+
 /// Write a command, choosing write-without-response when the characteristic
 /// supports it (low latency, matching the real-time lighting path) and falling
-/// back to write-with-response otherwise. Logs the exact bytes.
+/// back to write-with-response otherwise. Logs the exact bytes. Bounded by
+/// [`WRITE_TIMEOUT`].
 pub async fn write_command(p: &Peripheral, write: &Characteristic, data: &[u8]) -> Result<()> {
     let wt = if write.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE) {
         WriteType::WithoutResponse
@@ -778,7 +800,7 @@ pub async fn write_command(p: &Peripheral, write: &Characteristic, data: &[u8]) 
         WriteType::WithResponse
     };
     debug!(bytes = %hexstr(data), ?wt, "BLE write");
-    p.write(write, data, wt)
+    write_bounded(p.write(write, data, wt), WRITE_TIMEOUT)
         .await
         .with_context(|| format!("writing command {}", hexstr(data)))?;
     WRITES_ACCEPTED.fetch_add(1, Ordering::Relaxed);
@@ -811,7 +833,7 @@ pub async fn write_command_chunked(p: &Peripheral, write: &Characteristic, data:
     debug!(bytes = %hexstr(data), ?wt, "BLE write (chunked)");
     let mut chunks = data.chunks(MAX_ATT_WRITE).peekable();
     while let Some(chunk) = chunks.next() {
-        p.write(write, chunk, wt)
+        write_bounded(p.write(write, chunk, wt), WRITE_TIMEOUT)
             .await
             .with_context(|| format!("writing chunk of command {}", hexstr(data)))?;
         WRITES_ACCEPTED.fetch_add(1, Ordering::Relaxed);
@@ -847,7 +869,7 @@ pub async fn write_ota_frame(
         WriteType::WithoutResponse
     };
     for chunk in data.chunks(MAX_ATT_WRITE) {
-        p.write(write, chunk, wt)
+        write_bounded(p.write(write, chunk, wt), WRITE_TIMEOUT)
             .await
             .with_context(|| format!("writing OTA fragment of {}", hexstr(data)))?;
         if !chunk_delay.is_zero() {
@@ -1055,6 +1077,22 @@ mod tests {
         assert_eq!(adapter_id_from_info("hci1"), "hci1");
         assert_eq!(adapter_id_from_info("  hci2  (x)"), "hci2");
         assert_eq!(adapter_id_from_info(""), "");
+    }
+
+    #[tokio::test]
+    async fn a_write_the_platform_never_completes_gives_up() {
+        let limit = Duration::from_millis(20);
+        // WinRT can leave a write pending for ever; it must fail, naming why.
+        let hung = std::future::pending::<std::result::Result<(), std::io::Error>>();
+        let e = write_bounded(hung, limit).await.expect_err("a hung write must fail");
+        assert!(format!("{e:#}").contains("hung platform BLE call"), "{e:#}");
+        // A completed write passes through unchanged, success and failure alike.
+        assert!(write_bounded(async { Ok::<(), std::io::Error>(()) }, limit).await.is_ok());
+        let refused = write_bounded(async { Err::<(), _>(std::io::Error::other("refused")) }, limit).await;
+        assert!(format!("{:#}", refused.unwrap_err()).contains("refused"));
+        // Shorter than the 30 s bluez-async allows a D-Bus call, so both
+        // platforms give up at the same point.
+        assert!(WRITE_TIMEOUT < Duration::from_secs(30));
     }
 
     #[test]

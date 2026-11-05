@@ -13,6 +13,16 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.10.1] — 2026-11-05
+
+### Fixed
+
+- **A Bluetooth write the operating system never completes no longer freezes
+  that light.** Every write now gives up after 10 seconds, the same way connects,
+  disconnects and the connection probe already did, and the light reconnects.
+  On Windows a write had no time limit at all; on Linux the Bluetooth library
+  already stopped waiting after 30 seconds, and now it is 10.
+
 ## [1.10.0] — 2026-11-05
 
 Recovery from a Bluetooth controller that stops passing traffic while Linux still
