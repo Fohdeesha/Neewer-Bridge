@@ -58,12 +58,55 @@ use crate::protocol::{queries, LightState};
 use crate::recovery::{Outcome, Problem, StaleLinkRecovery};
 use crate::scan::ScanCoordinator;
 
+/// How long to wait before the next write so it lands at least `gap` after
+/// the previous one (`last`), see [`MIN_WRITE_GAP`]. Pure, so the spacing is
+/// tested without a clock.
+fn pace_delay(last: Option<Instant>, now: Instant, gap: Duration) -> Duration {
+    match last {
+        Some(t) => (t + gap).saturating_duration_since(now),
+        None => Duration::ZERO,
+    }
+}
+
+/// Spaces the writes of one session (see [`MIN_WRITE_GAP`]).
+#[derive(Default)]
+struct Pacer {
+    last: Option<Instant>,
+}
+
+impl Pacer {
+    /// Write one frame, no sooner than `gap` after the previous write.
+    async fn write(&mut self, p: &Peripheral, write: &Characteristic, frame: &[u8], gap: Duration) -> Result<()> {
+        let wait = pace_delay(self.last, Instant::now(), gap);
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        let r = ble::write_command_chunked(p, write, frame).await;
+        self.last = Some(Instant::now());
+        r
+    }
+}
+
+/// Whether the flush loop should still hold back the startup baseline.
+///
+/// At a fresh start every light's state is the baseline (3200K @ 50 %) until
+/// the first ArtNet packet for it arrives. A light that is already connected
+/// when the bridge starts (a service restart or an upgrade does not drop the
+/// links) used to get that baseline before the console's state, a visible flash
+/// of warm white, when the room was meant to be dark. So the baseline is held
+/// back until `hold`'s deadline ([`crate::bridge::BASELINE_GRACE`] after the
+/// start) unless something replaces it first. With no ArtNet at all the light
+/// still gets the baseline, just a few seconds later.
+fn holding_baseline(hold: Option<(LightState, Instant)>, desired: &LightState, now: Instant) -> bool {
+    matches!(hold, Some((baseline, until)) if *desired == baseline && now < until)
+}
+
 /// Whether a rate-limited repeat is due: nothing reported yet, or `every` has
 /// elapsed since the last report. `now` is a parameter rather than read inside,
 /// so the throttle is testable without sleeping — the same convention `Merger`
 /// follows. Uses `duration_since`, which saturates instead of panicking if the
 /// clock ever appears to run backwards.
-fn report_due(last: Option<std::time::Instant>, now: std::time::Instant, every: Duration) -> bool {
+fn report_due(last: Option<Instant>, now: Instant, every: Duration) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= every)
 }
 
@@ -123,6 +166,24 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(4);
 const QUERY_SPACING: Duration = Duration::from_millis(60);
 /// Gap between the sub-frames of a multi-frame (pixel) state, matching the app.
 const PIXEL_FRAME_SPACING: Duration = Duration::from_millis(80);
+/// The least time between any two frames written to one light.
+///
+/// A frame that arrives right behind another can be lost inside the fixture
+/// (its radio module forwards frames to the LED controller over a serial link).
+/// Measured 2026-11-12 on a TL120C, power-on followed by power-off and read
+/// back with the state query: back to back the second frame was lost 4 times
+/// in 10, 10 ms apart once in 10, 20 ms and more never (0 of 18). Until 1.10.3
+/// the power-on and the state frame after it went out 0.3 ms apart, and from
+/// 11-10 to 11-12 that dropped openHAB's "off" on every reconnect: the lights
+/// kept their old colour, and the bridge, believing the state delivered, never
+/// sent it again. The 15 Hz flush already spaces ordinary frames ~67 ms apart;
+/// this also covers the pairs that were not: power command → state frame, and a
+/// probe's status query → the next flush.
+const MIN_WRITE_GAP: Duration = Duration::from_millis(50);
+/// After a power-on, the state frames are sent once more this long later, in
+/// case the first copy was lost all the same. Nothing else would ever resend
+/// it: the flush loop only writes a state that differs from the last one sent.
+const REASSERT_AFTER: Duration = Duration::from_secs(1);
 /// While parked on a stale platform record: how often to re-read the record.
 const STALE_RECHECK: Duration = Duration::from_secs(60);
 /// While parked: how often to repeat the warning that the light is not driven.
@@ -141,6 +202,9 @@ pub struct LightActor {
     scan: Arc<ScanCoordinator>,
     /// Fleet-wide stale-record recovery gate (see `recovery.rs`).
     recovery: Arc<StaleLinkRecovery>,
+    /// The startup baseline and until when to hold it back (see
+    /// [`holding_baseline`]); `None` when this run carried a real state over.
+    hold_baseline: Option<(LightState, Instant)>,
 }
 
 impl LightActor {
@@ -154,8 +218,9 @@ impl LightActor {
         probe_secs: u64,
         scan: Arc<ScanCoordinator>,
         recovery: Arc<StaleLinkRecovery>,
+        hold_baseline: Option<(LightState, Instant)>,
     ) -> Self {
-        Self { cfg, label, adapter, rx, flush_hz, probe_secs, scan, recovery }
+        Self { cfg, label, adapter, rx, flush_hz, probe_secs, scan, recovery, hold_baseline }
     }
 
     fn label(&self) -> String {
@@ -385,13 +450,13 @@ impl LightActor {
     /// warn stream (times the number of missing lights).
     async fn find(&self) -> (Peripheral, String, Option<i16>) {
         let label = self.label();
-        let since = std::time::Instant::now();
+        let since = Instant::now();
         let mut announced = false;
         let mut next_report = MISSING_REPORT;
         // Independent rate limit for peripheral-listing errors — see the `Err`
         // arm below. Local to this call, so every fresh search starts by
         // reporting immediately.
-        let mut last_err_report: Option<std::time::Instant> = None;
+        let mut last_err_report: Option<Instant> = None;
         let mut err_suppressed: u64 = 0;
         loop {
             match ble::find_scanned(&self.adapter, &self.cfg.mac).await {
@@ -434,7 +499,7 @@ impl LightActor {
                 // a mute (the same rule the re-report above follows, and the
                 // reason nothing here drops to silence).
                 Err(e) => {
-                    let now = std::time::Instant::now();
+                    let now = Instant::now();
                     if report_due(last_err_report, now, MISSING_REPORT) {
                         warn!(
                             light = %label, error = %format!("{e:#}"), suppressed = err_suppressed,
@@ -531,27 +596,38 @@ impl LightActor {
             None => None,
         };
         let mut status = StatusCache::default();
+        // Every write of this session goes through one pacer (MIN_WRITE_GAP).
+        let mut pacer = Pacer::default();
+        // When to send the state once more after a power-on (REASSERT_AFTER).
+        let mut reassert_at: Option<Instant> = None;
         if let Some(mac) = query_mac {
-            send_status_queries(p, &chars.write, mac, true).await;
+            send_status_queries(&mut pacer, p, &chars.write, mac, true).await;
         }
 
         loop {
             tokio::select! {
                 _ = flush.tick() => {
                     let desired = *self.rx.borrow();
-                    if Some(desired) != last_sent {
+                    let now = Instant::now();
+                    if holding_baseline(self.hold_baseline, &desired, now) {
+                        // Waiting a few seconds for the console's state before
+                        // sending the startup baseline (see `holding_baseline`).
+                    } else if Some(desired) != last_sent {
                         // Power transitions first (pure decision — see
                         // `power_command` for the seed/failsafe corners).
                         match power_command(last_sent.map(|l| l.power), &desired) {
                             Some(true) => {
                                 info!(light = %label, "power on");
-                                ble::write_command(p, &chars.write, &driver.power(true))
+                                pacer
+                                    .write(p, &chars.write, &driver.power(true), MIN_WRITE_GAP)
                                     .await
                                     .map_err(|e| anyhow::anyhow!("power-on write failed: {e}"))?;
+                                reassert_at = Some(Instant::now() + REASSERT_AFTER);
                             }
                             Some(false) => {
                                 info!(light = %label, "power off");
-                                ble::write_command(p, &chars.write, &driver.power(false))
+                                pacer
+                                    .write(p, &chars.write, &driver.power(false), MIN_WRITE_GAP)
                                     .await
                                     .map_err(|e| anyhow::anyhow!("power-off write failed: {e}"))?;
                             }
@@ -561,23 +637,15 @@ impl LightActor {
                             // The state command itself is per-frame at ArtNet rates,
                             // so it's debug (kept off the info console but in the file).
                             debug!(light = %label, state = %desired.summary(), "flush");
-                            // Most modes are one frame; Pixel emits several. Each
-                            // frame is MTU-chunked as needed (pixel palettes >20 B).
-                            // Multi-frame (pixel) sub-frames are spaced ~80 ms apart
-                            // as the app does, so the effect registers (and, for a
-                            // static render, so PLAY establishes before PAUSE).
-                            let frames = driver.apply_frames(&desired);
-                            let mut it = frames.iter().peekable();
-                            while let Some(frame) = it.next() {
-                                ble::write_command_chunked(p, &chars.write, frame)
-                                    .await
-                                    .map_err(|e| anyhow::anyhow!("flush write failed: {e}"))?;
-                                if it.peek().is_some() {
-                                    tokio::time::sleep(PIXEL_FRAME_SPACING).await;
-                                }
-                            }
+                            send_state(&mut pacer, p, &chars.write, driver, &desired).await?;
                         }
                         last_sent = Some(desired);
+                    } else if reassert_at.is_some_and(|t| now >= t) {
+                        reassert_at = None;
+                        if desired.power {
+                            debug!(light = %label, state = %desired.summary(), "re-sending the state after power-on");
+                            send_state(&mut pacer, p, &chars.write, driver, &desired).await?;
+                        }
                     }
                 }
                 _ = probe.tick() => {
@@ -615,7 +683,7 @@ impl LightActor {
                     // Status telemetry (battery + temperature): the replies are logged,
                     // best-effort.
                     let queries_ok = match query_mac {
-                        Some(mac) => send_status_queries(p, &chars.write, mac, false).await,
+                        Some(mac) => send_status_queries(&mut pacer, p, &chars.write, mac, false).await,
                         None => true,
                     };
 
@@ -760,26 +828,52 @@ fn log_status(label: &str, data: &[u8], cache: &mut StatusCache) {
 /// temperature (polled each probe). Best-effort: a light that never replies (e.g.
 /// the TL97C) is still fully controllable. Returns whether the platform accepted
 /// every write, which is the connection probe where no GATT read is possible.
-async fn send_status_queries(p: &Peripheral, write: &Characteristic, mac: [u8; 6], full: bool) -> bool {
+async fn send_status_queries(
+    pacer: &mut Pacer,
+    p: &Peripheral,
+    write: &Characteristic,
+    mac: [u8; 6],
+    full: bool,
+) -> bool {
     let mut frames = vec![queries::battery(mac), queries::temperature(mac)];
     if full {
         frames.push(queries::version(mac));
         frames.push(queries::state(mac));
     }
-    // Spaced so the light's reply queue isn't outrun — but only BETWEEN frames.
-    // A trailing sleep would just stall this select arm (and therefore the flush
-    // arm alongside it) for no benefit.
-    let mut it = frames.iter().peekable();
-    while let Some(f) = it.next() {
-        if let Err(e) = ble::write_command(p, write, f).await {
+    // Spaced so the light's reply queue isn't outrun, and so the first query
+    // does not land right behind the last flush frame (MIN_WRITE_GAP). The
+    // pacer waits BEFORE a write, never after the last one: a trailing sleep
+    // would just stall this select arm (and the flush arm with it), and the
+    // next flush is paced against this write anyway.
+    for f in &frames {
+        if let Err(e) = pacer.write(p, write, f, QUERY_SPACING).await {
             debug!(error = %format!("{e:#}"), "status query write failed");
             return false;
         }
-        if it.peek().is_some() {
-            tokio::time::sleep(QUERY_SPACING).await;
-        }
     }
     true
+}
+
+/// Write a state's frames. The first goes out at least [`MIN_WRITE_GAP`] after
+/// the previous write. Most modes are one frame; Pixel emits several, spaced
+/// [`PIXEL_FRAME_SPACING`] apart as the app does, so the effect registers (and,
+/// for a static render, so PLAY establishes before PAUSE). Each frame is
+/// MTU-chunked as needed (pixel palettes are over 20 bytes).
+async fn send_state(
+    pacer: &mut Pacer,
+    p: &Peripheral,
+    write: &Characteristic,
+    driver: &Driver,
+    desired: &LightState,
+) -> Result<()> {
+    for (i, frame) in driver.apply_frames(desired).iter().enumerate() {
+        let gap = if i == 0 { MIN_WRITE_GAP } else { PIXEL_FRAME_SPACING };
+        pacer
+            .write(p, write, frame, gap)
+            .await
+            .map_err(|e| anyhow::anyhow!("flush write failed: {e}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -788,6 +882,42 @@ mod tests {
 
     fn state(power: bool, seed: bool) -> LightState {
         LightState { power, seed, ..LightState::default() }
+    }
+
+    #[test]
+    fn writes_are_spaced_by_the_gap() {
+        let t0 = Instant::now();
+        let gap = MIN_WRITE_GAP;
+        // First write of a session: no wait.
+        assert_eq!(pace_delay(None, t0, gap), Duration::ZERO);
+        // Right behind the previous write (the 0.3 ms power-on → state pair):
+        // wait out the whole gap.
+        assert_eq!(pace_delay(Some(t0), t0, gap), gap);
+        // Part-way through: wait the rest.
+        assert_eq!(pace_delay(Some(t0), t0 + Duration::from_millis(30), gap), Duration::from_millis(20));
+        // The gap has passed (a 15 Hz flush tick is ~67 ms): no wait.
+        assert_eq!(pace_delay(Some(t0), t0 + Duration::from_millis(67), gap), Duration::ZERO);
+        // A clock that looks to run backwards waits the gap, never panics.
+        assert_eq!(pace_delay(Some(t0 + Duration::from_secs(1)), t0, gap), Duration::from_secs(1) + gap);
+        // Measured: 20 ms was always enough, so the gap must not be less.
+        const { assert!(MIN_WRITE_GAP.as_millis() >= 20) };
+    }
+
+    #[test]
+    fn the_startup_baseline_waits_for_the_console_but_not_for_ever() {
+        let t0 = Instant::now();
+        let baseline = state(true, false);
+        let until = t0 + Duration::from_secs(4);
+        let hold = Some((baseline, until));
+        // Nothing from the console yet: hold the baseline back.
+        assert!(holding_baseline(hold, &baseline, t0));
+        // The console's state arrived (openHAB's 0,0,0 → HSI at 0 %): send it.
+        let dark = LightState { mode: crate::protocol::Mode::Hsi, brightness: 0, ..baseline };
+        assert!(!holding_baseline(hold, &dark, t0));
+        // No console at all: the baseline goes out once the grace has passed.
+        assert!(!holding_baseline(hold, &baseline, until));
+        // A restart that carried a state over holds nothing.
+        assert!(!holding_baseline(None, &baseline, t0));
     }
 
     #[test]

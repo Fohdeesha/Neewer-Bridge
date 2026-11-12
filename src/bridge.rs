@@ -714,13 +714,13 @@ async fn start(
             channels = %channels,
             "configuring light"
         );
-        // Seed initial power from power_on_connect: the actor sends this as soon
-        // as it connects, before any ArtNet arrives. Until the first ArtDmx for
+        // Seed initial power from power_on_connect. Until the first ArtDmx for
         // this light lands, that seed is the deterministic startup baseline
         // (LightState::default() = CCT 3200K @ 50%) — the locked §5.4 "defined
-        // startup state" decision. With a console streaming (openHAB refreshes
-        // at ~1.2 Hz) the baseline is visible for well under a second; it only
-        // persists if the bridge restarts while the ArtNet source is down.
+        // startup state" decision. The actor holds it back for BASELINE_GRACE
+        // after the start, so a light that is already connected gets the
+        // console's state instead of a flash of the baseline; it only goes out
+        // when no ArtNet arrives in that time.
         // `seed` marks the power_on_connect = false baseline as PASSIVE: the
         // actor then leaves the light's power completely alone at connect
         // (previously it actively sent power-OFF — turning off a light the user
@@ -730,7 +730,13 @@ async fn start(
         // every failsafe/reconnect corner behaves exactly as before.
         // On a RESTART the light instead starts where the last run left it —
         // see `initial_state`.
-        let (tx, rx) = watch::channel(initial_state(light, carried));
+        let initial = initial_state(light, carried);
+        // A fresh baseline (nothing carried over) is held back for a few
+        // seconds in case the light is already connected and the console's
+        // state is about to arrive; see `light::holding_baseline`.
+        let hold_baseline = (!carried.contains_key(&crate::config::normalize_mac(&light.mac)))
+            .then(|| (initial, Instant::now() + BASELINE_GRACE));
+        let (tx, rx) = watch::channel(initial);
         states.push((crate::config::normalize_mac(&light.mac), tx.subscribe()));
         let cct = CctRange { min: light.cct_min, max: light.cct_max };
         let sink = Arc::new(Sink {
@@ -752,6 +758,7 @@ async fn start(
             cfg.ble.probe_secs,
             scan.clone(),
             recovery.clone(),
+            hold_baseline,
         );
         actors.spawn(async move {
             actor.run().await;
@@ -842,6 +849,12 @@ async fn start(
         states,
     })
 }
+
+/// How long a light holds back the startup baseline waiting for the console's
+/// first state (see `light::holding_baseline`). Art-Net has an unchanging
+/// source repeat its last packet about every 4 s at most (the spec recommends
+/// 0.8 to 1 s; openHAB sends at ~1.2 Hz), so 4 s covers any source that is up.
+pub const BASELINE_GRACE: Duration = Duration::from_secs(4);
 
 /// The state a light starts a run in: where the previous run left it if this
 /// is a restart (`carried`, by normalised MAC), else the startup baseline

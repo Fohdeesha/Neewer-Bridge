@@ -13,6 +13,25 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.10.3] — 2026-11-12
+
+### Fixed
+
+- **A light could miss the command sent right after it reconnected and keep its
+  old colour.** On connecting, the bridge sent "power on" and the light's state
+  0.3 ms apart. A fixture loses a frame that arrives right behind another (measured
+  on a TL120C: 4 times in 10 back to back, never at 20 ms or more), so the state
+  was often dropped, and since the bridge only resends a state that changes, it
+  stayed dropped. From 11-10 to 11-12 this kept the lights on in their old colours
+  after every reconnect while openHAB was sending "off". Every frame to a light now
+  goes out at least 50 ms after the one before it, and after a power-on the state
+  is sent once more a second later.
+- **A restart no longer flashes the lights warm white.** At a fresh start a light
+  that is still connected (a service restart or an upgrade keeps the links) used
+  to get the startup baseline, 3200K at 50 %, before the console's state arrived.
+  The baseline now waits up to 4 seconds for the console; with no ArtNet at all
+  the light still gets it.
+
 ## [1.10.2] — 2026-11-12
 
 ### Fixed
