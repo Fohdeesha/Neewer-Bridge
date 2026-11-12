@@ -88,6 +88,9 @@ scan_pause_secs  = 15    # idle gap between bursts (s) so a powered-off/flaky li
 # And another: if writes keep being accepted but no packet leaves the adapter for 90 s
 # (Linux only: the controller has stalled, while every light still reads as connected),
 # the same steps run, and again every 10 minutes while it lasts; "off" only logs it.
+# And one more: if no light is connected and the adapter hears no advertisement from
+# any device for 3 minutes (Linux only: the controller has gone deaf, so no light can
+# ever reconnect), the same steps run, and again every 30 minutes while it lasts.
 # Separately, and whatever this is set to, the bridge restarts
 # itself on whatever adapter is present if the one it is using disappears
 # (unplugged, or reset by the kernel and back under a new name, hci0 -> hci1).

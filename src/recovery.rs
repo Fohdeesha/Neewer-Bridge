@@ -62,7 +62,9 @@
 //! power-cycle resets the controller. See `scan.rs`.
 //!
 //! And [`Problem::ControllerStalled`]: the controller has stopped passing LE
-//! traffic while every light still reads as connected. See `controller.rs`.
+//! traffic while every light still reads as connected; and
+//! [`Problem::ControllerDeaf`]: it has stopped hearing advertisements, so with
+//! every link gone no light can ever reconnect. See `controller.rs`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -120,6 +122,9 @@ pub enum Problem {
     ScanBlocked,
     /// The controller has stopped passing traffic (`controller.rs`).
     ControllerStalled,
+    /// The controller has stopped hearing advertisements while no light is
+    /// connected, so none can reconnect (`controller.rs`).
+    ControllerDeaf,
 }
 
 impl Problem {
@@ -133,7 +138,7 @@ impl Problem {
     fn settle_limit(self) -> Duration {
         match self {
             Problem::StaleRecord | Problem::ScanBlocked => SETTLE,
-            Problem::ControllerStalled => STALL_SETTLE_LIMIT,
+            Problem::ControllerStalled | Problem::ControllerDeaf => STALL_SETTLE_LIMIT,
         }
     }
 }
@@ -290,6 +295,9 @@ impl StaleLinkRecovery {
                     Problem::ControllerStalled => {
                         warn!(step = %step, error = %error, "controller stall recovery step failed")
                     }
+                    Problem::ControllerDeaf => {
+                        warn!(step = %step, error = %error, "deaf controller recovery step failed")
+                    }
                 }
                 continue;
             }
@@ -307,6 +315,9 @@ impl StaleLinkRecovery {
                 Problem::StaleRecord => warn!(light = %subject, step = %step, "stale device record survived this step"),
                 Problem::ScanBlocked => warn!(step = %step, "discovery scans still cannot start after this step"),
                 Problem::ControllerStalled => warn!(step = %step, "no data has come back from any light after this step"),
+                Problem::ControllerDeaf => {
+                    warn!(step = %step, "the controller still hears no advertisement and no light has connected after this step")
+                }
             }
         }
         Outcome::StillStale
@@ -340,6 +351,13 @@ impl StaleLinkRecovery {
             ),
             (Problem::ControllerStalled, Step::RestartDaemon) => warn!(
                 "controller stall recovery: restarting bluetoothd (systemd bluetooth.service)"
+            ),
+            (Problem::ControllerDeaf, Step::CycleAdapter) => warn!(
+                adapter = %self.adapter_id,
+                "deaf controller recovery: power-cycling the Bluetooth adapter"
+            ),
+            (Problem::ControllerDeaf, Step::RestartDaemon) => warn!(
+                "deaf controller recovery: restarting bluetoothd (systemd bluetooth.service)"
             ),
         }
     }
@@ -582,13 +600,15 @@ mod tests {
     }
 
     #[test]
-    fn only_a_stalled_controller_gets_a_long_settle() {
+    fn only_a_controller_fault_gets_a_long_settle() {
         // The other two re-check once, at SETTLE, as they always have.
         assert_eq!(Problem::StaleRecord.settle_limit(), SETTLE);
         assert_eq!(Problem::ScanBlocked.settle_limit(), SETTLE);
         // Long enough for the slowest measured reconnect after a power-cycle
         // (49 s), since escalating too early restarts bluetoothd for nothing.
         assert!(Problem::ControllerStalled.settle_limit() > Duration::from_secs(49));
+        // A deaf controller is judged cleared by a light reconnecting, too.
+        assert!(Problem::ControllerDeaf.settle_limit() > Duration::from_secs(49));
     }
 
     #[tokio::test]

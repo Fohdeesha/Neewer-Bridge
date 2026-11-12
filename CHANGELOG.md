@@ -13,6 +13,23 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
+## [1.10.2] — 2026-11-12
+
+### Fixed
+
+- **A Bluetooth controller that stops hearing is now noticed and reset (Linux).**
+  On 2026-11-11 the adapter stalled, Linux dropped every light, and the controller
+  then kept answering commands while receiving nothing at all, so every reconnect
+  timed out. The stalled-controller check added in 1.10.0 only judges while a light
+  is connected, so the lights stayed dark for six hours with nothing done about it.
+  The bridge now counts the advertisements the controller receives. If no light is
+  connected and none arrives from any device for 3 minutes, it logs an error, says
+  so in the service status line, and runs the usual steps: an adapter power-cycle,
+  then a bluetoothd restart. If neither helps, it tries again every 30 minutes.
+  `stale_link_recovery = "off"` only logs it. A false alarm can only happen when
+  every light is off and nothing else nearby transmits, and then a power-cycle
+  drops nothing.
+
 ## [1.10.1] — 2026-11-05
 
 ### Fixed
