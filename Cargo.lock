@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "neewer-bridge"
-version = "1.10.3"
+version = "1.10.4"
 dependencies = [
  "anyhow",
  "btleplug",

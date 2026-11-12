@@ -47,14 +47,14 @@ use btleplug::platform::{Adapter, Peripheral};
 use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::ble::{self, DisconnectOutcome, NeewerChars};
 use crate::config::{parse_mac, LightCfg};
 use crate::driver::Driver;
 use crate::profile::Profile;
 use crate::protocol::replies::{self, Reply};
-use crate::protocol::{queries, LightState};
+use crate::protocol::{queries, LightState, Mode};
 use crate::recovery::{Outcome, Problem, StaleLinkRecovery};
 use crate::scan::ScanCoordinator;
 
@@ -84,6 +84,90 @@ impl Pacer {
         let r = ble::write_command_chunked(p, write, frame).await;
         self.last = Some(Instant::now());
         r
+    }
+}
+
+/// When the periodic refresh (`[ble] refresh_secs`) should next resend an
+/// unchanged state, or `None`.
+///
+/// - A powered light in a steady mode: power-on and the state frame, so a lost
+///   frame, or a light switched off at its own button, is put right.
+/// - An effect or pixel animation: never — a resend restarts the animation.
+///   (Those still get the one resend after a power-on, [`REASSERT_AFTER`].)
+/// - An active off (the poweroff failsafe): the power-off frame.
+/// - The passive seed of a `power_on_connect = false` light: never; the bridge
+///   must not touch that light until the console says something.
+fn next_refresh(desired: &LightState, refresh: Option<Duration>, now: Instant) -> Option<Instant> {
+    let every = refresh?;
+    let wanted = if desired.power { is_steady(desired.mode) } else { !desired.seed };
+    if wanted {
+        now.checked_add(every)
+    } else {
+        None
+    }
+}
+
+/// When the flush loop sends an unchanged state again: the one resend after a
+/// power-on ([`REASSERT_AFTER`]) and the periodic refresh ([`next_refresh`]),
+/// kept apart so a DMX change in the second after a power-on does not cancel
+/// the first (it only reschedules the refresh).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Resends {
+    reassert_at: Option<Instant>,
+    refresh_at: Option<Instant>,
+}
+
+impl Resends {
+    /// A power-on frame went out.
+    fn powered_on(&mut self, now: Instant) {
+        self.reassert_at = now.checked_add(REASSERT_AFTER);
+    }
+    /// A power-off frame went out: nothing to reassert for a light that is off.
+    fn powered_off(&mut self) {
+        self.reassert_at = None;
+    }
+    /// A new state was sent.
+    fn sent(&mut self, desired: &LightState, refresh: Option<Duration>, now: Instant) {
+        self.refresh_at = next_refresh(desired, refresh, now);
+    }
+    fn due(&self, now: Instant) -> bool {
+        self.reassert_at.is_some_and(|t| now >= t) || self.refresh_at.is_some_and(|t| now >= t)
+    }
+    /// The unchanged state was resent at `now`.
+    fn resent(&mut self, desired: &LightState, refresh: Option<Duration>, now: Instant) {
+        if self.reassert_at.is_some_and(|t| now >= t) {
+            self.reassert_at = None;
+        }
+        self.refresh_at = next_refresh(desired, refresh, now);
+    }
+}
+
+/// Send the current state again: its power frame, then (if powered) its state
+/// frames, each paced like any other write.
+async fn resend(
+    pacer: &mut Pacer,
+    p: &Peripheral,
+    write: &Characteristic,
+    driver: &Driver,
+    desired: &LightState,
+) -> Result<()> {
+    pacer
+        .write(p, write, &driver.power(desired.power), MIN_WRITE_GAP)
+        .await
+        .map_err(|e| anyhow::anyhow!("resend failed: {e:#}"))?;
+    if desired.power {
+        send_state(pacer, p, write, driver, desired).await?;
+    }
+    Ok(())
+}
+
+/// Whether resending this mode's frame leaves the light looking the same. An
+/// exhaustive match on purpose: a new mode must be decided here, not default
+/// into being resent.
+fn is_steady(mode: Mode) -> bool {
+    match mode {
+        Mode::Cct | Mode::Hsi | Mode::Xy | Mode::Rgbcw => true,
+        Mode::Fx | Mode::Pixel => false,
     }
 }
 
@@ -181,8 +265,9 @@ const PIXEL_FRAME_SPACING: Duration = Duration::from_millis(80);
 /// probe's status query → the next flush.
 const MIN_WRITE_GAP: Duration = Duration::from_millis(50);
 /// After a power-on, the state frames are sent once more this long later, in
-/// case the first copy was lost all the same. Nothing else would ever resend
-/// it: the flush loop only writes a state that differs from the last one sent.
+/// case the first copy was lost all the same — sooner than the periodic
+/// refresh, and also for effects, which the refresh leaves alone (see
+/// [`Resends`]).
 const REASSERT_AFTER: Duration = Duration::from_secs(1);
 /// While parked on a stale platform record: how often to re-read the record.
 const STALE_RECHECK: Duration = Duration::from_secs(60);
@@ -199,6 +284,8 @@ pub struct LightActor {
     rx: watch::Receiver<LightState>,
     flush_hz: u32,
     probe_secs: u64,
+    /// `[ble] refresh_secs`: resend an unchanged steady state this often (0 = never).
+    refresh_secs: u64,
     scan: Arc<ScanCoordinator>,
     /// Fleet-wide stale-record recovery gate (see `recovery.rs`).
     recovery: Arc<StaleLinkRecovery>,
@@ -216,11 +303,12 @@ impl LightActor {
         rx: watch::Receiver<LightState>,
         flush_hz: u32,
         probe_secs: u64,
+        refresh_secs: u64,
         scan: Arc<ScanCoordinator>,
         recovery: Arc<StaleLinkRecovery>,
         hold_baseline: Option<(LightState, Instant)>,
     ) -> Self {
-        Self { cfg, label, adapter, rx, flush_hz, probe_secs, scan, recovery, hold_baseline }
+        Self { cfg, label, adapter, rx, flush_hz, probe_secs, refresh_secs, scan, recovery, hold_baseline }
     }
 
     fn label(&self) -> String {
@@ -569,6 +657,7 @@ impl LightActor {
             light = %label,
             flush_hz = self.flush_hz,
             probe_secs = self.probe_secs,
+            refresh_secs = self.refresh_secs,
             probe = probe_kind,
             rssi = ?rssi0,
             "session active"
@@ -598,8 +687,9 @@ impl LightActor {
         let mut status = StatusCache::default();
         // Every write of this session goes through one pacer (MIN_WRITE_GAP).
         let mut pacer = Pacer::default();
-        // When to send the state once more after a power-on (REASSERT_AFTER).
-        let mut reassert_at: Option<Instant> = None;
+        // When to send the unchanged state again (see `Resends`).
+        let mut resends = Resends::default();
+        let refresh = (self.refresh_secs > 0).then(|| Duration::from_secs(self.refresh_secs));
         if let Some(mac) = query_mac {
             send_status_queries(&mut pacer, p, &chars.write, mac, true).await;
         }
@@ -621,15 +711,16 @@ impl LightActor {
                                 pacer
                                     .write(p, &chars.write, &driver.power(true), MIN_WRITE_GAP)
                                     .await
-                                    .map_err(|e| anyhow::anyhow!("power-on write failed: {e}"))?;
-                                reassert_at = Some(Instant::now() + REASSERT_AFTER);
+                                    .map_err(|e| anyhow::anyhow!("power-on write failed: {e:#}"))?;
+                                resends.powered_on(Instant::now());
                             }
                             Some(false) => {
                                 info!(light = %label, "power off");
                                 pacer
                                     .write(p, &chars.write, &driver.power(false), MIN_WRITE_GAP)
                                     .await
-                                    .map_err(|e| anyhow::anyhow!("power-off write failed: {e}"))?;
+                                    .map_err(|e| anyhow::anyhow!("power-off write failed: {e:#}"))?;
+                                resends.powered_off();
                             }
                             None => {}
                         }
@@ -640,12 +731,15 @@ impl LightActor {
                             send_state(&mut pacer, p, &chars.write, driver, &desired).await?;
                         }
                         last_sent = Some(desired);
-                    } else if reassert_at.is_some_and(|t| now >= t) {
-                        reassert_at = None;
-                        if desired.power {
-                            debug!(light = %label, state = %desired.summary(), "re-sending the state after power-on");
-                            send_state(&mut pacer, p, &chars.write, driver, &desired).await?;
-                        }
+                        resends.sent(&desired, refresh, Instant::now());
+                    } else if resends.due(now) {
+                        trace!(light = %label, state = %desired.summary(), "re-sending the state");
+                        // Fails the session like any other write: a write the
+                        // platform refuses or never completes means the link is
+                        // gone, and the console's next change would only find
+                        // that out later.
+                        resend(&mut pacer, p, &chars.write, driver, &desired).await?;
+                        resends.resent(&desired, refresh, now);
                     }
                 }
                 _ = probe.tick() => {
@@ -871,7 +965,7 @@ async fn send_state(
         pacer
             .write(p, write, frame, gap)
             .await
-            .map_err(|e| anyhow::anyhow!("flush write failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("flush write failed: {e:#}"))?;
     }
     Ok(())
 }
@@ -901,6 +995,75 @@ mod tests {
         assert_eq!(pace_delay(Some(t0 + Duration::from_secs(1)), t0, gap), Duration::from_secs(1) + gap);
         // Measured: 20 ms was always enough, so the gap must not be less.
         const { assert!(MIN_WRITE_GAP.as_millis() >= 20) };
+    }
+
+    #[test]
+    fn the_refresh_covers_steady_states_and_active_offs_only() {
+        let t0 = Instant::now();
+        let five = Some(Duration::from_secs(5));
+        let in5 = Some(t0 + Duration::from_secs(5));
+        let with = |mode| LightState { power: true, mode, ..LightState::default() };
+        // A steady state is refreshed every interval...
+        for mode in [Mode::Cct, Mode::Hsi, Mode::Xy, Mode::Rgbcw] {
+            assert_eq!(next_refresh(&with(mode), five, t0), in5, "{mode:?}");
+        }
+        // ...an effect or a pixel animation is not: a resend restarts it.
+        for mode in [Mode::Fx, Mode::Pixel] {
+            assert_eq!(next_refresh(&with(mode), five, t0), None, "{mode:?}");
+        }
+        // A blacked-out light (brightness 0, still powered) IS refreshed: that
+        // is exactly openHAB's "off" that got lost on 11-10.
+        let dark = LightState { brightness: 0, ..with(Mode::Hsi) };
+        assert_eq!(next_refresh(&dark, five, t0), in5);
+        // An active off (poweroff failsafe) is refreshed — as a power-off frame.
+        let off = LightState { power: false, ..with(Mode::Hsi) };
+        assert_eq!(next_refresh(&off, five, t0), in5);
+        // The passive seed of a power_on_connect = false light never is.
+        assert_eq!(next_refresh(&state(false, true), five, t0), None);
+        // refresh_secs = 0: nothing.
+        assert_eq!(next_refresh(&with(Mode::Hsi), None, t0), None);
+        // The largest allowed interval does not overflow the clock.
+        let max = Some(Duration::from_secs(crate::config::MAX_REFRESH_SECS));
+        assert!(next_refresh(&with(Mode::Hsi), max, t0).is_some());
+    }
+
+    #[test]
+    fn a_change_right_after_power_on_does_not_cancel_the_reassert() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let fx = LightState { power: true, mode: Mode::Fx, ..LightState::default() };
+        let hsi = LightState { power: true, mode: Mode::Hsi, ..LightState::default() };
+        let five = Some(Duration::from_secs(5));
+
+        // Reconnect: power-on + a steady state, then DMX switches to an effect
+        // 200 ms later. The effect is never refreshed, but the one resend a
+        // second after power-on must still happen.
+        let mut r = Resends::default();
+        r.powered_on(t0);
+        r.sent(&hsi, five, t0);
+        r.sent(&fx, five, t0 + ms(200));
+        assert!(!r.due(t0 + ms(999)));
+        assert!(r.due(t0 + REASSERT_AFTER));
+        r.resent(&fx, five, t0 + REASSERT_AFTER);
+        // ...once only.
+        assert!(!r.due(t0 + Duration::from_secs(60)));
+
+        // A steady state: the reassert at 1 s, then the refresh every 5 s.
+        let mut r = Resends::default();
+        r.powered_on(t0);
+        r.sent(&hsi, five, t0);
+        assert!(r.due(t0 + REASSERT_AFTER));
+        r.resent(&hsi, five, t0 + REASSERT_AFTER);
+        assert!(!r.due(t0 + REASSERT_AFTER + ms(4999)));
+        assert!(r.due(t0 + REASSERT_AFTER + Duration::from_secs(5)));
+
+        // Powered off before the reassert came due: nothing to reassert.
+        let off = LightState { power: false, ..hsi };
+        let mut r = Resends::default();
+        r.powered_on(t0);
+        r.powered_off();
+        r.sent(&off, None, t0 + ms(100));
+        assert!(!r.due(t0 + Duration::from_secs(10)));
     }
 
     #[test]

@@ -13,7 +13,29 @@ binaries, runs the tests, and publishes the GitHub release automatically (with
 this file's entry as the release notes). The binary prints its version on
 startup (first log line) and via `neewer-bridge --version`.
 
-## [1.10.3] — 2026-11-12
+## [1.10.4] — 2026-11-12
+
+### Added
+
+- **`[ble] refresh_secs` (default 5): each light's unchanged state is resent
+  every few seconds.** The bridge used to write a light only when the console
+  changed something, so a command the light lost, or a light switched off or
+  changed at its own buttons, stayed wrong until the next change. Now a powered
+  light in a steady mode (CCT, HSI, XY, RGBCW) gets its power-on and colour
+  frames again every 5 s, and a light the poweroff failsafe turned off gets its
+  power-off frame again. Effects and pixel animations are not resent, since that
+  would restart them; they still get the one extra send a second after the light
+  powers on. Nothing is resent while values are changing (a fade), and a light
+  with `power_on_connect = false` is still left alone until the console says
+  something. `0` turns the refresh off; the maximum is 3600.
+  Note: a config that sets `refresh_secs` will not load in 1.10.3 or older
+  (unknown keys are refused), so remove the line before downgrading.
+
+### Fixed
+
+- A session that ended on a failed write logged only `writing command …`, not
+  why the write failed. The log line now carries the whole cause.
+
 
 ### Fixed
 

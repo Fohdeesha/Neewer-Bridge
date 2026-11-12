@@ -756,6 +756,7 @@ async fn start(
             rx,
             cfg.ble.flush_hz,
             cfg.ble.probe_secs,
+            cfg.ble.refresh_secs,
             scan.clone(),
             recovery.clone(),
             hold_baseline,

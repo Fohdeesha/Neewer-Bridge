@@ -116,6 +116,13 @@ pub struct Ble {
     /// readable, otherwise whether the status query was accepted (BlueZ).
     #[serde(default = "default_probe_secs")]
     pub probe_secs: u64,
+    /// Resend a light's unchanged state every this many seconds, so a frame the
+    /// light lost (or a change made at the light itself) is put right without
+    /// waiting for the console to change something. Steady modes only (CCT, HSI,
+    /// XY, RGBCW): resending an effect or pixel frame would restart its
+    /// animation. `0` = never.
+    #[serde(default = "default_refresh_secs")]
+    pub refresh_secs: u64,
     /// Discovery-scan burst length, seconds. The bridge scans for a missing light
     /// only in bursts of this long (then pauses — see `scan_pause_secs`). While
     /// every configured light is connected it does NOT scan at all, which keeps a
@@ -241,6 +248,7 @@ impl Default for Ble {
             adapter: default_adapter(),
             flush_hz: default_flush_hz(),
             probe_secs: default_probe_secs(),
+            refresh_secs: default_refresh_secs(),
             scan_window_secs: default_scan_window_secs(),
             scan_pause_secs: default_scan_pause_secs(),
             stale_link_recovery: default_stale_link_recovery(),
@@ -292,6 +300,12 @@ fn default_flush_hz() -> u32 {
 }
 fn default_probe_secs() -> u64 {
     20
+}
+/// Upper bound for `[ble] refresh_secs`. Anything slower is not a refresh any
+/// more (use 0), and an unbounded value would overflow the actor's clock.
+pub const MAX_REFRESH_SECS: u64 = 3600;
+fn default_refresh_secs() -> u64 {
+    5
 }
 fn default_scan_window_secs() -> u64 {
     8
@@ -541,6 +555,12 @@ impl Config {
         }
         if self.ble.probe_secs == 0 {
             bail!("[ble] probe_secs must be ≥ 1 (seconds between connection-health probes)");
+        }
+        if self.ble.refresh_secs > MAX_REFRESH_SECS {
+            bail!(
+                "[ble] refresh_secs must be 0 (never) to {MAX_REFRESH_SECS} (got {})",
+                self.ble.refresh_secs
+            );
         }
         if self.ble.scan_window_secs == 0 {
             bail!(
@@ -861,6 +881,30 @@ pub fn mac_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_defaults_to_five_seconds_and_zero_turns_it_off() {
+        // An existing config without the key (every install before 1.10.4)
+        // gets the refresh at 5 s.
+        let cfg: Config = toml::from_str("[ble]
+flush_hz = 15
+").unwrap();
+        assert_eq!(cfg.ble.refresh_secs, 5);
+        assert_eq!(Config::default().ble.refresh_secs, 5);
+        let off: Config = toml::from_str("[ble]
+refresh_secs = 0
+").unwrap();
+        assert_eq!(off.ble.refresh_secs, 0);
+        off.validate().expect("0 = no refresh is a valid choice");
+        let mut slow = Config::default();
+        slow.ble.refresh_secs = MAX_REFRESH_SECS;
+        slow.validate().expect("the maximum is allowed");
+        slow.ble.refresh_secs = MAX_REFRESH_SECS + 1;
+        assert!(slow.validate().is_err(), "past the maximum is refused, not overflowed");
+        // The shipped example spells the default out.
+        let example: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert_eq!(example.ble.refresh_secs, 5);
+    }
 
     /// The shipped template must always be a valid config — it is what users
     /// copy to `config.toml`, and what `add` seeds a first-run config from, so

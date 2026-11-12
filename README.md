@@ -118,6 +118,7 @@ port    = 6454
 [ble]
 adapter  = "default"    # or an index ("0") or a name substring
 flush_hz = 15           # max BLE updates per light per second
+refresh_secs = 5        # resend unchanged colours every 5 s in case a light missed one; 0 = off
 stale_link_recovery = "auto"   # Linux: how far the bridge may go to reset the Bluetooth stack (see the example config)
 
 [failsafe]              # what to do when ArtNet for a universe stops arriving

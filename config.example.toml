@@ -60,6 +60,13 @@ probe_secs  = 20         # how often (s) to check each connection (3 consecutive
                          # recycle the link) and read status telemetry. The check is a
                          # GATT read on Windows; BlueZ has nothing readable to offer, so
                          # on Linux it is whether the status queries are accepted.
+refresh_secs = 5         # resend each light's unchanged state (power + colour) every N s,
+                         # so a command the light missed, or a light switched off or
+                         # changed at its own buttons, is put right without waiting for
+                         # the console to change something. Steady colours/whites only:
+                         # an effect or pixel animation would restart, so those are sent
+                         # once (plus once more a second after the light powers on).
+                         # 0 = never; at most 3600.
 # Discovery scanning is on-demand, not permanent: the bridge scans only while a light
 # is disconnected, in duty-cycled bursts, and NOT AT ALL once every light is connected.
 # A continuous scan starves the active connections on cheap USB BT dongles (kernel
